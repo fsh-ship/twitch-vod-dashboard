@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Log In – Twitch VOD Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-page">
+  <main class="login-shell">
+    <section class="login-card">
+      <div class="brand login-brand">
+        <div class="brand-mark">VOD</div>
+        <div>
+          <h1>Twitch VOD Dashboard</h1>
+          <p>Log in to open the dashboard.</p>
+        </div>
+      </div>
+      {% if error %}
+      <div class="login-error" role="alert">{{ error }}</div>
+      {% endif %}
+      <form method="post" action="/login" class="login-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>Username <input name="username" autocomplete="username" required autofocus></label>
+        <label>Password <input type="password" name="password" autocomplete="current-password" required></label>
+        <button type="submit" class="primary">Log In</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

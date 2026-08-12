@@ -1,0 +1,68 @@
+﻿# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.ruff_cache/
+.mypy_cache/
+.tox/
+
+# Secrets
+.env
+.env.*
+!.env.example
+twitch-cookies.txt
+/cookies.txt
+/*-cookies.txt
+/*.cookies.txt
+youtube-token.json
+client_secret.json
+
+# Personal runtime data
+dashboard-settings.json
+settings.json
+streamer.txt
+archive.txt
+*.uploaded.json
+*.info.json
+*.youtube.json
+*.youtube-beschreibung.txt
+
+# Logs
+*.log
+*.log.*
+
+# Videos / downloads
+/data/
+/downloads/
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.m4v
+*.part
+*.ytdl
+*.tmp
+
+# Local backups
+*.bak
+*.backup*
+app.py.backup-*
+
+# OS / editor artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/

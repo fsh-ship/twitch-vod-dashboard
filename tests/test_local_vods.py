@@ -1,0 +1,345 @@
+import ast
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+
+from vod_dashboard import local_vods
+from vod_dashboard import twitch
+from vod_dashboard import youtube
+from vod_dashboard.media import MediaPathPolicy, local_video_marker_path
+
+
+class LocalVodServiceTests(unittest.TestCase):
+    VIDEO_PAYLOAD_KEYS = {
+        "path",
+        "name",
+        "folder",
+        "relative_folder",
+        "size_gb",
+        "size_bytes",
+        "mtime",
+        "streamer",
+        "date_de",
+        "title",
+        "vod_id",
+        "youtube_title",
+        "youtube_description",
+        "description_file",
+        "description_file_exists",
+        "metadata_file",
+        "metadata_file_exists",
+        "marker_file",
+        "prepared",
+        "dashboard_uploaded",
+        "manually_uploaded",
+        "already_uploaded",
+        "in_uploaded_folder",
+        "status",
+        "uploaded_at",
+    }
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp_dir.name)
+        self.media_root = self.base / "media"
+        self.outside_root = self.base / "outside"
+        self.app_dir = self.media_root / "application"
+        self.uploaded_root = self.media_root / "_hochgeladen"
+        self.media_root.mkdir()
+        self.outside_root.mkdir()
+        self.policy = MediaPathPolicy(self.media_root)
+        self.logs = []
+        self.settings = {
+            "download_path": str(self.media_root),
+            "uploaded_vods_folder": str(self.uploaded_root),
+            "youtube_uploaded_files": [],
+            "youtube_title_template": (
+                "{streamer} VOD - {date_de} - {title}"
+            ),
+            "youtube_description": "Fallback description",
+            "youtube_description_template": (
+                "Streamer: {streamer}\nDate: {date_de}\n"
+                "Original: {url}\nVOD ID: {vod_id}\n"
+                "Duration: {duration}"
+            ),
+        }
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def make_video(self, relative_path, content=b"video"):
+        path = self.media_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path.resolve()
+
+    @staticmethod
+    def info_payload(**updates):
+        payload = {
+            "id": "1234567890",
+            "title": "A Test Stream",
+            "uploader": "Example",
+            "upload_date": "20260810",
+            "duration": 3661,
+            "webpage_url": (
+                "https://www.twitch.tv/videos/1234567890"
+            ),
+        }
+        payload.update(updates)
+        return payload
+
+    def write_info(self, video, **updates):
+        video.with_suffix(".info.json").write_text(
+            json.dumps(self.info_payload(**updates), ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def metadata_loader(self, path, settings):
+        return youtube.metadata_from_path(
+            path,
+            settings,
+            media_policy=self.policy,
+            entry_date_parser=twitch.entry_date,
+            date_parser=twitch.parse_date,
+            log_callback=self.logs.append,
+        )
+
+    def youtube_metadata_builder(self, path, settings):
+        return youtube.build_youtube_metadata(
+            path,
+            settings,
+            media_policy=self.policy,
+            entry_date_parser=twitch.entry_date,
+            date_parser=twitch.parse_date,
+            metadata_loader=self.metadata_loader,
+            log_callback=self.logs.append,
+        )
+
+    def marker_reader(self, path):
+        return self.policy.read_local_upload_marker(
+            path, log=self.logs.append
+        )
+
+    def payload(self, path, uploaded_set=None):
+        return local_vods.local_video_metadata_payload(
+            path,
+            self.settings,
+            set() if uploaded_set is None else uploaded_set,
+            media_policy=self.policy,
+            download_root=self.policy.download_path(self.settings),
+            uploaded_root=self.policy.uploaded_vods_folder(
+                self.settings, self.uploaded_root
+            ),
+            metadata_loader=self.metadata_loader,
+            youtube_metadata_builder=self.youtube_metadata_builder,
+            marker_reader=self.marker_reader,
+            marker_path_builder=local_video_marker_path,
+            sidecar_loader=self.policy.local_video_sidecars,
+        )
+
+    def enumerate(self, include_uploaded=False, app_dir=None):
+        return local_vods.enumerate_local_vods(
+            self.settings,
+            include_uploaded,
+            media_policy=self.policy,
+            uploaded_folder_fallback=self.uploaded_root,
+            app_dir=app_dir or self.app_dir,
+            payload_builder=lambda path, settings, uploaded: self.payload(
+                path, uploaded
+            ),
+            log_callback=self.logs.append,
+        )
+
+    def test_module_boundary_has_no_framework_or_application_imports(self):
+        module_path = Path(local_vods.__file__).resolve()
+        tree = ast.parse(module_path.read_text(encoding="utf-8"))
+        imported_roots = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_roots.update(
+                    alias.name.split(".", 1)[0] for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_roots.add(node.module.split(".", 1)[0])
+        self.assertEqual(
+            imported_roots,
+            {"__future__", "datetime", "pathlib", "typing", "vod_dashboard"},
+        )
+        source = module_path.read_text(encoding="utf-8").lower()
+        for forbidden in (
+            "import app",
+            "flask",
+            "jobs",
+            "vod_dashboard.twitch",
+            "vod_dashboard.settings",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+
+    def test_empty_media_root_response_contract(self):
+        payload = self.enumerate()
+        self.assertEqual(
+            payload,
+            {
+                "videos": [],
+                "root": str(self.media_root.resolve()),
+                "uploaded_root": str(self.uploaded_root.resolve()),
+                "include_uploaded": False,
+                "counts": {
+                    "total": 0,
+                    "pending": 0,
+                    "uploaded": 0,
+                    "size_gb": 0.0,
+                },
+            },
+        )
+
+    def test_valid_vod_info_metadata_and_payload_key_contract(self):
+        video = self.make_video(
+            "Example/2026-08-10 - Example - Stream [1234567890].mp4"
+        )
+        self.write_info(video)
+        payload = self.payload(video)
+
+        self.assertEqual(set(payload), self.VIDEO_PAYLOAD_KEYS)
+        self.assertEqual(payload["path"], str(video))
+        self.assertEqual(payload["relative_folder"], "Example")
+        self.assertEqual(payload["streamer"], "Example")
+        self.assertEqual(payload["date_de"], "10.08.2026")
+        self.assertEqual(payload["title"], "A Test Stream")
+        self.assertEqual(payload["vod_id"], "1234567890")
+        self.assertEqual(
+            payload["youtube_title"],
+            "Example VOD - 10.08.2026 - A Test Stream",
+        )
+        self.assertEqual(payload["status"], "Ready")
+        self.assertIsInstance(payload["size_bytes"], int)
+        self.assertIsInstance(payload["size_gb"], float)
+
+    def test_metadata_fallback_without_info_json(self):
+        video = self.make_video(
+            "Fallback/2026-08-09 Fallback title [2345678901].mkv"
+        )
+        payload = self.payload(video)
+        self.assertEqual(payload["streamer"], "Fallback")
+        self.assertEqual(payload["date_de"], "09.08.2026")
+        self.assertEqual(payload["vod_id"], "2345678901")
+        self.assertEqual(
+            payload["title"],
+            "2026-08-09 Fallback title [2345678901]",
+        )
+
+    def test_marker_state_and_malformed_marker_behavior(self):
+        video = self.make_video("Example/marked.mp4")
+        marker = self.policy.write_local_upload_marker(video, "manual")
+        payload = self.payload(video)
+        self.assertTrue(payload["manually_uploaded"])
+        self.assertTrue(payload["already_uploaded"])
+        self.assertEqual(payload["status"], "Manually Uploaded")
+        self.assertEqual(payload["uploaded_at"], marker["uploaded_at"])
+
+        local_video_marker_path(video).write_text(
+            "{malformed", encoding="utf-8"
+        )
+        self.logs.clear()
+        payload = self.payload(video)
+        self.assertFalse(payload["manually_uploaded"])
+        self.assertFalse(payload["already_uploaded"])
+        self.assertEqual(payload["status"], "Ready")
+        self.assertTrue(
+            any("Could not read upload marker" in line for line in self.logs)
+        )
+
+    def test_youtube_sidecars_and_missing_sidecars(self):
+        video = self.make_video("Example/prepared.mp4")
+        missing = self.payload(video)
+        self.assertFalse(missing["prepared"])
+        self.assertFalse(missing["description_file_exists"])
+        self.assertFalse(missing["metadata_file_exists"])
+
+        video.with_suffix(".youtube.json").write_text(
+            "{malformed but present", encoding="utf-8"
+        )
+        video.with_suffix(".youtube-beschreibung.txt").write_text(
+            "description", encoding="utf-8"
+        )
+        prepared = self.payload(video)
+        self.assertTrue(prepared["prepared"])
+        self.assertTrue(prepared["description_file_exists"])
+        self.assertTrue(prepared["metadata_file_exists"])
+        self.assertEqual(prepared["status"], "Prepared for YouTube")
+
+    def test_multiple_vods_preserve_pending_first_oldest_first_order(self):
+        old_pending = self.make_video("One/old.mp4")
+        new_pending = self.make_video("Two/new.mp4")
+        uploaded = self.make_video("Three/uploaded.mp4")
+        os.utime(old_pending, (1_700_000_000, 1_700_000_000))
+        os.utime(new_pending, (1_700_100_000, 1_700_100_000))
+        os.utime(uploaded, (1_699_000_000, 1_699_000_000))
+        self.settings["youtube_uploaded_files"] = [str(uploaded)]
+
+        result = self.enumerate()
+
+        self.assertEqual(
+            [item["name"] for item in result["videos"]],
+            ["old.mp4", "new.mp4", "uploaded.mp4"],
+        )
+        self.assertEqual(result["counts"]["pending"], 2)
+        self.assertEqual(result["counts"]["uploaded"], 1)
+
+    def test_uploaded_folder_filter_status_and_count_semantics(self):
+        video = self.make_video("_hochgeladen/Example/archived.mp4")
+
+        hidden = self.enumerate(include_uploaded=False)
+        self.assertEqual(hidden["videos"], [])
+
+        included = self.enumerate(include_uploaded=True)
+        self.assertEqual(len(included["videos"]), 1)
+        payload = included["videos"][0]
+        self.assertEqual(payload["path"], str(video))
+        self.assertTrue(payload["in_uploaded_folder"])
+        self.assertTrue(payload["already_uploaded"])
+        self.assertEqual(payload["status"], "Archived")
+        self.assertEqual(included["counts"]["pending"], 0)
+        self.assertEqual(included["counts"]["uploaded"], 0)
+
+    def test_nested_streamer_directory_relative_folder(self):
+        video = self.make_video("Streamer/2026/August/nested.mov")
+        payload = self.payload(video)
+        self.assertEqual(
+            payload["relative_folder"],
+            str(Path("Streamer") / "2026" / "August"),
+        )
+
+    def test_application_directory_and_outside_paths_are_excluded(self):
+        self.make_video("application/private.mp4")
+        outside = self.outside_root / "outside.mp4"
+        outside.write_bytes(b"outside")
+
+        result = self.enumerate()
+        self.assertEqual(result["videos"], [])
+        with self.assertRaisesRegex(RuntimeError, "outside"):
+            self.payload(outside)
+
+    def test_symlink_escape_is_excluded_where_supported(self):
+        outside = self.outside_root / "outside.mp4"
+        outside.write_bytes(b"outside")
+        link = self.media_root / "escape.mp4"
+        try:
+            link.symlink_to(outside)
+        except (OSError, NotImplementedError) as exc:
+            if os.name == "nt":
+                self.skipTest(f"Symlinks are not supported: {exc}")
+            raise
+
+        result = self.enumerate(include_uploaded=True)
+        self.assertEqual(result["videos"], [])
+        self.assertTrue(
+            any("outside" in line.lower() for line in self.logs)
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

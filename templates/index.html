@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Twitch VOD Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  {% if auth_disabled %}
+  <div class="security-warning" role="alert">
+    SECURITY WARNING: Authentication is disabled. Use this mode for local development only.
+  </div>
+  {% endif %}
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">VOD</div>
+        <div>
+          <h1>Twitch VOD Dashboard</h1>
+          <p>Download → YouTube → Done</p>
+        </div>
+      </div>
+      <nav class="nav">
+        <button type="button" class="nav-btn active" data-page="dashboard">Dashboard</button>
+        <button type="button" class="nav-btn" data-page="search">Search VODs</button>
+        <button type="button" class="nav-btn" data-page="queue">Queue & Log</button>
+        <button type="button" class="nav-btn" data-page="youtube">YouTube</button>
+        <button type="button" class="nav-btn" data-page="localuploads">Prepare for YouTube</button>
+        <button type="button" class="nav-btn" data-page="streamers">Streamers</button>
+        <button type="button" class="nav-btn" data-page="settings">Settings</button>
+      </nav>
+      <button type="button" id="openFolder" class="sidebar-action">Open Download Folder</button>
+      {% if not auth_disabled %}
+      <form action="/logout" method="post" class="logout-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">Log Out</button>
+      </form>
+      {% endif %}
+    </aside>
+
+    <div class="content-shell">
+      <header class="topbar">
+        <div>
+          <div class="page-title" id="pageTitle">Dashboard</div>
+          <div class="page-subtitle" id="pageSubtitle">Downloads, YouTube, and storage at a glance.</div>
+        </div>
+        <div class="status-strip">
+          <span class="status-pill" id="statusYoutube">YouTube: ...</span>
+          <span class="status-pill" id="statusJobs">Jobs: ...</span>
+          <span class="status-pill" id="statusDisk">Storage: ...</span>
+          <span class="status-pill" id="statusUploadMode">Upload: ...</span>
+        </div>
+      </header>
+
+      <main>
+        <section class="page active" id="page-dashboard">
+          <section class="card hero-card" id="workflowBanner">
+            <div>
+              <p class="eyebrow">Twitch VOD Dashboard</p>
+              <h2>A clear workflow from download to YouTube upload.</h2>
+              <p class="hero-copy">Follow clear steps, see the active paths, and get useful status and error messages where you need them.</p>
+            </div>
+            <div class="workflow-steps">
+              <span><b>1</b> Find a VOD</span>
+              <span><b>2</b> Start Download</span>
+              <span><b>3</b> Prepare File</span>
+              <span><b>4</b> Upload to YouTube</span>
+            </div>
+          </section>
+
+          <div class="grid four cards-grid">
+            <section class="card mini-card"><span class="mini-label">YouTube</span><strong id="dashYoutube">...</strong><p id="dashYoutubeHint">Checking connection status.</p></section>
+            <section class="card mini-card"><span class="mini-label">Jobs</span><strong id="dashJobs">...</strong><p>Active, completed, and failed jobs in this session.</p></section>
+            <section class="card mini-card"><span class="mini-label">Storage</span><strong id="dashDisk">...</strong><p>Free space on the download drive.</p></section>
+            <section class="card mini-card"><span class="mini-label">Upload Mode</span><strong id="dashUploadMode">...</strong><p>Controls chunk size and upload stability.</p></section>
+          </div>
+          <section class="card command-center-card" id="setupChecklist">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Command Center</p>
+                <h2>Setup Checklist</h2>
+                <p class="muted">See what is ready and what still needs attention.</p>
+              </div>
+              <span class="score-pill" id="setupScore">0/4 ready</span>
+            </div>
+            <div class="setup-grid">
+              <article class="setup-item" id="setupStreamers">
+                <span class="setup-dot"></span>
+                <div><strong>Streamer List</strong><p id="setupStreamersText">Checking...</p></div>
+                <button type="button" class="goto-page" data-page="streamers">Open</button>
+              </article>
+              <article class="setup-item" id="setupYoutube">
+                <span class="setup-dot"></span>
+                <div><strong>YouTube</strong><p id="setupYoutubeText">Checking...</p></div>
+                <button type="button" class="goto-page" data-page="youtube">Open</button>
+              </article>
+              <article class="setup-item" id="setupStorage">
+                <span class="setup-dot"></span>
+                <div><strong>Storage</strong><p id="setupStorageText">Checking...</p></div>
+                <button type="button" class="goto-page" data-page="settings">Check</button>
+              </article>
+              <article class="setup-item" id="setupWorkflow">
+                <span class="setup-dot"></span>
+                <div><strong>Workflow</strong><p id="setupWorkflowText">Checking...</p></div>
+                <button type="button" class="goto-page" data-page="search">Start</button>
+              </article>
+            </div>
+          </section>
+
+          <section class="card next-action-card" id="nextActionCard">
+            <div>
+              <p class="eyebrow">Recommended Next Step</p>
+              <h2 id="nextActionTitle">Loading status...</h2>
+              <p id="nextActionText" class="muted">One moment...</p>
+            </div>
+            <button type="button" class="primary" id="nextActionButton" data-page="search">Open</button>
+          </section>
+          <section class="card">
+            <h2>Quick Start</h2>
+            <div class="quick-actions">
+              <button type="button" class="primary goto-page" data-page="search">Search VODs</button>
+              <button type="button" class="goto-page" data-page="youtube">Configure YouTube</button>
+              <button type="button" class="goto-page" data-page="queue">View Queue</button>
+              <button type="button" class="goto-page" data-page="settings">Check Paths</button>
+            </div>
+            <div id="dashboardHints" class="hint-list"></div>
+          </section>
+        </section>
+
+        <section class="page" id="page-search">
+          <section class="card">
+            <div class="page-guide" id="searchPageGuide"><strong>Guided Search</strong><span>Choose a date range and streamers. Results are grouped to help you download the right VODs.</span></div>
+            <div class="section-head"><h2>VOD Search</h2><span id="archiveCount">Archive: ...</span></div>
+            <div class="grid four">
+              <label>Start Date <input type="date" id="fromDate"></label>
+              <label>End Date <input type="date" id="toDate"></label>
+              <label>Search Depth per Streamer <input type="number" id="limit" min="1" value="150"></label>
+              <label>Streamer Selection <select id="streamerMode"><option value="checked" selected>Selected Checkboxes</option><option value="all">All Listed Streamers</option><option value="one">One Streamer</option></select></label>
+            </div>
+            <div class="grid two hidden" id="singleStreamerBox"><label>Streamer <select id="singleStreamer"></select></label></div>
+            <div class="streamer-toggle-card" id="searchStreamerToggleCard">
+              <div class="streamer-toggle-head">
+                <div><strong>Streamers for This Search</strong><span id="searchStreamerToggleInfo">Not loaded yet.</span></div>
+                <div class="button-row">
+                  <button id="searchStreamersAll" type="button">Select All</button>
+                  <button id="searchStreamersNone" type="button">Clear All</button>
+                </div>
+              </div>
+              <div id="searchStreamerCheckboxes" class="streamer-checkbox-grid"></div>
+            </div>
+            <div class="search-depth-hint muted">If VODs are missing, increase the search depth. Results from multiple Twitch sources are combined, and VOD IDs are converted to Twitch VOD links automatically.</div>
+            <div class="option-row">
+              <label class="inlinecheck"><input type="checkbox" id="includeUnknownDates" checked> Show VODs with Unknown Dates</label>
+              <label class="inlinecheck"><input type="checkbox" id="strictDateFilter"> Enforce Date Range</label>
+              <label class="inlinecheck"><input type="checkbox" id="excludeLiveStreams" checked> Hide Live and Upcoming Streams</label>
+              <label class="inlinecheck"><input type="checkbox" id="onlyRealVodUrls" checked> Twitch VOD Links Only</label>
+            </div>
+            <div class="actions">
+              <button id="presetToday">Today</button><button id="preset7">Last 7 Days</button><button id="preset30">Last 30 Days</button>
+              <button class="primary" id="searchBtn">Search VODs</button><button id="selectNewResults" type="button">Select New</button>
+              <button id="clearResultsSelection" type="button">Clear Selection</button>
+              <button id="downloadSelected" disabled>Download Selected</button>
+            </div>
+            <div id="searchErrors"></div>
+            <div class="table-wrap"><table><thead><tr><th><input type="checkbox" id="checkAll"></th><th>Date</th><th>Streamer</th><th>Title</th><th>Status</th><th>Link</th></tr></thead><tbody id="resultsBody"><tr><td colspan="6" class="muted">No search started yet.</td></tr></tbody></table></div>
+          </section>
+          <section class="card action-card">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Quick Download</p>
+                <h2>Download a Single VOD</h2>
+                <p class="muted">Enter a Twitch VOD link or VOD ID. The link is validated before download.</p>
+              </div>
+            </div>
+            <div class="grid two">
+              <label>VOD Link or ID <input id="singleUrl" placeholder="https://www.twitch.tv/videos/2786742616"></label>
+              <label>Action
+                <div class="button-row">
+                  <button id="validateSingleVod" type="button">Validate Link</button>
+                  <button class="primary" id="singleDownload" type="button">Download VOD</button>
+                </div>
+              </label>
+            </div>
+            <div id="singleVodStatus" class="inline-status muted">Ready. Enter a link to validate or download it.</div>
+          </section>
+        </section>
+
+        <section class="page" id="page-queue">
+          <section class="card">
+            <div class="page-guide" id="queuePageGuide"><strong>Downloads and Errors</strong><span>Each job appears as a card. If something fails, open its details and check the latest error.</span></div>
+            <div class="section-head job-section-head"><h2>Download Queue and Log</h2><div class="job-toolbar"><label class="inlinecheck compact"><input type="checkbox" id="jobAutoExpand"> Expand Details Automatically</label><button id="toggleJobDetails">Show All Details</button></div></div>
+            <div class="queue-summary" id="queueSummary">
+              <div><span>Total</span><strong id="queueTotal">0</strong></div>
+              <div><span>Active</span><strong id="queueActive">0</strong></div>
+              <div><span>Completed</span><strong id="queueDone">0</strong></div>
+              <div><span>Errors</span><strong id="queueFailed">0</strong></div>
+              <div class="queue-current"><span>Current</span><strong id="queueCurrent">Nothing active</strong><small id="queueEta"></small></div>
+            </div>
+            <div id="jobs" class="jobs muted">No downloads in this session yet.</div>
+          </section>
+        </section>
+
+        <section class="page" id="page-youtube">
+          <section class="card">
+            <h2>YouTube Connection and Upload</h2>
+            <div class="grid two">
+              <label>YouTube Client Secret JSON <input id="youtubeClientSecretFile" placeholder="Twitch VODs/client_secret.json"></label>
+              <label>YouTube Token File <input id="youtubeTokenFile" placeholder="Twitch VODs/youtube-token.json"></label>
+              <label>YouTube Visibility <select id="youtubePrivacyStatus"><option value="private">Private</option><option value="unlisted">Unlisted</option><option value="public">Public</option></select></label>
+              <label>YouTube Playlist <select id="youtubePlaylistId"><option value="">No Playlist</option></select></label>
+              <label>YouTube Upload Mode <select id="youtubeUploadMode"><option value="safe">Very Stable - 32 MB Chunks</option><option value="stable">Stable - 64 MB Chunks</option><option value="fast">Fast - 128 MB Chunks</option><option value="manual">Manual - Use Value Below</option></select></label>
+              <label>Manual Chunk Size <select id="youtubeChunkSizeMb"><option value="8">8 MB</option><option value="32">32 MB</option><option value="64">64 MB</option><option value="128">128 MB</option><option value="256">256 MB</option></select></label>
+            </div>
+            <div class="option-row">
+              <label class="inlinecheck"><input type="checkbox" id="youtubeEnabled"> Enable YouTube Uploads</label>
+              <label class="inlinecheck"><input type="checkbox" id="youtubeAutoUpload"> Upload Automatically After Download</label>
+              <label class="inlinecheck"><input type="checkbox" id="moveUploadedVods" checked> Move After Successful Upload</label>
+            </div>
+            <div class="grid two">
+              <label>Uploaded VOD Folder <input id="uploadedVodsFolder" placeholder="Twitch VODs/_hochgeladen"></label>
+            </div>
+            <div class="actions"><button id="youtubeConnect">Connect YouTube</button><button id="youtubeLoadPlaylists">Load Playlists</button><button id="saveYoutubeSettings" class="primary" type="button" onclick="window.vodRobustSaveSettings && window.vodRobustSaveSettings(event, \'youtube\')">Save YouTube Settings</button><span id="youtubeStatus" class="muted">YouTube not checked.</span></div>
+          </section>
+          <section class="card">
+            <h2>YouTube Metadata</h2>
+            <div class="option-row">
+              <label class="inlinecheck"><input type="checkbox" id="manualUploadPrepareEnabled" checked> Prepare for YouTube After Download</label>
+              <label class="inlinecheck"><input type="checkbox" id="manualUploadRenameVideo" checked> Rename VOD to Match YouTube Title</label>
+              <label class="inlinecheck"><input type="checkbox" id="manualUploadWriteDescription" checked> Save Description as a TXT Sidecar</label>
+              <label class="inlinecheck"><input type="checkbox" id="manualUploadWriteMetadataJson" checked> Save Metadata as JSON</label>
+            </div>
+            <div class="grid two">
+              <label>YouTube Title Template <input id="youtubeTitleTemplate" placeholder="{streamer} VOD - {date_de} - {title}"></label>
+              <label>Final Filename for Manual YouTube Upload <input id="manualUploadFilenameTemplate" placeholder="{date_de} - {streamer} - {title}"></label>
+              <label>YouTube Tags <input id="youtubeTags" placeholder="twitch,vod"></label>
+              <label>YouTube Category ID <input id="youtubeCategoryId" value="20"></label>
+              <label>YouTube Description / Fallback <textarea id="youtubeDescription" rows="3"></textarea></label>
+            </div>
+            <label>YouTube Description Template <textarea id="youtubeDescriptionTemplate" rows="7" spellcheck="false"></textarea></label>
+            <div class="actions compact-actions">
+              <button id="resetManualFilenameTemplate" type="button">Reset YouTube Filename Template</button>
+              <button id="resetYtdlpOutputTemplate" type="button">Reset yt-dlp Output Template</button>
+            </div>
+            <div class="template-help">Placeholders: <code>{date}</code>, <code>{date_de}</code>, <code>{streamer}</code>, <code>{title}</code>, <code>{vod_id}</code>, <code>{url}</code>, <code>{duration}</code>, <code>{filename}</code></div>
+          </section>
+          <section class="card">
+            <h2>Metadata Preview</h2>
+            <div class="grid two">
+              <label>Local VOD to Preview <input id="youtubePreviewPath" placeholder="Twitch VODs/streamer/video.mp4"></label>
+              <label>Action <button id="youtubePreviewBtn" type="button">Preview YouTube Metadata</button></label>
+            </div>
+            <div id="youtubePreviewBox" class="previewbox muted">No preview yet.</div>
+            <div class="sticky-savebar">
+              <button id="saveYoutubeSettingsBottom" class="primary" type="button" onclick="window.vodRobustSaveSettings && window.vodRobustSaveSettings(event, \'youtube\')">Save YouTube Settings</button>
+              <span class="muted">Saves the connection, playlist, upload mode, chunk size, title template, and description template.</span>
+            </div>
+          </section>
+        </section>
+
+        <section class="page" id="page-localuploads">
+          <section class="card">
+            <div class="page-guide" id="localUploadsGuide">
+              <strong>Manual YouTube Workspace</strong>
+              <span>Manage the workflow from completed download to cleanup: open the folder, launch YouTube Studio, copy metadata, mark the upload, then move or delete the VOD.</span>
+            </div>
+
+            <div class="section-head workspace-head">
+              <div>
+                <p class="eyebrow">Upload-Ready Library</p>
+                <h2>Prepare for YouTube and Clean Up</h2>
+                <p class="muted">Dashboard uploads remain available, but this workspace is optimized for manual uploads through YouTube Studio.</p>
+                <div id="manualWorkflowHelp" class="workflow-help">
+                  <strong>What does “YouTube Studio + Show in Folder” do?</strong>
+                  <span>It does not upload automatically. It opens YouTube Studio, selects the VOD in your file manager, and copies the prepared YouTube title. You then add the file to the upload window yourself.</span>
+                </div>
+              </div>
+              <div class="button-row">
+                <button id="openYoutubeStudio" class="primary" type="button">Open YouTube Studio</button>
+                <button id="refreshLocalVideos" type="button">Refresh Files</button>
+              </div>
+            </div>
+
+            <div class="workspace-kpis">
+              <div><span>Pending</span><strong id="workspacePending">0</strong></div>
+              <div><span>Uploaded</span><strong id="workspaceUploaded">0</strong></div>
+              <div><span>Shown</span><strong id="workspaceTotal">0</strong></div>
+              <div><span>Storage</span><strong id="workspaceSize">0 GB</strong></div>
+            </div>
+
+            <div class="workspace-toolbar">
+              <div class="button-row">
+                <button id="prepareSelectedLocalVideos" type="button" disabled>Prepare Selected for YouTube</button>
+                <button id="uploadSelectedLocalVideos" type="button" disabled>Upload Selected to YouTube</button>
+                <button id="checkAllLocalVideos" type="button">Select All</button>
+                <button id="uncheckAllLocalVideos" type="button">Clear Selection</button>
+              </div>
+              <label class="inlinecheck"><input type="checkbox" id="includeUploadedLocalVideos"> Include the “_hochgeladen” Folder</label>
+            </div>
+
+            <div id="localVideosInfo" class="inline-status muted">Not loaded yet.</div>
+            <div id="localVideoCards" class="video-workspace-grid">
+              <div class="empty-workspace muted">Not loaded yet.</div>
+            </div>
+          </section>
+        </section>
+
+        <section class="page" id="page-streamers">
+          <section class="card"><h2>Streamers</h2>
+            <div class="settings-info">
+              <div><span>Streamer File:</span><code id="streamerFileInfo">...</code></div>
+              <div><span>Status:</span><strong id="streamerFileStatus">not checked</strong></div>
+              <button id="checkStreamerFile" type="button">Check Streamer File</button>
+              <button id="repairStreamerNewlines" type="button">Repair Line Breaks</button>
+              <button id="forceFixedStreamerPath" type="button">Restore Default Path</button>
+            </div><p class="muted block-note">Enter one streamer per line without the @ prefix.</p><textarea id="streamersText" rows="14" spellcheck="false"></textarea><button class="full" id="saveStreamers">Save Streamers</button></section>
+        </section>
+
+        <section class="page" id="page-settings">
+          <section class="card">
+            <h2>Technical Settings</h2>
+            <div class="settings-info">
+              <div><span>Settings File:</span><code id="settingsFilePath">...</code></div>
+              <div><span>Last Save Status:</span><strong id="settingsSaveStatus">not saved yet</strong></div>
+              <button id="checkSettingsStatus" type="button" onclick="window.vodCheckSettingsStatus && window.vodCheckSettingsStatus(event)">Check Settings File</button>
+            </div>
+            <div class="grid two">
+              <label>Download Folder <input id="downloadPath" placeholder="Twitch VODs"></label>
+              <label>Streamer File <input id="streamerFile" placeholder="Twitch VODs/streamer.txt"></label>
+              <label>Archive File <input id="archiveFile" placeholder="Twitch VODs/archive.txt"></label>
+              <label>Browser Cookies <input id="cookieBrowser"></label>
+              <label>Quality <input id="quality" value="source/best"></label>
+              <label>Concurrent Fragments <input type="number" id="fragments" min="1" value="8"></label>
+              <label>Twitch Download Rate Limit <input id="twitchRateLimit" placeholder="blank = unlimited, e.g. 5M or 800K"></label>
+              <div id="batchModeHelp" class="batch-mode-help"><strong>Batch Mode:</strong> Processing after each VOD saves storage and keeps files organized. Processing after all downloads keeps upload work until the batch is complete.</div>
+              <label>Batch Post-Processing
+                <select id="batchPostprocessMode">
+                  <option value="after_each">Prepare or Upload After Each VOD</option>
+                  <option value="after_all">Download All, Then Prepare or Upload</option>
+                </select>
+              </label>
+              <label>Merge-Format <input id="mergeFormat" value="mp4"></label>
+              <label>Technical yt-dlp Output Template, Not the YouTube Filename <input id="outputTemplate"></label>
+            </div>
+            <div id="templateSeparationHelp" class="template-warning">
+              <strong>Important:</strong> The yt-dlp output template uses values such as <code>%(uploader)s</code> and <code>%(title)s</code>. Normally, leave it unchanged. Configure the final filename for manual YouTube uploads on the YouTube page with <code>{date_de}</code>, <code>{streamer}</code>, and <code>{title}</code>.
+            </div>
+            <button id="saveSettings" onclick="window.vodRobustSaveSettings && window.vodRobustSaveSettings(event, \'settings\')">Save Settings</button>
+          </section>
+        </section>
+      </main>
+    </div>
+  </div>
+  <div id="searchSelectionBar" class="selection-action-bar hidden">
+    <div>
+      <strong id="searchSelectionBarCount">0 VODs selected</strong>
+      <span>You can keep scrolling; this action remains available.</span>
+    </div>
+    <div class="button-row">
+      <button id="stickyClearSelection" type="button">Clear Selection</button>
+      <button id="stickyDownloadSelected" class="primary" type="button">Download Selected</button>
+    </div>
+  </div>
+  <div id="appToast" class="app-toast hidden"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

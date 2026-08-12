@@ -1,0 +1,17 @@
+services:
+  dashboard:
+    networks:
+      - default
+      - reverse-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.vod-dashboard.rule: "Host(`${VOD_DASHBOARD_HOSTNAME:?Set VOD_DASHBOARD_HOSTNAME}`)"
+      traefik.http.routers.vod-dashboard.entrypoints: websecure
+      traefik.http.routers.vod-dashboard.tls: "true"
+      traefik.http.routers.vod-dashboard.tls.certresolver: "${VOD_DASHBOARD_CERT_RESOLVER:?Set VOD_DASHBOARD_CERT_RESOLVER}"
+      traefik.http.services.vod-dashboard.loadbalancer.server.port: "8787"
+
+networks:
+  reverse-proxy:
+    external: true
+    name: "${VOD_DASHBOARD_TRAEFIK_NETWORK:?Set VOD_DASHBOARD_TRAEFIK_NETWORK}"

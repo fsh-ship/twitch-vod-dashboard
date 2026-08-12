@@ -1,0 +1,33 @@
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: twitch-vod-dashboard:latest
+    restart: unless-stopped
+    init: true
+    environment:
+      TZ: ${TZ:-UTC}
+      HOME: /data
+      PYTHONUNBUFFERED: "1"
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      VOD_DASHBOARD_DIR: /data
+      VOD_DASHBOARD_SETTINGS: /data/dashboard-settings.json
+      VOD_DASHBOARD_MEDIA_ROOT: ${VOD_DASHBOARD_MEDIA_ROOT:-/downloads}
+      VOD_DASHBOARD_LOG_FILE: /data/dashboard.log
+      VOD_DASHBOARD_TWITCH_COOKIE_FILE: ${VOD_DASHBOARD_TWITCH_COOKIE_FILE:-}
+      VOD_DASHBOARD_LEGACY_SETTINGS_PATH: ${VOD_DASHBOARD_LEGACY_SETTINGS_PATH:-}
+      VOD_DASHBOARD_YOUTUBE_OAUTH_MODE: ${VOD_DASHBOARD_YOUTUBE_OAUTH_MODE:-external}
+      VOD_DASHBOARD_NO_BROWSER: "1"
+      VOD_DASHBOARD_USERNAME: ${VOD_DASHBOARD_USERNAME:?Set VOD_DASHBOARD_USERNAME in .env}
+      VOD_DASHBOARD_PASSWORD_HASH: ${VOD_DASHBOARD_PASSWORD_HASH:?Set VOD_DASHBOARD_PASSWORD_HASH in .env}
+      VOD_DASHBOARD_SECRET_KEY: ${VOD_DASHBOARD_SECRET_KEY:?Set VOD_DASHBOARD_SECRET_KEY in .env}
+      VOD_DASHBOARD_SESSION_COOKIE_SECURE: ${VOD_DASHBOARD_SESSION_COOKIE_SECURE:-0}
+      VOD_DASHBOARD_ALLOWED_ORIGINS: ${VOD_DASHBOARD_ALLOWED_ORIGINS:-}
+      VOD_DASHBOARD_TRUSTED_HOSTS: ${VOD_DASHBOARD_TRUSTED_HOSTS:-}
+    volumes:
+      - ./data:/data
+      - ./downloads:/downloads
+    ports:
+      - "127.0.0.1:${VOD_DASHBOARD_PORT:-8787}:8787"
