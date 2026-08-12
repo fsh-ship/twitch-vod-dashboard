@@ -895,6 +895,11 @@ def api_local_videos():
     include_uploaded = to_bool(request.args.get("include_uploaded"), False)
     return jsonify(enumerate_local_vods(settings, include_uploaded))
 
+
+def is_windows_platform() -> bool:
+    return os.name == "nt"
+
+
 @app.post("/api/local-video/open")
 def api_local_video_open():
     data = request.json or {}
@@ -913,7 +918,7 @@ def api_local_video_open():
         elif mode == "folder":
             os.startfile(str(path.parent))  # type: ignore[attr-defined]
         else:
-            if os.name == "nt":
+            if is_windows_platform():
                 subprocess.Popen(["explorer.exe", "/select,", str(path)])
             else:
                 os.startfile(str(path.parent))  # type: ignore[attr-defined]

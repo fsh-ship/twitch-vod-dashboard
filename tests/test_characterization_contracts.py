@@ -1331,16 +1331,34 @@ class LocalVodContractTests(IsolatedDashboardTestCase):
 
     def test_local_select_uses_windows_explorer(self):
         video = self.make_video()
-        with mock.patch.object(dashboard.os, "name", "nt"), mock.patch.object(
-            dashboard.subprocess, "Popen"
-        ) as popen:
+        actual_os_name = dashboard.os.name
+        with mock.patch.object(
+            dashboard, "is_windows_platform", return_value=True
+        ), mock.patch.object(dashboard.subprocess, "Popen") as popen:
             response = self.client.post(
                 "/api/local-video/open",
                 json={"path": str(video), "mode": "select"},
                 headers=self.csrf_headers,
             )
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(dashboard.os.name, actual_os_name)
         popen.assert_called_once_with(["explorer.exe", "/select,", str(video.resolve())])
+
+    def test_local_select_uses_parent_folder_off_windows(self):
+        video = self.make_video()
+        with mock.patch.object(
+            dashboard, "is_windows_platform", return_value=False
+        ), mock.patch.object(
+            dashboard.os, "startfile", create=True
+        ) as startfile, mock.patch.object(dashboard.subprocess, "Popen") as popen:
+            response = self.client.post(
+                "/api/local-video/open",
+                json={"path": str(video), "mode": "select"},
+                headers=self.csrf_headers,
+            )
+        self.assertEqual(response.status_code, 200)
+        startfile.assert_called_once_with(str(video.parent.resolve()))
+        popen.assert_not_called()
 
 
 class MediaCompatibilityTests(IsolatedDashboardTestCase):
