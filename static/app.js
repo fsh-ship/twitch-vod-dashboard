@@ -80,7 +80,7 @@ async function startSingleVodDownload() {
   if (!checked) return;
   setSingleVodStatus('Creating download job...', 'muted');
   const data = await api('/api/download', { method:'POST', body: JSON.stringify({ url: checked.url, label:'Single VOD ' + checked.vod_id }) });
-  setSingleVodStatus('Download started. Job ID: ' + data.job_id, 'good');
+  setSingleVodStatus('VOD added to the download queue.', 'good');
   await pollJobs();
   return data;
 }
@@ -228,13 +228,10 @@ async function startSingleVodDownload() {
 const MANUAL_UPLOAD_DEFAULT_FILENAME_TEMPLATE = '{date_de} - {streamer} - {title}';
 
 const pageMetaEarly = {
-    dashboard: ['Dashboard', 'Downloads, YouTube, and storage at a glance.'],
-    search: ['VOD Search', 'Search by date range and streamer, or download a single VOD.'],
-    queue: ['Queue and Log', 'Active downloads and YouTube uploads.'],
-    youtube: ['YouTube', 'Connection, playlist, upload mode, and metadata.'],
-  localuploads: ['Prepare for YouTube', 'Prepare manual uploads, track status, and clean up local VODs.'],
-    streamers: ['Streamers', 'Manage frequently used Twitch channels.'],
-    settings: ['Settings', 'Paths and core yt-dlp settings.']
+    dashboard: ['Dashboard', 'What needs attention and what is happening now.'],
+    search: ['Search VODs', 'Choose a date range and streamers, then select VODs to download.'],
+    queue: ['Queue', 'Follow individual VODs from download through YouTube upload.'],
+    settings: ['Settings', 'Manage downloads, streamers, YouTube, and advanced options.']
   };
   window.vodShowPage = function(name) {
     if (!pageMetaEarly[name]) name = 'dashboard';
@@ -273,16 +270,14 @@ const YTDLP_DEFAULT_OUTPUT_TEMPLATE = '%(uploader)s/%(upload_date)s - %(uploader
 const MANUAL_UPLOAD_DEFAULT_FILENAME_TEMPLATE = '{date_de} - {streamer} - {title}';
 
 const pageMeta = {
-  dashboard: ['Dashboard', 'Downloads, YouTube, and storage at a glance.'],
-  search: ['VOD Search', 'Search by date range and streamer, or download a single VOD.'],
-  queue: ['Queue and Log', 'Active downloads and YouTube uploads.'],
-  youtube: ['YouTube', 'Connection, playlist, upload mode, and metadata.'],
-  localuploads: ['Prepare for YouTube', 'Prepare manual uploads, track status, and clean up local VODs.'],
-  streamers: ['Streamers', 'Manage frequently used Twitch channels.'],
-  settings: ['Settings', 'Paths and core yt-dlp settings.']
+  dashboard: ['Dashboard', 'What needs attention and what is happening now.'],
+  search: ['Search VODs', 'Choose a date range and streamers, then select VODs to download.'],
+  queue: ['Queue', 'Follow individual VODs from download through YouTube upload.'],
+  settings: ['Settings', 'Manage downloads, streamers, YouTube, and advanced options.']
 };
 
 function showPage(name) {
+  if (!pageMeta[name]) name = 'dashboard';
   document.body.dataset.activePage = name;
   const selectionBar = document.getElementById('searchSelectionBar');
   if (selectionBar && name !== 'search') {
@@ -292,7 +287,7 @@ function showPage(name) {
   }
   window.vodShowPage(name);
   refreshDashboard().catch(() => {});
-  if (name === 'localuploads' && typeof loadLocalVideos === 'function') loadLocalVideos().catch(() => {});
+  if (name === 'queue' && typeof loadLocalVideos === 'function') loadLocalVideos().catch(() => {});
   if (typeof refreshSelectionState === 'function') refreshSelectionState();
 }
 
@@ -324,6 +319,7 @@ function renderState() {
   $('archiveCount').textContent = `Archive: ${state.archive_count} VODs`;
   if ($('settingsFilePath')) $('settingsFilePath').textContent = state.settings_file || state.settings._settings_file || 'unknown';
   $('streamersText').value = state.streamers.join('\n');
+  renderStreamerEditor();
   if ($('streamerFileInfo')) $('streamerFileInfo').textContent = state.streamer_file_resolved || state.settings.streamer_file || 'unknown';
   if ($('streamerFileStatus')) $('streamerFileStatus').textContent = `${state.streamers.length} streamers loaded`;
   $('limit').value = state.settings.playlist_end;
@@ -350,7 +346,7 @@ function renderState() {
   $('youtubeTokenFile').value = state.settings.youtube_token_file || '';
   $('youtubeDescription').value = state.settings.youtube_description || '';
   $('youtubeTags').value = state.settings.youtube_tags || '';
-  $('youtubeCategoryId').value = state.settings.youtube_category_id || '20';
+  setYoutubeCategoryValue(state.settings.youtube_category_id || '20');
   $('youtubeTitleTemplate').value = state.settings.youtube_title_template || '{streamer} VOD - {date_de} - {title}';
   $('youtubeDescriptionTemplate').value = state.settings.youtube_description_template || '';
   $('manualUploadFilenameTemplate').value = state.settings.manual_upload_filename_template || MANUAL_UPLOAD_DEFAULT_FILENAME_TEMPLATE;
@@ -362,8 +358,6 @@ function renderState() {
   $('youtubeUploadMode').value = state.settings.youtube_upload_mode || 'stable';
   $('singleStreamer').innerHTML = state.streamers.map(s => `<option>${escapeHtml(s)}</option>`).join('');
   renderSearchStreamerCheckboxes();
-  $('jobAutoExpand').checked = autoExpandJobDetails;
-  updateJobDetailButtonLabel();
 }
 
 function escapeHtml(s) {
@@ -507,6 +501,97 @@ function selectedResultObjects() {
   return lastResults.filter(r => urls.has(r.url));
 }
 
+function setYoutubeCategoryValue(value) {
+  const select = $('youtubeCategoryId');
+  if (!select) return;
+  const categoryId = String(value || '20');
+  if (![...select.options].some(option => option.value === categoryId)) {
+    const option = document.createElement('option');
+    option.value = categoryId;
+    option.textContent = `Category ID ${categoryId}`;
+    select.appendChild(option);
+  }
+  select.value = categoryId;
+}
+
+function streamerEditorNames() {
+  return String($('streamersText')?.value || '').split(/\r?\n/).map(name => name.trim()).filter(Boolean);
+}
+
+function setStreamerEditorNames(names) {
+  $('streamersText').value = (names || []).join('\n');
+  renderStreamerEditor();
+}
+
+function renderStreamerEditor() {
+  const list = $('streamerEditorList');
+  if (!list || !$('streamersText')) return;
+  const names = streamerEditorNames();
+  if (!names.length) {
+    list.innerHTML = '<div class="streamer-editor-empty muted">No streamers configured yet.</div>';
+    return;
+  }
+  list.innerHTML = names.map((name, index) => `<div class="streamer-editor-row" data-streamer-index="${index}"><span class="streamer-order">${index + 1}</span><strong>${escapeHtml(name)}</strong><div class="streamer-row-actions"><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></div>`).join('');
+  list.querySelectorAll('[data-streamer-action]').forEach(button => button.addEventListener('click', () => {
+    const row = button.closest('[data-streamer-index]');
+    const index = Number(row.dataset.streamerIndex);
+    const current = streamerEditorNames();
+    const action = button.dataset.streamerAction;
+    if (action === 'remove') current.splice(index, 1);
+    if (action === 'up' && index > 0) [current[index - 1], current[index]] = [current[index], current[index - 1]];
+    if (action === 'down' && index < current.length - 1) [current[index + 1], current[index]] = [current[index], current[index + 1]];
+    setStreamerEditorNames(current);
+  }));
+}
+
+function addStreamerFromInput() {
+  const input = $('streamerAddInput');
+  const raw = String(input?.value || '').trim();
+  if (!raw) return;
+  const names = streamerEditorNames();
+  if (names.some(name => name.toLowerCase() === raw.toLowerCase())) {
+    showToast('That streamer is already in the list.', 'warn');
+    return;
+  }
+  names.push(raw);
+  setStreamerEditorNames(names);
+  input.value = '';
+  input.focus();
+}
+
+function showSettingsTab(name) {
+  const allowed = ['general', 'streamers', 'youtube', 'advanced'];
+  const target = allowed.includes(name) ? name : 'general';
+  document.querySelectorAll('.settings-tab').forEach(tab => {
+    const active = tab.dataset.settingsTab === target;
+    tab.classList.toggle('active', active);
+    tab.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+  document.querySelectorAll('.settings-panel').forEach(panel => panel.classList.toggle('active', panel.dataset.settingsPanel === target));
+  try { localStorage.setItem('vodSettingsTab', target); } catch {}
+  if (target === 'youtube') {
+    refreshYoutubeStatus().catch(() => {});
+    loadYoutubePlaylists().catch(() => {});
+  }
+}
+
+function rememberSearchResults(results) {
+  const compact = (results || []).slice(0, 300).map(r => ({
+    url: r.url,
+    streamer: r.streamer || '',
+    title: r.title || '',
+    date: r.date || ''
+  }));
+  try { localStorage.setItem('vodSearchResultMetadata', JSON.stringify(compact)); } catch {}
+}
+
+function rememberedSearchResults() {
+  try {
+    const value = JSON.parse(localStorage.getItem('vodSearchResultMetadata') || '[]');
+    return Array.isArray(value) ? value : [];
+  } catch { return []; }
+}
+
 async function downloadSelectedWithConfirm() {
   const selected = selectedResultObjects();
   if (!selected.length) {
@@ -530,12 +615,15 @@ Review the streamer list before starting.`);
 
 function renderResults(results, errors, debug) {
   lastResults = results || [];
+  rememberSearchResults(lastResults);
   const errHtml = errors && errors.length ? errors.map(e => `<div class="errorbox"><b>${escapeHtml(e.streamer)}</b>: ${escapeHtml(e.error)}</div>`).join('') : '';
-  const dbgHtml = debug && debug.length ? `<div class="debugbox">${debug.map(d => `${escapeHtml(d.streamer)}: ${d.kept}/${d.deduped || d.found_raw} shown · raw source results: ${d.found_raw} · unknown date: ${d.unknown_dates} · outside date range: ${d.skipped_by_date} · live/upcoming filtered: ${d.skipped_live || 0} · non-VOD filtered: ${d.skipped_nonvod || 0}`).join('<br>')}</div>` : '';
-  $('searchErrors').innerHTML = errHtml + dbgHtml;
+  const dbgHtml = debug && debug.length ? debug.map(d => `${escapeHtml(d.streamer)}: ${d.kept}/${d.deduped || d.found_raw} shown · raw source results: ${d.found_raw} · unknown date: ${d.unknown_dates} · outside date range: ${d.skipped_by_date} · live/upcoming filtered: ${d.skipped_live || 0} · non-VOD filtered: ${d.skipped_nonvod || 0}`).join('<br>') : 'No diagnostic details returned.';
+  $('searchErrors').innerHTML = errHtml;
+  if ($('searchDiagnostics')) $('searchDiagnostics').innerHTML = dbgHtml;
+  if ($('searchResultSummary')) $('searchResultSummary').textContent = `${lastResults.length} VOD${lastResults.length === 1 ? '' : 's'} found`;
   const body = $('resultsBody');
   if (!lastResults.length) {
-    body.innerHTML = `<tr><td colspan="6" class="muted">No matching VODs found.<br><span class="small">Try increasing the search depth or expanding the date range. The diagnostics above show whether results were filtered.</span></td></tr>`;
+    body.innerHTML = '<tr><td colspan="6" class="muted">No matching VODs found. Try expanding the date range.</td></tr>';
     refreshSelectionState();
     return;
   }
@@ -550,16 +638,16 @@ function renderResults(results, errors, debug) {
   const rows = [];
   for (const [streamer, items] of groups.entries()) {
     const openCount = items.filter(r => !r.already_downloaded).length;
-    rows.push(`<tr class="streamer-group-row"><td colspan="6"><div class="streamer-group-head"><div><strong>${escapeHtml(streamer)}</strong><span>${items.length} VOD(s), ${openCount} new/pending</span></div><div><button type="button" class="group-select" data-streamer="${escapeHtml(streamer)}">Select All</button><button type="button" class="group-clear" data-streamer="${escapeHtml(streamer)}">Clear</button></div></div></td></tr>`);
+    rows.push(`<tr class="streamer-group-row"><td colspan="6"><div class="streamer-group-head"><div><strong>${escapeHtml(streamer)}</strong><span>${items.length} VOD(s), ${openCount} ready to download</span></div><div><button type="button" class="group-select" data-streamer="${escapeHtml(streamer)}">Select All</button><button type="button" class="group-clear" data-streamer="${escapeHtml(streamer)}">Clear</button></div></div></td></tr>`);
     items.forEach(r => {
       rows.push(`
         <tr>
           <td><input class="rowcheck" type="checkbox" data-url="${escapeHtml(r.url)}" data-streamer="${escapeHtml(r.streamer)}" data-already-downloaded="${r.already_downloaded ? 'true' : 'false'}"></td>
-          <td>${escapeHtml(r.date)}</td>
-          <td>${escapeHtml(r.streamer)}</td>
-          <td>${escapeHtml(r.title)}</td>
-          <td class="${r.already_downloaded ? 'good' : ''}">${r.already_downloaded ? 'Already in Archive' : 'New/Pending'}${r.outside_range ? '<br><span class="warn">Outside Date Range</span>' : ''}</td>
-          <td><a href="${escapeHtml(r.url)}" target="_blank">Open</a></td>
+          <td data-label="Date">${escapeHtml(r.date)}</td>
+          <td data-label="Streamer">${escapeHtml(r.streamer)}</td>
+          <td data-label="Title">${escapeHtml(r.title)}</td>
+          <td data-label="Status" class="${r.already_downloaded ? 'good' : ''}">${r.already_downloaded ? 'Already in Archive' : 'Ready to Download'}${r.outside_range ? '<br><span class="warn">Outside Date Range</span>' : ''}</td>
+          <td data-label="Link"><a href="${escapeHtml(r.url)}" target="_blank" rel="noopener">Open Twitch</a></td>
         </tr>`);
     });
   }
@@ -574,6 +662,7 @@ function renderResults(results, errors, debug) {
 
 async function searchVods() {
   $('resultsBody').innerHTML = `<tr><td colspan="6" class="muted">Searching...</td></tr>`;
+  if ($('searchResultSummary')) $('searchResultSummary').textContent = 'Searching...';
   $('downloadSelected').disabled = true;
   const streamers = selectedSearchStreamersForSearch();
   if (!streamers.length || !streamers[0]) { alert('No streamers are configured. Save at least one streamer first.'); return; }
@@ -762,9 +851,7 @@ function renderProgressBar(label, progress, extra = '') {
 }
 
 function updateJobDetailButtonLabel() {
-  const ids = Object.keys(jobOpenState);
-  const anyClosed = ids.some(v => !jobOpenState[v]);
-  $('toggleJobDetails').textContent = anyClosed || !ids.length ? 'Show All Details' : 'Hide All Details';
+  return;
 }
 
 
@@ -796,12 +883,147 @@ function updateQueueSummary(jobs) {
   }
 }
 
+function queueMetadataByUrl(url) {
+  const all = [...lastResults, ...rememberedSearchResults()];
+  return all.find(item => item && item.url === url) || {};
+}
+
+function queuePathName(path) {
+  return String(path || '').split(/[\\/]/).filter(Boolean).pop() || 'Local VOD';
+}
+
+function queueVodId(url) {
+  const match = String(url || '').match(/(?:videos\/)(\d+)/);
+  return match ? match[1] : '';
+}
+
+function downloadLogSegment(logs, index) {
+  const startPattern = new RegExp(`--- VOD\\s+${index}\\/\\d+\\s+---`, 'i');
+  const start = logs.findIndex(line => startPattern.test(String(line)));
+  if (start < 0) return [];
+  const next = logs.findIndex((line, pos) => pos > start && /--- VOD\s+\d+\/\d+\s+---/i.test(String(line)));
+  return logs.slice(start, next < 0 ? logs.length : next);
+}
+
+function queueErrorFromLines(lines) {
+  return [...(lines || [])].reverse().find(line => /(?:failed|error|ended with error|did not start)/i.test(String(line))) || '';
+}
+
+function queueItemsFromJobs(jobs) {
+  const items = [];
+  (jobs || []).slice().reverse().forEach(job => {
+    const logs = job.log || [];
+    const progress = parseProgress(logs);
+    const sources = job.urls || [];
+    if (job.type === 'youtube_upload') {
+      sources.forEach((path, zeroIndex) => {
+        const name = queuePathName(path);
+        const local = localVideoCache.get(path) || [...localVideoCache.values()].find(v => v.name === name) || {};
+        const failure = [...logs].reverse().find(line => String(line).includes(name) && /(?:failed|error|without a video ID)/i.test(String(line))) || '';
+        const completion = logs.some(line => String(line).includes(name) && /YouTube Upload completed:/i.test(String(line)));
+        const started = logs.some(line => String(line).includes(name) && /(?:Uploading local VOD file:|YouTube Upload starting:)/i.test(String(line)));
+        let stateName = 'waiting';
+        if (failure) stateName = 'error';
+        else if (completion || job.status === 'fertig') stateName = 'completed';
+        else if (job.status === 'läuft' && progress.uploadFile && progress.uploadFile.includes(name)) stateName = 'running';
+        else if (job.status === 'läuft' && started) stateName = 'running';
+        else if (job.status === 'fehler') stateName = 'error';
+        const operation = stateName === 'running' ? 'Uploading to YouTube' : stateName === 'completed' ? 'YouTube upload completed' : stateName === 'error' ? 'YouTube upload failed' : 'Waiting to upload';
+        items.push({
+          job, state: stateName, operation,
+          streamer: local.streamer || '', date: local.date_de || '', title: local.title || local.youtube_title || name,
+          progress: stateName === 'running' ? progress.uploadProgress : null, extra: '', error: failure || (stateName === 'error' ? queueErrorFromLines(logs) : ''), index: zeroIndex
+        });
+      });
+      return;
+    }
+
+    sources.forEach((url, zeroIndex) => {
+      const index = zeroIndex + 1;
+      const meta = queueMetadataByUrl(url);
+      const segment = downloadLogSegment(logs, index);
+      const failed = segment.some(line => /ended with error code/i.test(String(line)));
+      const completed = segment.some(line => new RegExp(`VOD\\s+${index}\\/\\d+ download completed`, 'i').test(String(line)));
+      const trackedStatus = Array.isArray(job.item_statuses) ? job.item_statuses[zeroIndex] : '';
+      let stateName = 'waiting';
+      if (trackedStatus === 'fehler') stateName = 'error';
+      else if (trackedStatus === 'fertig') stateName = 'completed';
+      else if (trackedStatus === 'läuft') stateName = 'running';
+      else if (trackedStatus === 'wartet' && job.status === 'fehler') stateName = 'error';
+      else if (trackedStatus === 'wartet' && job.status === 'fertig') stateName = 'completed';
+      else if (trackedStatus === 'wartet') stateName = 'waiting';
+      else if (failed) stateName = 'error';
+      else if (completed || job.status === 'fertig') stateName = 'completed';
+      else if (job.status === 'läuft' && progress.batchCurrent === index) stateName = 'running';
+      else if (job.status === 'läuft' && progress.batchCurrent && progress.batchCurrent > index) stateName = 'completed';
+      else if (job.status === 'fehler') stateName = 'error';
+      const vodId = queueVodId(url);
+      const operation = stateName === 'running' ? 'Downloading' : stateName === 'completed' ? 'Download completed' : stateName === 'error' ? 'Download failed' : 'Waiting to download';
+      items.push({
+        job, state: stateName, operation,
+        streamer: meta.streamer || '', date: meta.date || '', title: meta.title || (vodId ? `Twitch VOD ${vodId}` : job.label),
+        progress: stateName === 'running' ? progress.downloadProgress : null,
+        extra: stateName === 'running' ? [progress.downloadSpeed, progress.eta ? `ETA ${progress.eta}` : ''].filter(Boolean).join(' · ') : '',
+        error: stateName === 'error' ? queueErrorFromLines(segment.length ? segment : logs) : '', index: zeroIndex
+      });
+    });
+  });
+  return items;
+}
+
+function renderQueueVodItem(item, compact=false) {
+  const identity = [item.streamer, item.date].filter(Boolean).join(' · ');
+  const status = item.state === 'running' ? item.operation : niceStatus(item.state === 'waiting' ? 'wartet' : item.state === 'completed' ? 'fertig' : 'fehler');
+  const logText = (item.job.log || []).slice(-120).join('\n');
+  const progress = item.state === 'running' ? renderProgressBar(item.operation, item.progress, item.extra) : '';
+  const error = item.error ? `<div class="queue-item-error">${escapeHtml(item.error)}</div>` : '';
+  if (compact) {
+    return `<article class="queue-vod-item compact ${item.state === 'error' ? 'has-error' : ''}">
+      <div class="queue-row-identity"><strong>${escapeHtml(item.streamer || 'Unknown streamer')}</strong><span>${escapeHtml(item.date || 'Unknown date')}</span></div>
+      <div class="queue-row-title">${escapeHtml(item.title || item.job.label)}</div>
+      <span class="pill ${item.state === 'error' ? 'bad' : item.state === 'completed' ? 'good' : 'muted'}">${escapeHtml(status)}</span>
+      <details class="technical-details queue-row-details"><summary>${item.state === 'error' ? 'View error' : 'Technical details'}</summary><div class="job-detail-grid"><div><span class="muted">Job ID</span><strong>${escapeHtml(item.job.id)}</strong></div><div><span class="muted">Operation</span><strong>${escapeHtml(item.operation)}</strong></div></div>${error}<pre>${escapeHtml(logText)}</pre></details>
+    </article>`;
+  }
+  return `<article class="queue-vod-item ${compact ? 'compact' : ''} ${item.state === 'error' ? 'has-error' : ''}">
+    <div class="queue-vod-main"><div class="queue-vod-copy">${identity ? `<div class="queue-vod-identity">${escapeHtml(identity)}</div>` : ''}<strong>${escapeHtml(item.title || item.job.label)}</strong></div><span class="pill ${item.state === 'error' ? 'bad' : item.state === 'completed' ? 'good' : item.state === 'running' ? 'accent' : 'muted'}">${escapeHtml(status)}</span></div>
+    ${error}${progress}
+    <details class="technical-details"><summary>Technical details</summary><div class="job-detail-grid"><div><span class="muted">Job ID</span><strong>${escapeHtml(item.job.id)}</strong></div><div><span class="muted">Operation</span><strong>${escapeHtml(item.operation)}</strong></div></div><pre>${escapeHtml(logText)}</pre></details>
+  </article>`;
+}
+
+function renderQueueGroup(id, items, emptyMessage, compact=false) {
+  const box = $(id);
+  if (!box) return;
+  box.classList.toggle('muted', !items.length);
+  box.innerHTML = items.length ? items.map(item => renderQueueVodItem(item, compact)).join('') : escapeHtml(emptyMessage);
+}
+
+function renderVodQueue(jobs) {
+  const items = queueItemsFromJobs(jobs);
+  const running = items.filter(item => item.state === 'running');
+  const waiting = items.filter(item => item.state === 'waiting');
+  const errors = items.filter(item => item.state === 'error');
+  const completed = items.filter(item => item.state === 'completed').reverse();
+  renderQueueGroup('queueRunning', running, 'No downloads or uploads are currently running.');
+  renderQueueGroup('queueWaiting', waiting, 'Nothing is waiting.', true);
+  renderQueueGroup('queueErrors', errors, 'No errors.', true);
+  renderQueueGroup('queueCompleted', completed, 'Nothing completed in this session.', true);
+  if ($('queueActive')) $('queueActive').textContent = String(running.length);
+  if ($('queueWaitingCount')) $('queueWaitingCount').textContent = String(waiting.length);
+  if ($('queueFailed')) $('queueFailed').textContent = String(errors.length);
+  if ($('queueDone')) $('queueDone').textContent = String(completed.length);
+  if ($('queueErrorsSection')) $('queueErrorsSection').classList.toggle('hidden', errors.length === 0);
+  return {items, running, waiting, errors, completed};
+}
+
 
 async function pollJobs() {
   collectOpenStates();
   const data = await api('/api/jobs');
   const box = $('jobs');
   updateQueueSummary(data.jobs || []);
+  renderVodQueue(data.jobs || []);
   if (!data.jobs.length) {
     box.textContent = 'No downloads in this session yet.';
     updateQueueSummary([]);
@@ -858,150 +1080,35 @@ async function pollJobs() {
 }
 
 
-function setSetupItemState(id, stateName, text) {
-  const item = document.getElementById(id);
-  if (!item) return;
-  item.classList.remove('good', 'warn', 'bad');
-  item.classList.add(stateName);
-  const textEl = document.getElementById(id + 'Text');
-  if (textEl) textEl.textContent = text;
-}
-
-function updateCommandCenter(data) {
-  if (!state || !state.settings) return;
-  const yt = data.youtube || {};
-  const disk = data.disk || {};
-  const streamerCount = (state.streamers || []).length;
-  let ready = 0;
-
-  if (streamerCount > 0) {
-    ready++;
-    setSetupItemState('setupStreamers', 'good', `${streamerCount} streamers loaded.`);
-  } else {
-    setSetupItemState('setupStreamers', 'bad', 'No streamers loaded. Check the streamer file or save the list.');
-  }
-
-  if (yt.connected) {
-    ready++;
-    setSetupItemState('setupYoutube', 'good', `Connected${yt.channel_title ? ': ' + yt.channel_title : ''}.`);
-  } else if (yt.client_secret_exists) {
-    setSetupItemState('setupYoutube', 'warn', 'client_secret.json found, but YouTube is not connected.');
-  } else {
-    setSetupItemState('setupYoutube', 'bad', 'client_secret.json is missing or its path is incorrect.');
-  }
-
-  if (disk.ok && disk.free_gb >= 50) {
-    ready++;
-    setSetupItemState('setupStorage', 'good', `${disk.free_gb} GB free.`);
-  } else if (disk.ok) {
-    setSetupItemState('setupStorage', 'warn', `${disk.free_gb} GB free. Large VODs may run out of space.`);
-  } else {
-    setSetupItemState('setupStorage', 'warn', 'Storage information is unavailable.');
-  }
-
-  if (data.jobs_failed > 0) {
-    setSetupItemState('setupWorkflow', 'bad', `${data.jobs_failed} job(s) failed. Check the queue.`);
-  } else if (data.jobs_active > 0) {
-    ready++;
-    setSetupItemState('setupWorkflow', 'good', `${data.jobs_active} job(s) running.`);
-  } else {
-    ready++;
-    setSetupItemState('setupWorkflow', 'good', 'Ready to search or download a single VOD.');
-  }
-
-  const score = document.getElementById('setupScore');
-  if (score) score.textContent = `${ready}/4 ready`;
-
-  const next = decideNextAction(data, yt, disk, streamerCount);
-  const title = document.getElementById('nextActionTitle');
-  const text = document.getElementById('nextActionText');
-  const btn = document.getElementById('nextActionButton');
-  if (title) title.textContent = next.title;
-  if (text) text.textContent = next.text;
-  if (btn) {
-    btn.textContent = next.button;
-    btn.dataset.page = next.page;
-    btn.onclick = () => showPage(next.page);
-  }
-}
-
-function decideNextAction(data, yt, disk, streamerCount) {
-  if (streamerCount === 0) {
-    return {
-      title: 'Add Streamers First',
-      text: 'VOD Search needs a streamer list. Open Streamers, check the file, and save the list.',
-      button: 'Open Streamers',
-      page: 'streamers'
-    };
-  }
-  if (data.jobs_failed > 0) {
-    return {
-      title: 'Review Failed Jobs',
-      text: 'One or more jobs failed. Open the queue, expand the details, and check the latest error.',
-      button: 'Open Queue',
-      page: 'queue'
-    };
-  }
-  if (!yt.connected) {
-    return {
-      title: yt.client_secret_exists ? 'Connect YouTube' : 'Add client_secret.json',
-      text: yt.client_secret_exists ? 'The client secret is available. Connect your YouTube channel now.' : 'Add client_secret.json to the dashboard data folder, then connect YouTube.',
-      button: 'Open YouTube',
-      page: 'youtube'
-    };
-  }
-  if (disk.ok && disk.free_gb < 50) {
-    return {
-      title: 'Check Available Storage',
-      text: 'Large VODs may fail when storage is low. Check the download path or upload and clean up local VODs.',
-      button: 'Local VODs',
-      page: 'localuploads'
-    };
-  }
-  return {
-    title: 'Ready for the Next Download',
-    text: 'Search VODs by date range or enter a VOD link for a quick download.',
-    button: 'Search VODs',
-    page: 'search'
-  };
-}
-
-
 async function refreshDashboard() {
   try {
-    const data = await api('/api/dashboard');
+    const [data, jobsData] = await Promise.all([api('/api/dashboard'), api('/api/jobs')]);
     const yt = data.youtube || {};
     const disk = data.disk || {};
-    const ytText = yt.connected ? `Connected: ${yt.channel_title || 'Channel'}` : (yt.client_secret_exists ? 'Not Connected' : 'Missing client_secret');
-    const jobsText = `${data.jobs_active} active · ${data.jobs_finished} completed · ${data.jobs_failed} errors`;
-    const diskText = disk.ok ? `${disk.free_gb} GB free` : 'Unavailable';
-    const uploadText = `${data.upload_mode} · ${data.upload_chunk_mb} MB`;
-    $('statusYoutube').textContent = 'YouTube: ' + ytText;
-    $('statusJobs').textContent = 'Jobs: ' + jobsText;
-    $('statusDisk').textContent = 'Storage: ' + diskText;
-    $('statusUploadMode').textContent = 'Upload: ' + uploadText;
-    $('dashYoutube').textContent = ytText;
-    $('dashYoutubeHint').textContent = yt.connected ? 'Uploads are available.' : 'Connect YouTube or check client_secret.json.';
-    $('dashJobs').textContent = jobsText;
-    $('dashDisk').textContent = diskText;
-    $('dashUploadMode').textContent = uploadText;
-    const hints = [];
-    if (!yt.connected) hints.push(['YouTube Not Connected', 'Connect YouTube before enabling automatic uploads.', 'youtube']);
-    if (data.jobs_failed > 0) hints.push(['Failed Jobs', 'Open queue details and review the errors.', 'queue']);
-    if (disk.ok && disk.free_gb < 50) hints.push(['Low Storage', 'Large VOD downloads may fail. Check the download folder and available storage.', 'settings']);
-    if (!hints.length) hints.push(['Ready', 'You can search VODs or start a quick download.', 'search']);
-    $('dashboardHints').innerHTML = hints.map(h => `<div class="hint-item"><div><strong>${escapeHtml(h[0])}</strong><span>${escapeHtml(h[1])}</span></div><button class="goto-page" data-page="${escapeHtml(h[2])}">Open</button></div>`).join('');
-    document.querySelectorAll('.goto-page').forEach(btn => btn.onclick = () => showPage(btn.dataset.page));
-    updateCommandCenter(data);
+    const queue = queueItemsFromJobs(jobsData.jobs || []);
+    const running = queue.filter(item => item.state === 'running');
+    const waiting = queue.filter(item => item.state === 'waiting');
+    const errors = queue.filter(item => item.state === 'error');
+    const hasActivity = running.length > 0 || waiting.length > 0;
+    renderQueueGroup('dashboardRunning', running.slice(0, 4), 'No downloads or uploads are currently running.', true);
+    renderQueueGroup('dashboardUpcoming', waiting.slice(0, 5), 'Nothing is waiting.', true);
+    $('dashboardRunningSection').classList.toggle('hidden', !hasActivity);
+    $('dashboardUpcomingSection').classList.toggle('hidden', !hasActivity);
+
+    const alerts = [];
+    if (errors.length) alerts.push(`<article class="action-alert bad-alert"><div><strong>${errors.length} VOD${errors.length === 1 ? '' : 's'} need attention</strong><span>${escapeHtml(errors[0].title || errors[0].job.label)}${errors.length > 1 ? ` and ${errors.length - 1} more` : ''}</span></div><button type="button" class="goto-page" data-page="queue">View Error${errors.length === 1 ? '' : 's'}</button></article>`);
+    if (state && state.settings && state.settings.youtube_enabled && !yt.connected) alerts.push('<article class="action-alert warn-alert"><div><strong>YouTube is not connected</strong><span>Connect YouTube before starting an upload.</span></div><button type="button" class="goto-page" data-page="settings" data-settings-target="youtube">Open YouTube Settings</button></article>');
+    if (disk.ok && disk.free_gb < 50) alerts.push(`<article class="action-alert warn-alert"><div><strong>Storage is running low</strong><span>${escapeHtml(disk.free_gb)} GB is available for VOD downloads.</span></div><button type="button" class="goto-page" data-page="settings" data-settings-target="advanced">Review Settings</button></article>`);
+    $('dashboardAlerts').innerHTML = alerts.join('');
+    $('dashboardIdle').classList.toggle('hidden', hasActivity);
+    document.querySelectorAll('#page-dashboard .goto-page').forEach(btn => btn.onclick = () => {
+      showPage(btn.dataset.page);
+      if (btn.dataset.settingsTarget) showSettingsTab(btn.dataset.settingsTarget);
+    });
   } catch (e) {
-    $('statusYoutube').textContent = 'Status: Error';
-    const nextTitle = document.getElementById('nextActionTitle');
-    const nextText = document.getElementById('nextActionText');
-    if (nextTitle) nextTitle.textContent = 'Command Center: Status Error';
-    if (nextText) nextText.textContent = e.message;
+    if ($('dashboardAlerts')) $('dashboardAlerts').innerHTML = `<article class="action-alert bad-alert"><div><strong>Dashboard status could not be loaded</strong><span>${escapeHtml(e.message)}</span></div></article>`;
   }
 }
-
 
 let localVideoCache = new Map();
 
@@ -1033,46 +1140,18 @@ function localVideoByPath(path) {
 }
 
 function renderLocalVideoCard(v) {
-  const statusClassName = workspaceStatusClass(v);
   const marked = v.manually_uploaded || v.dashboard_uploaded;
-  const actionMark = marked
-    ? `<button type="button" class="video-action" data-action="move" data-path="${escapeHtml(v.path)}">Move to _hochgeladen</button>`
-    : `<button type="button" class="video-action" data-action="mark" data-path="${escapeHtml(v.path)}">Mark as Uploaded</button>`;
-
-  return `
-    <article class="video-workspace-card ${marked ? 'is-uploaded' : ''}" data-video-path="${escapeHtml(v.path)}">
-      <div class="video-card-top">
-        <label class="video-select"><input class="localvideocheck" type="checkbox" data-path="${escapeHtml(v.path)}" ${v.already_uploaded ? '' : 'checked'}><span>Select</span></label>
-        <span class="pill ${statusClassName}">${escapeHtml(workspaceStatusLabel(v))}</span>
-      </div>
-
-      <div class="video-file-block">
-        <strong title="${escapeHtml(v.name)}">${escapeHtml(v.name)}</strong>
-        <span>${escapeHtml(v.streamer || 'Unknown')} · ${escapeHtml(v.date_de || 'Unknown Date')} · ${escapeHtml(v.size_gb)} GB</span>
-        <small title="${escapeHtml(v.folder)}">${escapeHtml(v.folder)}</small>
-      </div>
-
-      <div class="video-title-preview">
-        <span>YouTube Title</span>
-        <strong>${escapeHtml(v.youtube_title || v.title || '')}</strong>
-      </div>
-
-      <div class="video-primary-actions">
-        <button type="button" class="primary video-action" data-action="workflow" data-path="${escapeHtml(v.path)}">YouTube Studio + Show in Folder</button>
-        <button type="button" class="video-action" data-action="explorer" data-path="${escapeHtml(v.path)}">Show in Folder</button>
-      </div>
-
-      <div class="video-copy-actions">
-        <button type="button" class="video-action" data-action="copy-title" data-path="${escapeHtml(v.path)}">Copy Title</button>
-        <button type="button" class="video-action" data-action="copy-description" data-path="${escapeHtml(v.path)}">Copy Description</button>
-        <button type="button" class="video-action" data-action="open-txt" data-path="${escapeHtml(v.path)}" ${v.description_file_exists ? '' : 'disabled'}>Open TXT</button>
-      </div>
-
-      <div class="video-cleanup-actions">
-        ${actionMark}
-        <button type="button" class="danger-outline video-action" data-action="delete" data-path="${escapeHtml(v.path)}">Delete Permanently</button>
-      </div>
-    </article>`;
+  const statusClassName = workspaceStatusClass(v);
+  return `<article class="video-workspace-card ${marked ? 'is-uploaded' : ''}" data-video-path="${escapeHtml(v.path)}">
+    <label class="video-select"><input class="localvideocheck" type="checkbox" data-path="${escapeHtml(v.path)}" ${v.already_uploaded ? '' : 'checked'}><span>Select</span></label>
+    <div class="video-person"><strong>${escapeHtml(v.streamer || 'Unknown streamer')}</strong><span>${escapeHtml(v.date_de || 'Unknown date')}</span></div>
+    <strong class="video-display-title">${escapeHtml(v.title || v.youtube_title || v.name)}</strong>
+    <span class="video-size">${escapeHtml(v.size_gb)} GB</span>
+    <span class="metadata-status ${v.prepared ? 'good' : 'muted'}">${v.prepared ? 'Metadata ready' : 'Metadata needed'}</span>
+    <span class="pill ${statusClassName}">${escapeHtml(workspaceStatusLabel(v))}</span>
+    <div class="video-primary-actions">${marked ? '' : `<button type="button" class="primary video-action" data-action="upload" data-path="${escapeHtml(v.path)}">Upload</button><button type="button" class="video-action" data-action="prepare" data-path="${escapeHtml(v.path)}">Prepare</button>`}</div>
+    <details class="technical-details secondary-actions"><summary>More actions</summary><div class="video-copy-actions"><button type="button" class="video-action" data-action="copy-title" data-path="${escapeHtml(v.path)}">Copy Title</button><button type="button" class="video-action" data-action="copy-description" data-path="${escapeHtml(v.path)}">Copy Description</button>${marked ? '' : `<button type="button" class="video-action" data-action="mark" data-path="${escapeHtml(v.path)}">Mark as Uploaded</button>`}</div><div class="danger-zone"><strong>Delete the local VOD file and its sidecars</strong><button type="button" class="danger-outline video-action" data-action="delete" data-path="${escapeHtml(v.path)}">Delete Permanently</button></div></details>
+  </article>`;
 }
 
 async function loadLocalVideos() {
@@ -1087,12 +1166,8 @@ async function loadLocalVideos() {
   const counts = data.counts || {};
 
   if ($('workspacePending')) $('workspacePending').textContent = String(counts.pending || 0);
-  if ($('workspaceUploaded')) $('workspaceUploaded').textContent = String(counts.uploaded || 0);
-  if ($('workspaceTotal')) $('workspaceTotal').textContent = String(counts.total || 0);
-  if ($('workspaceSize')) $('workspaceSize').textContent = `${counts.size_gb || 0} GB`;
-
   if (info) {
-    info.textContent = `${videos.length} VOD file(s) shown · Media root: ${data.root}`;
+    info.textContent = includeUploaded ? `${counts.pending || 0} ready · ${counts.uploaded || 0} uploaded or archived` : `${counts.pending || 0} ready for upload`;
     info.className = 'inline-status muted';
   }
 
@@ -1112,14 +1187,20 @@ async function handleLocalVideoAction(action, path) {
   const video = localVideoByPath(path);
   if (!video) throw new Error('VOD data is no longer available. Refresh the file list.');
 
-  if (action === 'explorer') {
-    await api('/api/local-video/open', { method:'POST', body: JSON.stringify({ path, mode:'select' }) });
-    showToast('VOD selected in its folder.');
+  if (action === 'upload') {
+    await api('/api/youtube/upload-local', { method:'POST', body: JSON.stringify({ paths:[path] }) });
+    showToast('VOD added to the upload queue.');
+    showPage('queue');
+    await pollJobs();
     return;
   }
 
-  if (action === 'open-txt') {
-    await api('/api/local-video/open', { method:'POST', body: JSON.stringify({ path, mode:'description' }) });
+  if (action === 'prepare') {
+    await saveCurrentSettingsSilently();
+    const result = await api('/api/manual-upload/prepare-local', { method:'POST', body: JSON.stringify({ paths:[path] }) });
+    if ((result.errors || []).length) throw new Error(result.errors[0].error || 'The VOD could not be prepared.');
+    showToast('YouTube metadata prepared.');
+    await loadLocalVideos();
     return;
   }
 
@@ -1133,15 +1214,6 @@ async function handleLocalVideoAction(action, path) {
     return;
   }
 
-  if (action === 'workflow') {
-    // Sofort öffnen, damit Browser den Tab nicht als Popup blockiert.
-    window.open('https://studio.youtube.com', '_blank', 'noopener');
-    await copyTextToClipboard(video.youtube_title || video.title, 'YouTube title');
-    await api('/api/local-video/open', { method:'POST', body: JSON.stringify({ path, mode:'select' }) });
-    showToast('Opened YouTube Studio, selected the VOD in its folder, and copied the title. Upload remains manual.');
-    return;
-  }
-
   if (action === 'mark') {
     if (!confirm(`Has the YouTube upload completed?
 
@@ -1150,19 +1222,6 @@ ${video.name}
 The VOD will be marked as manually uploaded.`)) return;
     await api('/api/local-video/mark-uploaded', { method:'POST', body: JSON.stringify({ path }) });
     showToast('Marked as manually uploaded.');
-    await loadLocalVideos();
-    return;
-  }
-
-  if (action === 'move') {
-    if (!confirm(`Move this VOD to the _hochgeladen folder?
-
-${video.name}
-
-The original will no longer remain in its current folder.`)) return;
-    const result = await api('/api/local-video/move-uploaded', { method:'POST', body: JSON.stringify({ path }) });
-    if (!result.source_removed) throw new Error('The source was not removed, so the move is considered unsuccessful.');
-    showToast('VOD moved and source removed.');
     await loadLocalVideos();
     return;
   }
@@ -1255,17 +1314,30 @@ async function checkStreamerFileStatus() {
 }
 
 async function refreshYoutubeStatus() {
+  const status = $('youtubeStatus');
+  const refreshButton = $('youtubeLoadPlaylists');
+  const playlist = $('youtubePlaylistId');
+  const connectButton = $('youtubeConnect');
   try {
     const data = await api('/api/youtube/status');
-    let text = 'YouTube: ';
-    if (!data.google_libs_available) text += 'Required libraries are unavailable.';
-    else if (data.connected) text += `Connected to ${data.channel_title || 'Channel'}`;
-    else if (!data.client_secret_exists) text += 'client_secret.json is missing.';
-    else if (!data.token_exists) text += 'Not connected.';
-    else text += data.error ? `Error: ${data.error}` : 'Not connected.';
-    $('youtubeStatus').textContent = text;
+    if (!data.google_libs_available) status.textContent = 'YouTube support is unavailable because the required libraries are not installed.';
+    else if (data.connected) status.textContent = `Connected to ${data.channel_title || 'your YouTube channel'}.`;
+    else if (!data.client_secret_exists) status.textContent = 'YouTube setup is incomplete. Add the client secret in Advanced YouTube options, then connect your account.';
+    else status.textContent = 'YouTube is not connected. Connect your account to enable uploads.';
+    status.className = `connection-status ${data.connected ? 'good' : 'muted'}`;
+    if (refreshButton) {
+      refreshButton.disabled = !data.connected;
+      refreshButton.title = data.connected ? 'Reload playlists from YouTube' : 'Connect YouTube before loading playlists';
+    }
+    if (playlist) playlist.disabled = !data.connected;
+    if (connectButton) connectButton.textContent = data.connected ? 'Reconnect YouTube' : 'Connect YouTube';
+    return data;
   } catch (e) {
-    $('youtubeStatus').textContent = 'YouTube Error: ' + e.message;
+    status.textContent = 'YouTube status could not be checked. Try again in a moment.';
+    status.className = 'connection-status bad';
+    if (refreshButton) refreshButton.disabled = true;
+    if (playlist) playlist.disabled = true;
+    return null;
   }
 }
 
@@ -1277,6 +1349,12 @@ async function loadYoutubePlaylists() {
   return data;
 }
 
+function friendlyYoutubeConnectError(message) {
+  const clean = String(message || '').replace(/\b[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception):\s*/g, '').trim();
+  if (/not connected/i.test(clean)) return 'YouTube is not connected. Connect your account to enable uploads.';
+  return clean || 'YouTube could not be connected. Check the setup and try again.';
+}
+
 
 
 async function saveYoutubeSettings() {
@@ -1286,26 +1364,6 @@ async function saveYoutubeSettings() {
   await refreshDashboard();
   markSettingsSaved('saved: ' + (saved._saved_at || new Date().toLocaleTimeString()));
   alert('YouTube settings saved.\n\nFile: ' + (saved._settings_file || state.settings_file || 'unknown'));
-}
-
-async function previewYoutubeMetadata() {
-  const path = $('youtubePreviewPath').value.trim();
-  if (!path) {
-    alert('Enter a local VOD path to preview.');
-    return;
-  }
-  await saveCurrentSettingsSilently();
-  const data = await api('/api/youtube/preview-file', { method:'POST', body: JSON.stringify({ path }) });
-  const m = data.meta || {};
-  $('youtubePreviewBox').classList.remove('muted');
-  $('youtubePreviewBox').innerHTML = `
-    <div><span>Title</span><strong>${escapeHtml(data.title || '')}</strong></div>
-    <div><span>Date</span><strong>${escapeHtml(m.date_de || m.date || 'unknown')}</strong></div>
-    <div><span>Streamer</span><strong>${escapeHtml(m.streamer || 'unknown')}</strong></div>
-    <div><span>VOD ID</span><strong>${escapeHtml(m.vod_id || 'unknown')}</strong></div>
-    <div><span>Original</span><strong>${m.url ? `<a href="${escapeHtml(m.url)}" target="_blank">${escapeHtml(m.url)}</a>` : 'unknown'}</strong></div>
-    <div class="wide-preview"><span>Description</span><pre>${escapeHtml(data.description || '')}</pre></div>
-  `;
 }
 
 $('presetToday').addEventListener('click', () => setDateRange(1));
@@ -1323,14 +1381,19 @@ $('checkAll').addEventListener('change', e => { document.querySelectorAll('.rowc
 $('downloadSelected').addEventListener('click', () => downloadSelectedWithConfirm().catch(e => alert(e.message)));
 $('selectNewResults').addEventListener('click', () => selectNewResults());
 $('clearResultsSelection').addEventListener('click', () => clearResultsSelection());
-$('validateSingleVod').addEventListener('click', () => validateSingleVodLink(true).catch(e => { setSingleVodStatus('Error: ' + e.message, 'bad'); alert(e.message); }));
 $('singleDownload').addEventListener('click', () => startSingleVodDownload().catch(e => { setSingleVodStatus('Error: ' + e.message, 'bad'); alert('VOD download failed:\n\n' + e.message); }));
+$('streamerAddButton').addEventListener('click', addStreamerFromInput);
+$('streamerAddInput').addEventListener('keydown', event => {
+  if (event.key !== 'Enter') return;
+  event.preventDefault();
+  addStreamerFromInput();
+});
 $('saveStreamers').addEventListener('click', async () => {
   const saved = await api('/api/streamers', { method:'POST', body: JSON.stringify({ streamers: $('streamersText').value }) });
   await loadState();
   if ($('streamerFileInfo')) $('streamerFileInfo').textContent = saved.streamer_file || state.streamer_file_resolved || 'unknown';
   if ($('streamerFileStatus')) $('streamerFileStatus').textContent = `${saved.count || 0} streamers saved`;
-  alert('Streamers saved.\n\nFile: ' + (saved.streamer_file || 'unknown') + '\nCount: ' + (saved.count || 0));
+  showToast(`${saved.count || 0} streamer${saved.count === 1 ? '' : 's'} saved.`);
 });
 $('saveSettings').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'settings'));
 $('youtubeConnect').addEventListener('click', async () => {
@@ -1344,26 +1407,12 @@ $('youtubeConnect').addEventListener('click', async () => {
     alert('YouTube connected' + (data.channel_title ? ': ' + data.channel_title : '.') + tokenPath);
   } catch (e) {
     await refreshYoutubeStatus().catch(()=>{});
-    alert('YouTube connection failed:\n\n' + e.message);
+    alert('YouTube connection failed:\n\n' + friendlyYoutubeConnectError(e.message));
   }
 });
 $('youtubeLoadPlaylists').addEventListener('click', () => loadYoutubePlaylists().then(() => alert('Playlists loaded.')).catch(e => alert(e.message)));
 $('saveYoutubeSettings').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'youtube'));
 $('saveYoutubeSettingsBottom').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'youtube'));
-$('openFolder').addEventListener('click', () => api('/api/open-folder', { method:'POST', body:'{}' }).catch(e => alert(e.message)));
-$('youtubePreviewBtn').addEventListener('click', () => previewYoutubeMetadata().catch(e => alert(e.message)));
-$('jobAutoExpand').addEventListener('change', e => {
-  autoExpandJobDetails = !!e.target.checked;
-  localStorage.setItem('vodJobAutoExpand', autoExpandJobDetails ? '1' : '0');
-  Object.keys(jobOpenState).forEach(id => jobOpenState[id] = autoExpandJobDetails);
-  pollJobs().catch(() => {});
-});
-$('toggleJobDetails').addEventListener('click', () => {
-  const ids = Object.keys(jobOpenState);
-  const shouldOpen = ids.some(id => !jobOpenState[id]) || !ids.length;
-  ids.forEach(id => jobOpenState[id] = shouldOpen);
-  pollJobs().catch(() => {});
-});
 
 setInterval(() => pollJobs().catch(() => {}), 2000);
 loadState().then(() => {
@@ -1386,7 +1435,8 @@ loadState().then(() => {
       btn.onclick = function(ev) {
         ev.preventDefault();
         const page = btn.dataset.page || 'dashboard';
-        if (window.vodShowPage) window.vodShowPage(page);
+        if (typeof showPage === 'function') showPage(page);
+        else if (window.vodShowPage) window.vodShowPage(page);
         if (typeof refreshDashboard === 'function') refreshDashboard().catch(function(){});
         return false;
       };
@@ -1487,13 +1537,6 @@ document.addEventListener('DOMContentLoaded', function() {
     return false;
   };
 
-  const studio = document.getElementById('openYoutubeStudio');
-  if (studio) studio.onclick = function(ev) {
-    ev.preventDefault();
-    window.open('https://studio.youtube.com', '_blank', 'noopener');
-    return false;
-  };
-
   const includeUploaded = document.getElementById('includeUploadedLocalVideos');
   if (includeUploaded) includeUploaded.onchange = function() {
     loadLocalVideos().catch(e => alert(e.message));
@@ -1523,4 +1566,28 @@ document.addEventListener('DOMContentLoaded', function() {
     document.body.dataset.activePage = active ? active.id.replace('page-', '') : 'dashboard';
   }
   if (typeof refreshSelectionState === 'function') refreshSelectionState();
+});
+
+document.addEventListener('DOMContentLoaded', function() {
+  document.querySelectorAll('.settings-tab').forEach(tab => {
+    tab.addEventListener('click', () => showSettingsTab(tab.dataset.settingsTab));
+  });
+  let initialTab = 'general';
+  try { initialTab = localStorage.getItem('vodSettingsTab') || 'general'; } catch {}
+  showSettingsTab(initialTab);
+
+  const toggle = document.getElementById('mobileNavToggle');
+  const sidebar = document.getElementById('appSidebar');
+  if (toggle && sidebar) {
+    toggle.addEventListener('click', () => {
+      const open = sidebar.classList.toggle('mobile-open');
+      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      toggle.textContent = open ? 'Close' : 'Menu';
+    });
+    sidebar.querySelectorAll('.nav-btn').forEach(btn => btn.addEventListener('click', () => {
+      sidebar.classList.remove('mobile-open');
+      toggle.setAttribute('aria-expanded', 'false');
+      toggle.textContent = 'Menu';
+    }));
+  }
 });

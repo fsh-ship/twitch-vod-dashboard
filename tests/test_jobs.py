@@ -61,6 +61,7 @@ class JobManagerTests(unittest.TestCase):
                 "created": "2026-08-11 12:34:56",
                 "urls": urls,
                 "total_urls": 1,
+                "item_statuses": ["wartet"],
                 "log": [],
                 "returncode": None,
             },
@@ -170,6 +171,19 @@ class JobManagerTests(unittest.TestCase):
         self.assertIsNone(manager.get_job("missing"))
         self.assertFalse(manager.update_job("missing", status="fehler"))
 
+    def test_unexpected_exit_fails_only_unfinished_download_items(self):
+        manager = self.manager()
+        job_id = manager.create_download_job(["one", "two", "three"], "Batch")
+        manager.set_download_item_status(job_id, 1, "fertig")
+        manager.set_download_item_status(job_id, 2, "läuft")
+
+        manager.fail_unfinished_download_items(job_id)
+
+        self.assertEqual(
+            manager.jobs[job_id]["item_statuses"],
+            ["fertig", "fehler", "fehler"],
+        )
+
     def test_worker_thread_is_daemon_and_receives_job_id(self):
         manager = self.manager()
         target = mock.Mock()
@@ -228,6 +242,10 @@ class DownloadWorkerTests(unittest.TestCase):
 
         def popen(command, **kwargs):
             self.assertEqual(self.manager.jobs["1"]["status"], "läuft")
+            active_index = len(process_calls)
+            self.assertEqual(
+                self.manager.jobs["1"]["item_statuses"][active_index], "läuft"
+            )
             process = mock.Mock()
             process.stdout = ["yt-dlp output\n"]
             process.wait.return_value = next(returncodes)
@@ -268,6 +286,7 @@ class DownloadWorkerTests(unittest.TestCase):
 
         job = self.manager.jobs[job_id]
         self.assertEqual((job["status"], job["returncode"]), ("fertig", 0))
+        self.assertEqual(job["item_statuses"], ["fertig"])
         prepare.assert_called_once_with(video, self.settings, job_id=job_id)
         dependencies.new_video_files.assert_called_once_with(
             {"old.mp4": 1.0}, {"old.mp4": 1.0, "new.mp4": 2.0}
@@ -286,6 +305,7 @@ class DownloadWorkerTests(unittest.TestCase):
 
         self.assertEqual(self.manager.jobs[job_id]["status"], "fehler")
         self.assertEqual(self.manager.jobs[job_id]["returncode"], 1)
+        self.assertEqual(self.manager.jobs[job_id]["item_statuses"], ["fehler"])
         prepare.assert_not_called()
         self.assertIn(
             "VOD 1/1 ended with error code 9. Continuing with the next VOD.",
@@ -320,6 +340,7 @@ class DownloadWorkerTests(unittest.TestCase):
 
         self.assertEqual(self.manager.jobs[job_id]["status"], "fehler")
         self.assertEqual(self.manager.jobs[job_id]["returncode"], -2)
+        self.assertEqual(self.manager.jobs[job_id]["item_statuses"], ["fertig"])
         self.assertIn("Error: prepare failed", self.manager.jobs[job_id]["log"])
 
     def test_auto_upload_disabled_still_prepares_but_never_uploads(self):
@@ -391,6 +412,9 @@ class DownloadWorkerTests(unittest.TestCase):
         self.assertEqual(len(process_calls), 2)
         self.assertEqual(events, ["download", "download", "prepare", "prepare"])
         self.assertEqual(self.manager.jobs[job_id]["status"], "fertig")
+        self.assertEqual(
+            self.manager.jobs[job_id]["item_statuses"], ["fertig", "fertig"]
+        )
 
     def test_missing_subprocess_sets_not_found_returncode(self):
         job_id = self.create_job()
@@ -406,6 +430,7 @@ class DownloadWorkerTests(unittest.TestCase):
 
         self.assertEqual(self.manager.jobs[job_id]["status"], "fehler")
         self.assertEqual(self.manager.jobs[job_id]["returncode"], -1)
+        self.assertEqual(self.manager.jobs[job_id]["item_statuses"], ["fehler"])
 
 
 class UploadWorkerTests(unittest.TestCase):

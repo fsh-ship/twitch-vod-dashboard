@@ -1990,11 +1990,13 @@ class JobContractTests(IsolatedDashboardTestCase):
                 "created",
                 "urls",
                 "total_urls",
+                "item_statuses",
                 "log",
                 "returncode",
             },
         )
         self.assertEqual(dashboard.jobs[first]["status"], "wartet")
+        self.assertEqual(dashboard.jobs[first]["item_statuses"], ["wartet"])
         self.assertEqual(dashboard.jobs[first]["total_urls"], 1)
         self.assertRegex(dashboard.jobs[first]["created"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
         self.assertEqual(thread_class.call_count, 2)

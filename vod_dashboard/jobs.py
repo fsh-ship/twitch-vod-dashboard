@@ -108,6 +108,7 @@ class JobManager:
                 "created": self._created_at(),
                 "urls": urls,
                 "total_urls": len(urls),
+                "item_statuses": ["wartet" for _ in urls],
                 "log": [],
                 "returncode": None,
             }
@@ -186,6 +187,34 @@ class JobManager:
     def set_returncode(self, job_id: str, returncode: int) -> None:
         with self.lock:
             self.jobs[job_id]["returncode"] = returncode
+
+    def set_download_item_status(
+        self, job_id: str, item_number: int, status: str
+    ) -> bool:
+        """Update one one-based download item without relying on bounded logs."""
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return False
+            statuses = job.get("item_statuses")
+            index = item_number - 1
+            if not isinstance(statuses, list) or index < 0 or index >= len(statuses):
+                return False
+            statuses[index] = status
+        return True
+
+    def fail_unfinished_download_items(self, job_id: str) -> None:
+        """Mark active and queued items failed after an unexpected worker exit."""
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return
+            statuses = job.get("item_statuses")
+            if not isinstance(statuses, list):
+                return
+            for index, status in enumerate(statuses):
+                if status in {"wartet", "läuft"}:
+                    statuses[index] = "fehler"
 
     def finish_job(self, job_id: str, returncode: int, status: str) -> None:
         with self.lock:
@@ -359,6 +388,7 @@ def run_download_job(
             raise RuntimeError("The job contains no URLs.")
 
         for idx, url in enumerate(urls, start=1):
+            manager.set_download_item_status(job_id, idx, "läuft")
             dependencies.append_log(job_id, "")
             dependencies.append_log(job_id, f"--- VOD {idx}/{total} ---")
             dependencies.append_log(job_id, f"URL: {url}")
@@ -390,6 +420,7 @@ def run_download_job(
 
                 if rc == 0:
                     succeeded += 1
+                    manager.set_download_item_status(job_id, idx, "fertig")
                     dependencies.append_log(
                         job_id, f"VOD {idx}/{total} download completed."
                     )
@@ -417,6 +448,7 @@ def run_download_job(
                         )
                 else:
                     failed += 1
+                    manager.set_download_item_status(job_id, idx, "fehler")
                     dependencies.append_log(
                         job_id,
                         f"VOD {idx}/{total} ended with error code {rc}. Continuing with the next VOD.",
@@ -457,12 +489,14 @@ def run_download_job(
                 f"Batch completed: {succeeded}/{total} successful, {failed} failed.",
             )
     except FileNotFoundError:
+        manager.fail_unfinished_download_items(job_id)
         manager.finish_job(job_id, -1, "fehler")
         dependencies.append_log(
             job_id,
             "The yt-dlp Python module was not found. Install the dependencies from requirements.txt.",
         )
     except Exception as exc:
+        manager.fail_unfinished_download_items(job_id)
         manager.finish_job(job_id, -2, "fehler")
         dependencies.append_log(job_id, f"Error: {exc}")
 
