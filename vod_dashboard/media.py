@@ -9,6 +9,15 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+INCOMPLETE_VIDEO_SUFFIXES = {".temp", ".part", ".partial", ".download", ".ytdl"}
+
+
+def is_complete_video_file(path: Path) -> bool:
+    """Accept supported videos while rejecting known downloader work artifacts."""
+    if path.suffix.lower() not in VIDEO_EXTENSIONS:
+        return False
+    stem_suffix = Path(path.stem).suffix.lower()
+    return stem_suffix not in INCOMPLETE_VIDEO_SUFFIXES
 
 
 def local_video_marker_path(path: Path) -> Path:
@@ -107,12 +116,15 @@ class MediaPathPolicy:
         must_exist: bool = True,
     ) -> Path:
         del settings
-        return self.resolve_media_path(
+        path = self.resolve_media_path(
             raw,
             must_exist=must_exist,
             require_file=must_exist,
             allowed_extensions=VIDEO_EXTENSIONS,
         )
+        if not is_complete_video_file(path):
+            raise RuntimeError("Incomplete or temporary VOD files cannot be used.")
+        return path
 
     def local_video_sidecars(self, path: Path) -> List[Path]:
         """Alle Dateien, die eindeutig zu einer Videodatei gehören."""
@@ -181,7 +193,7 @@ class MediaPathPolicy:
         if not root.exists():
             return found
         for path in root.rglob("*"):
-            if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+            if path.is_file() and is_complete_video_file(path):
                 try:
                     path = self.safe_local_video_path(path, settings)
                     found[str(path)] = path.stat().st_mtime
@@ -230,7 +242,7 @@ class MediaPathPolicy:
         files: List[Path] = []
         uploaded = set(map(str, settings.get("youtube_uploaded_files") or []))
         for path in root.rglob("*"):
-            if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
+            if not path.is_file() or not is_complete_video_file(path):
                 continue
             try:
                 path = self.safe_local_video_path(path, settings)

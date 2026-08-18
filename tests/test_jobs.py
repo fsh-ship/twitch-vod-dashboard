@@ -62,6 +62,7 @@ class JobManagerTests(unittest.TestCase):
                 "urls": urls,
                 "total_urls": 1,
                 "item_statuses": ["wartet"],
+                "item_resolved": [False],
                 "log": [],
                 "returncode": None,
             },
@@ -80,6 +81,11 @@ class JobManagerTests(unittest.TestCase):
                 "status": "wartet",
                 "created": "2026-08-11 12:34:56",
                 "urls": ["C:/media/vod.mp4"],
+                "item_statuses": ["wartet"],
+                "item_progress": [None],
+                "item_errors": [""],
+                "item_resolved": [False],
+                "item_metadata": [{}],
                 "log": [],
                 "returncode": None,
                 "type": "youtube_upload",
@@ -117,6 +123,36 @@ class JobManagerTests(unittest.TestCase):
         self.assertEqual(len(manager.jobs[job_id]["log"]), 500)
         self.assertEqual(manager.jobs[job_id]["log"][0], "line-5")
         self.assertEqual(manager.jobs[job_id]["log"][-1], "line-504")
+
+    def test_upload_progress_updates_only_the_explicitly_running_item(self):
+        manager = self.manager()
+        job_id = manager.create_upload_job(
+            ["C:/media/one.mp4", "C:/media/two.mp4"], "Upload"
+        )
+        manager.start_job(job_id)
+        manager.set_upload_item_status(job_id, 1, "\u006c\u00e4uft", progress=0)
+
+        manager.append_job_log(job_id, "YouTube Upload one.mp4: 52%")
+
+        self.assertEqual(manager.jobs[job_id]["item_progress"], [52, None])
+        self.assertEqual(
+            manager.jobs[job_id]["item_statuses"], ["\u006c\u00e4uft", "wartet"]
+        )
+
+    def test_unfinished_upload_paths_and_resolved_error_state(self):
+        manager = self.manager()
+        job_id = manager.create_upload_job(
+            ["C:/media/one.mp4", "C:/media/two.mp4"], "Upload"
+        )
+        manager.set_upload_item_status(job_id, 1, "fehler", error="failed")
+
+        self.assertEqual(
+            manager.unfinished_upload_paths(), {"C:/media/two.mp4"}
+        )
+        self.assertTrue(manager.resolve_error(job_id, 1))
+        self.assertTrue(manager.jobs[job_id]["item_resolved"][0])
+        self.assertEqual(manager.jobs[job_id]["item_statuses"][0], "fehler")
+        self.assertEqual(manager.jobs[job_id]["item_errors"][0], "failed")
 
     def test_concurrent_log_append_is_thread_safe_and_bounded(self):
         manager = self.manager()
@@ -467,6 +503,8 @@ class UploadWorkerTests(unittest.TestCase):
 
         self.assertEqual(self.manager.jobs[job_id]["status"], "fertig")
         self.assertEqual(self.manager.jobs[job_id]["returncode"], 0)
+        self.assertEqual(self.manager.jobs[job_id]["item_statuses"], ["fertig"])
+        self.assertEqual(self.manager.jobs[job_id]["item_progress"], [100])
         upload.assert_called_once_with(video, self.settings, job_id=job_id)
 
     def test_multi_file_upload_success(self):
@@ -477,6 +515,9 @@ class UploadWorkerTests(unittest.TestCase):
 
         self.assertEqual(self.manager.jobs[job_id]["status"], "fertig")
         self.assertEqual(self.manager.jobs[job_id]["returncode"], 0)
+        self.assertEqual(
+            self.manager.jobs[job_id]["item_statuses"], ["fertig", "fertig"]
+        )
         self.assertEqual(upload.call_count, 2)
         self.assertEqual(
             upload.call_args_list,
@@ -500,6 +541,10 @@ class UploadWorkerTests(unittest.TestCase):
         self.assertEqual(upload.call_count, 2)
         self.assertEqual(self.manager.jobs[job_id]["status"], "fehler")
         self.assertEqual(self.manager.jobs[job_id]["returncode"], 1)
+        self.assertEqual(
+            self.manager.jobs[job_id]["item_statuses"], ["fehler", "fertig"]
+        )
+        self.assertEqual(self.manager.jobs[job_id]["item_errors"][0], "first failed")
         self.assertIn(
             "Local upload completed: 1 successful, 1 failed.",
             self.manager.jobs[job_id]["log"],
@@ -544,6 +589,7 @@ class UploadWorkerTests(unittest.TestCase):
         upload.assert_not_called()
         self.assertEqual(self.manager.jobs[job_id]["status"], "fehler")
         self.assertEqual(self.manager.jobs[job_id]["returncode"], -2)
+        self.assertEqual(self.manager.jobs[job_id]["item_statuses"], ["fehler"])
         self.assertIn(
             "Local YouTube upload did not start: not connected",
             self.manager.jobs[job_id]["log"],
@@ -642,6 +688,28 @@ class AppJobCompatibilityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), {"jobs": payload})
         snapshots.assert_called_once_with(reverse=True)
+
+    def test_resolve_error_route_hides_actionable_error_without_claiming_success(self):
+        job_id = dashboard.JOB_MANAGER.create_upload_job(
+            ["C:/media/failed.mp4"], "Upload"
+        )
+        dashboard.JOB_MANAGER.set_upload_item_status(
+            job_id, 1, "fehler", error="quota exceeded"
+        )
+        client = dashboard.app.test_client()
+        csrf_token = client.get("/api/auth/status").get_json()["csrf_token"]
+
+        response = client.post(
+            "/api/jobs/resolve-error",
+            json={"job_id": job_id, "item_index": 0},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        job = dashboard.JOB_MANAGER.get_job(job_id)
+        self.assertEqual(job["item_statuses"], ["fehler"])
+        self.assertEqual(job["item_errors"], ["quota exceeded"])
+        self.assertEqual(job["item_resolved"], [True])
 
     def test_worker_wrappers_delegate_with_current_patchable_app_helpers(self):
         dashboard.jobs["download"] = {

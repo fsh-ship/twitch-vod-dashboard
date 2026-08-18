@@ -777,17 +777,36 @@ def run_download_job(job_id: str) -> None:
 
 def create_upload_job(paths: List[str], label: str = "Local YouTube Upload") -> str:
     settings = load_settings()
+    manager = _job_manager_for_compatibility()
+    unfinished = manager.unfinished_upload_paths()
+    uploaded = set(map(str, settings.get("youtube_uploaded_files") or []))
     clean_paths = []
+    item_metadata = []
     for raw in paths:
         p = safe_local_video_path(raw, settings)
+        if str(p) in clean_paths:
+            continue
+        if str(p) in unfinished:
+            raise RuntimeError("This VOD is already queued for upload.")
+        payload = local_video_metadata_payload(p, settings, uploaded)
+        if payload.get("already_uploaded"):
+            raise RuntimeError("This VOD is already in uploaded history.")
         clean_paths.append(str(p))
-    clean_paths = list(dict.fromkeys(clean_paths))
+        item_metadata.append({
+            "streamer": payload.get("streamer") or "",
+            "date": payload.get("date_de") or "",
+            "title": payload.get("title") or payload.get("youtube_title") or p.name,
+            "vod_id": payload.get("vod_id") or "",
+            "name": p.name,
+            "size_bytes": payload.get("size_bytes"),
+            "size_gb": payload.get("size_gb"),
+        })
     if not clean_paths:
         raise RuntimeError("No valid VOD files were provided for upload.")
-    manager = _job_manager_for_compatibility()
     job_id = manager.create_upload_job(
         clean_paths,
         label,
+        item_metadata=item_metadata,
         counter_getter=lambda: job_counter,
         counter_setter=_set_job_counter,
     )
@@ -865,6 +884,9 @@ def enumerate_local_vods(
         uploaded_folder_fallback=FIXED_UPLOADED_VODS_FOLDER,
         app_dir=APP_DIR,
         payload_builder=local_video_metadata_payload,
+        unfinished_upload_paths=(
+            _job_manager_for_compatibility().unfinished_upload_paths()
+        ),
         log_callback=log_line,
     )
 
@@ -973,7 +995,10 @@ def api_youtube_upload_local():
     paths = [str(p).strip() for p in paths if str(p).strip()]
     if not paths:
         return jsonify({"error": "No files selected."}), 400
-    job_id = create_upload_job(paths)
+    try:
+        job_id = create_upload_job(paths)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 400
     return jsonify({"job_id": job_id})
 
 
@@ -1322,6 +1347,24 @@ def api_download():
 def api_jobs():
     jobs_snapshot = _job_manager_for_compatibility().snapshot_jobs(reverse=True)
     return jsonify({"jobs": jobs_snapshot})
+
+
+@app.post("/api/jobs/resolve-error")
+def api_resolve_job_error():
+    data = request.json or {}
+    job_id = str(data.get("job_id") or "").strip()
+    try:
+        item_index = int(data.get("item_index"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "A valid Queue item is required."}), 400
+    if not job_id or item_index < 0:
+        return jsonify({"error": "A valid Queue item is required."}), 400
+    resolved = _job_manager_for_compatibility().resolve_error(
+        job_id, item_index + 1
+    )
+    if not resolved:
+        return jsonify({"error": "Only an unresolved failed item can be resolved."}), 409
+    return jsonify({"ok": True, "job_id": job_id, "item_index": item_index})
 
 
 

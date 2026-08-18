@@ -225,6 +225,7 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
             ("/api/vod/validate", "POST", "api_vod_validate"),
             ("/api/download", "POST", "api_download"),
             ("/api/jobs", "GET", "api_jobs"),
+            ("/api/jobs/resolve-error", "POST", "api_resolve_job_error"),
             ("/api/local-videos", "GET", "api_local_videos"),
             ("/api/local-video/open", "POST", "api_local_video_open"),
             (
@@ -1111,6 +1112,7 @@ class LocalVodContractTests(IsolatedDashboardTestCase):
         "in_uploaded_folder",
         "status",
         "uploaded_at",
+        "local_file_exists",
     }
 
     def make_video(self, name="2026-08-10 - Example - Stream [1234567890].mp4"):
@@ -1991,6 +1993,7 @@ class JobContractTests(IsolatedDashboardTestCase):
                 "urls",
                 "total_urls",
                 "item_statuses",
+                "item_resolved",
                 "log",
                 "returncode",
             },

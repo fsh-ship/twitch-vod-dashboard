@@ -262,6 +262,7 @@ const pageMetaEarly = {
 let state = null;
 let lastResults = [];
 let jobOpenState = {};
+let queueDetailOpenState = {};
 let autoExpandJobDetails = localStorage.getItem('vodJobAutoExpand') === '1';
 
 const $ = (id) => document.getElementById(id);
@@ -758,6 +759,10 @@ function collectOpenStates() {
     const id = el.dataset.jobId;
     if (id) jobOpenState[id] = !!el.open;
   });
+  document.querySelectorAll('[data-queue-detail-id]').forEach(el => {
+    const id = el.dataset.queueDetailId;
+    if (id) queueDetailOpenState[id] = !!el.open;
+  });
 }
 
 function parseProgress(logs) {
@@ -909,6 +914,21 @@ function queueErrorFromLines(lines) {
   return [...(lines || [])].reverse().find(line => /(?:failed|error|ended with error|did not start)/i.test(String(line))) || '';
 }
 
+function queueErrorSummary(raw, operation) {
+  let message = String(raw || '').trim();
+  message = message.replace(/^YouTube Upload failed for [^:]+:\s*/i, '');
+  message = message.replace(/^Local YouTube upload did not start:\s*/i, '');
+  message = message.replace(/^Error:\s*/i, '');
+  message = message.replace(/^[A-Za-z_][\w.]*Error:\s*/, '');
+  const exitCode = message.match(/ended with error code\s+(-?\d+)/i);
+  if (exitCode) return `Download failed (exit code ${exitCode[1]}).`;
+  return message ? `${operation || 'Operation failed'}: ${message}` : `${operation || 'Operation'} failed. See technical details below.`;
+}
+
+function queueItemKey(item) {
+  return `${item.job.type || 'download'}:${item.job.id}:${item.index}`;
+}
+
 function queueItemsFromJobs(jobs) {
   const items = [];
   (jobs || []).slice().reverse().forEach(job => {
@@ -919,20 +939,31 @@ function queueItemsFromJobs(jobs) {
       sources.forEach((path, zeroIndex) => {
         const name = queuePathName(path);
         const local = localVideoCache.get(path) || [...localVideoCache.values()].find(v => v.name === name) || {};
+        const metadata = (Array.isArray(job.item_metadata) && job.item_metadata[zeroIndex]) || {};
+        const trackedStatus = Array.isArray(job.item_statuses) ? job.item_statuses[zeroIndex] : '';
+        const trackedProgress = Array.isArray(job.item_progress) ? job.item_progress[zeroIndex] : null;
+        const trackedError = Array.isArray(job.item_errors) ? job.item_errors[zeroIndex] : '';
+        const resolved = !!(Array.isArray(job.item_resolved) && job.item_resolved[zeroIndex]);
         const failure = [...logs].reverse().find(line => String(line).includes(name) && /(?:failed|error|without a video ID)/i.test(String(line))) || '';
         const completion = logs.some(line => String(line).includes(name) && /YouTube Upload completed:/i.test(String(line)));
         const started = logs.some(line => String(line).includes(name) && /(?:Uploading local VOD file:|YouTube Upload starting:)/i.test(String(line)));
         let stateName = 'waiting';
-        if (failure) stateName = 'error';
+        if (trackedStatus === 'fehler') stateName = 'error';
+        else if (trackedStatus === 'fertig') stateName = 'completed';
+        else if (trackedStatus === 'läuft') stateName = 'running';
+        else if (trackedStatus === 'wartet') stateName = 'waiting';
+        else if (failure) stateName = 'error';
         else if (completion || job.status === 'fertig') stateName = 'completed';
         else if (job.status === 'läuft' && progress.uploadFile && progress.uploadFile.includes(name)) stateName = 'running';
-        else if (job.status === 'läuft' && started) stateName = 'running';
+        else if (job.status === 'läuft' && started && !progress.uploadFile) stateName = 'running';
         else if (job.status === 'fehler') stateName = 'error';
         const operation = stateName === 'running' ? 'Uploading to YouTube' : stateName === 'completed' ? 'YouTube upload completed' : stateName === 'error' ? 'YouTube upload failed' : 'Waiting to upload';
         items.push({
-          job, state: stateName, operation,
-          streamer: local.streamer || '', date: local.date_de || '', title: local.title || local.youtube_title || name,
-          progress: stateName === 'running' ? progress.uploadProgress : null, extra: '', error: failure || (stateName === 'error' ? queueErrorFromLines(logs) : ''), index: zeroIndex
+          job, state: stateName, operation, resolved,
+          streamer: metadata.streamer || local.streamer || '', date: metadata.date || local.date_de || '', title: metadata.title || local.title || local.youtube_title || name,
+          vodId: metadata.vod_id || local.vod_id || '', filename: queuePathName(metadata.name || local.name || name),
+          sizeBytes: metadata.size_bytes ?? local.size_bytes ?? null, sizeGb: metadata.size_gb ?? local.size_gb ?? null,
+          progress: stateName === 'running' ? trackedProgress : null, extra: '', error: trackedError || failure || (stateName === 'error' ? queueErrorFromLines(logs) : ''), index: zeroIndex
         });
       });
       return;
@@ -945,6 +976,7 @@ function queueItemsFromJobs(jobs) {
       const failed = segment.some(line => /ended with error code/i.test(String(line)));
       const completed = segment.some(line => new RegExp(`VOD\\s+${index}\\/\\d+ download completed`, 'i').test(String(line)));
       const trackedStatus = Array.isArray(job.item_statuses) ? job.item_statuses[zeroIndex] : '';
+      const resolved = !!(Array.isArray(job.item_resolved) && job.item_resolved[zeroIndex]);
       let stateName = 'waiting';
       if (trackedStatus === 'fehler') stateName = 'error';
       else if (trackedStatus === 'fertig') stateName = 'completed';
@@ -960,8 +992,9 @@ function queueItemsFromJobs(jobs) {
       const vodId = queueVodId(url);
       const operation = stateName === 'running' ? 'Downloading' : stateName === 'completed' ? 'Download completed' : stateName === 'error' ? 'Download failed' : 'Waiting to download';
       items.push({
-        job, state: stateName, operation,
+        job, state: stateName, operation, resolved,
         streamer: meta.streamer || '', date: meta.date || '', title: meta.title || (vodId ? `Twitch VOD ${vodId}` : job.label),
+        vodId, filename: '', sizeBytes: null, sizeGb: null,
         progress: stateName === 'running' ? progress.downloadProgress : null,
         extra: stateName === 'running' ? [progress.downloadSpeed, progress.eta ? `ETA ${progress.eta}` : ''].filter(Boolean).join(' · ') : '',
         error: stateName === 'error' ? queueErrorFromLines(segment.length ? segment : logs) : '', index: zeroIndex
@@ -971,24 +1004,93 @@ function queueItemsFromJobs(jobs) {
   return items;
 }
 
+function conciseQueueFilename(value, maxLength=72) {
+  const name = queuePathName(value);
+  if (name.length <= maxLength) return name;
+  const keep = Math.max(12, Math.floor((maxLength - 3) / 2));
+  return `${name.slice(0, keep)}...${name.slice(-keep)}`;
+}
+
+function queueFileSizeLabel(item) {
+  const bytes = Number(item.sizeBytes);
+  if (Number.isFinite(bytes) && bytes > 0) {
+    const gib = bytes / (1024 ** 3);
+    if (gib >= 1) return `${gib.toFixed(gib >= 10 ? 1 : 2)} GB`;
+    return `${(bytes / (1024 ** 2)).toFixed(1)} MB`;
+  }
+  const gb = Number(item.sizeGb);
+  return Number.isFinite(gb) && gb > 0 ? `${gb} GB` : '';
+}
+
+function distinguishQueueItems(items) {
+  const groups = new Map();
+  (items || []).forEach(item => {
+    const key = [item.streamer || 'Unknown streamer', item.date || 'Unknown date', item.title || item.job.label]
+      .map(value => String(value).trim().toLocaleLowerCase()).join('\u0000');
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  });
+  return (items || []).map(item => {
+    const key = [item.streamer || 'Unknown streamer', item.date || 'Unknown date', item.title || item.job.label]
+      .map(value => String(value).trim().toLocaleLowerCase()).join('\u0000');
+    const colliding = groups.get(key) || [];
+    if (colliding.length < 2) return {...item, distinguishingLabel: ''};
+    const parts = [];
+    if (item.vodId) parts.push(`VOD ID ${item.vodId}`);
+    const size = queueFileSizeLabel(item);
+    if (size) parts.push(size);
+    let label = parts.join(' \u00b7 ');
+    const labels = colliding.map(candidate => {
+      const candidateParts = [];
+      if (candidate.vodId) candidateParts.push(`VOD ID ${candidate.vodId}`);
+      const candidateSize = queueFileSizeLabel(candidate);
+      if (candidateSize) candidateParts.push(candidateSize);
+      return candidateParts.join(' \u00b7 ');
+    });
+    if (!label || labels.filter(value => value === label).length > 1) {
+      const filename = conciseQueueFilename(item.filename || '');
+      if (filename && !parts.includes(filename)) parts.push(filename);
+      label = parts.join(' \u00b7 ');
+    }
+    const withFilenames = colliding.map(candidate => {
+      const candidateParts = [];
+      if (candidate.vodId) candidateParts.push(`VOD ID ${candidate.vodId}`);
+      const candidateSize = queueFileSizeLabel(candidate);
+      if (candidateSize) candidateParts.push(candidateSize);
+      const filename = conciseQueueFilename(candidate.filename || '');
+      if (filename && !candidateParts.includes(filename)) candidateParts.push(filename);
+      return candidateParts.join(' \u00b7 ');
+    });
+    if (!label || withFilenames.filter(value => value === label).length > 1) {
+      parts.push(`Queue item ${item.job.id}-${item.index + 1}`);
+      label = parts.join(' \u00b7 ');
+    }
+    return {...item, distinguishingLabel: label};
+  });
+}
+
 function renderQueueVodItem(item, compact=false) {
   const identity = [item.streamer, item.date].filter(Boolean).join(' · ');
   const status = item.state === 'running' ? item.operation : niceStatus(item.state === 'waiting' ? 'wartet' : item.state === 'completed' ? 'fertig' : 'fehler');
   const logText = (item.job.log || []).slice(-120).join('\n');
   const progress = item.state === 'running' ? renderProgressBar(item.operation, item.progress, item.extra) : '';
-  const error = item.error ? `<div class="queue-item-error">${escapeHtml(item.error)}</div>` : '';
+  const detailId = queueItemKey(item);
+  const detailOpen = queueDetailOpenState[detailId] ? ' open' : '';
+  const error = item.error ? `<div class="queue-item-error">${escapeHtml(queueErrorSummary(item.error, item.operation))}</div>` : '';
+  const resolveAction = item.state === 'error' && !item.resolved ? `<button type="button" class="quiet-button queue-resolve-error" data-job-id="${escapeHtml(item.job.id)}" data-item-index="${item.index}">Mark as resolved</button>` : '';
   if (compact) {
     return `<article class="queue-vod-item compact ${item.state === 'error' ? 'has-error' : ''}">
       <div class="queue-row-identity"><strong>${escapeHtml(item.streamer || 'Unknown streamer')}</strong><span>${escapeHtml(item.date || 'Unknown date')}</span></div>
       <div class="queue-row-title">${escapeHtml(item.title || item.job.label)}</div>
+      ${item.distinguishingLabel ? `<div class="queue-row-disambiguator muted">${escapeHtml(item.distinguishingLabel)}</div>` : ''}
       <span class="pill ${item.state === 'error' ? 'bad' : item.state === 'completed' ? 'good' : 'muted'}">${escapeHtml(status)}</span>
-      <details class="technical-details queue-row-details"><summary>${item.state === 'error' ? 'View error' : 'Technical details'}</summary><div class="job-detail-grid"><div><span class="muted">Job ID</span><strong>${escapeHtml(item.job.id)}</strong></div><div><span class="muted">Operation</span><strong>${escapeHtml(item.operation)}</strong></div></div>${error}<pre>${escapeHtml(logText)}</pre></details>
+      <details class="technical-details queue-row-details" data-queue-detail-id="${escapeHtml(detailId)}"${detailOpen}><summary>${item.state === 'error' ? 'View error' : 'Technical details'}</summary><div class="job-detail-grid"><div><span class="muted">Job ID</span><strong>${escapeHtml(item.job.id)}</strong></div><div><span class="muted">Operation</span><strong>${escapeHtml(item.operation)}</strong></div></div>${error}${resolveAction}<pre>${escapeHtml(logText)}</pre></details>
     </article>`;
   }
   return `<article class="queue-vod-item ${compact ? 'compact' : ''} ${item.state === 'error' ? 'has-error' : ''}">
     <div class="queue-vod-main"><div class="queue-vod-copy">${identity ? `<div class="queue-vod-identity">${escapeHtml(identity)}</div>` : ''}<strong>${escapeHtml(item.title || item.job.label)}</strong></div><span class="pill ${item.state === 'error' ? 'bad' : item.state === 'completed' ? 'good' : item.state === 'running' ? 'accent' : 'muted'}">${escapeHtml(status)}</span></div>
     ${error}${progress}
-    <details class="technical-details"><summary>Technical details</summary><div class="job-detail-grid"><div><span class="muted">Job ID</span><strong>${escapeHtml(item.job.id)}</strong></div><div><span class="muted">Operation</span><strong>${escapeHtml(item.operation)}</strong></div></div><pre>${escapeHtml(logText)}</pre></details>
+    <details class="technical-details" data-queue-detail-id="${escapeHtml(detailId)}"${detailOpen}><summary>Technical details</summary><div class="job-detail-grid"><div><span class="muted">Job ID</span><strong>${escapeHtml(item.job.id)}</strong></div><div><span class="muted">Operation</span><strong>${escapeHtml(item.operation)}</strong></div></div><pre>${escapeHtml(logText)}</pre></details>
   </article>`;
 }
 
@@ -997,14 +1099,24 @@ function renderQueueGroup(id, items, emptyMessage, compact=false) {
   if (!box) return;
   box.classList.toggle('muted', !items.length);
   box.innerHTML = items.length ? items.map(item => renderQueueVodItem(item, compact)).join('') : escapeHtml(emptyMessage);
+  box.querySelectorAll('.queue-resolve-error').forEach(button => button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      await api('/api/jobs/resolve-error', {method:'POST', body:JSON.stringify({job_id:button.dataset.jobId, item_index:Number(button.dataset.itemIndex)})});
+      await pollJobs();
+    } catch (error) {
+      button.disabled = false;
+      showToast(error.message, 'bad');
+    }
+  }));
 }
 
 function renderVodQueue(jobs) {
   const items = queueItemsFromJobs(jobs);
   const running = items.filter(item => item.state === 'running');
   const waiting = items.filter(item => item.state === 'waiting');
-  const errors = items.filter(item => item.state === 'error');
-  const completed = items.filter(item => item.state === 'completed').reverse();
+  const errors = distinguishQueueItems(items.filter(item => item.state === 'error' && !item.resolved));
+  const completed = distinguishQueueItems(items.filter(item => item.state === 'completed').reverse());
   renderQueueGroup('queueRunning', running, 'No downloads or uploads are currently running.');
   renderQueueGroup('queueWaiting', waiting, 'Nothing is waiting.', true);
   renderQueueGroup('queueErrors', errors, 'No errors.', true);
@@ -1021,6 +1133,7 @@ function renderVodQueue(jobs) {
 async function pollJobs() {
   collectOpenStates();
   const data = await api('/api/jobs');
+  collectOpenStates();
   const box = $('jobs');
   updateQueueSummary(data.jobs || []);
   renderVodQueue(data.jobs || []);
@@ -1088,7 +1201,7 @@ async function refreshDashboard() {
     const queue = queueItemsFromJobs(jobsData.jobs || []);
     const running = queue.filter(item => item.state === 'running');
     const waiting = queue.filter(item => item.state === 'waiting');
-    const errors = queue.filter(item => item.state === 'error');
+    const errors = queue.filter(item => item.state === 'error' && !item.resolved);
     const hasActivity = running.length > 0 || waiting.length > 0;
     renderQueueGroup('dashboardRunning', running.slice(0, 4), 'No downloads or uploads are currently running.', true);
     renderQueueGroup('dashboardUpcoming', waiting.slice(0, 5), 'Nothing is waiting.', true);
@@ -1119,12 +1232,11 @@ function selectedLocalVideoPaths() {
 function updateLocalUploadButton() {
   const selected = selectedLocalVideoPaths().length;
   const uploadBtn = $('uploadSelectedLocalVideos');
-  const prepareBtn = $('prepareSelectedLocalVideos');
   if (uploadBtn) uploadBtn.disabled = selected === 0;
-  if (prepareBtn) prepareBtn.disabled = selected === 0;
 }
 
 function workspaceStatusClass(video) {
+  if (video.local_file_exists === false) return 'warn';
   if (video.in_uploaded_folder) return 'accent';
   if (video.manually_uploaded || video.dashboard_uploaded) return 'good';
   if (video.prepared) return 'warn';
@@ -1141,16 +1253,18 @@ function localVideoByPath(path) {
 
 function renderLocalVideoCard(v) {
   const marked = v.manually_uploaded || v.dashboard_uploaded;
+  const hasLocalFile = v.local_file_exists !== false;
+  const uploadable = !v.already_uploaded && hasLocalFile;
   const statusClassName = workspaceStatusClass(v);
   return `<article class="video-workspace-card ${marked ? 'is-uploaded' : ''}" data-video-path="${escapeHtml(v.path)}">
-    <label class="video-select"><input class="localvideocheck" type="checkbox" data-path="${escapeHtml(v.path)}" ${v.already_uploaded ? '' : 'checked'}><span>Select</span></label>
+    <label class="video-select"><input class="localvideocheck" type="checkbox" data-path="${escapeHtml(v.path)}" ${uploadable ? 'checked' : 'disabled'}><span>Select</span></label>
     <div class="video-person"><strong>${escapeHtml(v.streamer || 'Unknown streamer')}</strong><span>${escapeHtml(v.date_de || 'Unknown date')}</span></div>
     <strong class="video-display-title">${escapeHtml(v.title || v.youtube_title || v.name)}</strong>
-    <span class="video-size">${escapeHtml(v.size_gb)} GB</span>
+    <span class="video-size">${hasLocalFile ? `${escapeHtml(v.size_gb)} GB` : 'Size unavailable'}</span>
     <span class="metadata-status ${v.prepared ? 'good' : 'muted'}">${v.prepared ? 'Metadata ready' : 'Metadata needed'}</span>
     <span class="pill ${statusClassName}">${escapeHtml(workspaceStatusLabel(v))}</span>
-    <div class="video-primary-actions">${marked ? '' : `<button type="button" class="primary video-action" data-action="upload" data-path="${escapeHtml(v.path)}">Upload</button><button type="button" class="video-action" data-action="prepare" data-path="${escapeHtml(v.path)}">Prepare</button>`}</div>
-    <details class="technical-details secondary-actions"><summary>More actions</summary><div class="video-copy-actions"><button type="button" class="video-action" data-action="copy-title" data-path="${escapeHtml(v.path)}">Copy Title</button><button type="button" class="video-action" data-action="copy-description" data-path="${escapeHtml(v.path)}">Copy Description</button>${marked ? '' : `<button type="button" class="video-action" data-action="mark" data-path="${escapeHtml(v.path)}">Mark as Uploaded</button>`}</div><div class="danger-zone"><strong>Delete the local VOD file and its sidecars</strong><button type="button" class="danger-outline video-action" data-action="delete" data-path="${escapeHtml(v.path)}">Delete Permanently</button></div></details>
+    <div class="video-primary-actions">${uploadable ? `<button type="button" class="primary video-action" data-action="upload" data-path="${escapeHtml(v.path)}">Upload</button>` : ''}</div>
+    ${hasLocalFile ? `<details class="technical-details secondary-actions"><summary>Actions</summary><div class="video-copy-actions"><button type="button" class="video-action" data-action="copy-title" data-path="${escapeHtml(v.path)}">Copy Title</button><button type="button" class="video-action" data-action="copy-description" data-path="${escapeHtml(v.path)}">Copy Description</button>${uploadable && !v.prepared ? `<button type="button" class="video-action" data-action="prepare" data-path="${escapeHtml(v.path)}">Prepare metadata</button>` : ''}${uploadable ? `<button type="button" class="video-action" data-action="mark" data-path="${escapeHtml(v.path)}">Mark as Uploaded</button>` : ''}</div><div class="danger-zone"><strong>Delete the local VOD file and its sidecars</strong><button type="button" class="danger-outline video-action" data-action="delete" data-path="${escapeHtml(v.path)}">Delete Permanently</button></div></details>` : '<span class="muted">Upload history retained; local actions are unavailable.</span>'}
   </article>`;
 }
 
@@ -1191,7 +1305,7 @@ async function handleLocalVideoAction(action, path) {
     await api('/api/youtube/upload-local', { method:'POST', body: JSON.stringify({ paths:[path] }) });
     showToast('VOD added to the upload queue.');
     showPage('queue');
-    await pollJobs();
+    await Promise.all([pollJobs(), loadLocalVideos()]);
     return;
   }
 
@@ -1242,20 +1356,6 @@ The files will not be moved to the recycle bin or trash.`);
   }
 }
 
-async function prepareSelectedLocalVideos() {
-  await saveCurrentSettingsSilently();
-  const paths = selectedLocalVideoPaths();
-  if (!paths.length) {
-    alert('No local VODs selected.');
-    return;
-  }
-  const data = await api('/api/manual-upload/prepare-local', { method:'POST', body: JSON.stringify({ paths }) });
-  showToast(`${(data.prepared || []).length} VOD file(s) prepared for YouTube.`);
-  if ((data.errors || []).length) alert(`${(data.errors || []).length} VOD file(s) could not be prepared.`);
-  await loadLocalVideos();
-  return data;
-}
-
 async function uploadSelectedLocalVideos() {
   await saveCurrentSettingsSilently();
   const paths = selectedLocalVideoPaths();
@@ -1265,7 +1365,7 @@ async function uploadSelectedLocalVideos() {
   }
   const data = await api('/api/youtube/upload-local', { method:'POST', body: JSON.stringify({ paths }) });
   showPage('queue');
-  await pollJobs();
+  await Promise.all([pollJobs(), loadLocalVideos()]);
   return data;
 }
 
@@ -1469,8 +1569,6 @@ loadState().then(() => {
     if (refreshBtn) refreshBtn.onclick = function(ev) { ev.preventDefault(); loadLocalVideos().catch(e => alert(e.message)); };
     const uploadBtn = document.getElementById('uploadSelectedLocalVideos');
     if (uploadBtn) uploadBtn.onclick = function(ev) { ev.preventDefault(); uploadSelectedLocalVideos().catch(e => alert(e.message)); };
-    const prepareBtn = document.getElementById('prepareSelectedLocalVideos');
-    if (prepareBtn) prepareBtn.onclick = function(ev) { ev.preventDefault(); prepareSelectedLocalVideos().catch(e => alert(e.message)); };
     const checkAll = document.getElementById('checkAllLocalVideos');
     if (checkAll) checkAll.onclick = function(ev) {
       ev.preventDefault();

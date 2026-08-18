@@ -17,7 +17,9 @@ STYLESHEET = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
 NODE = shutil.which("node")
 
 
-def _classify_download_jobs(jobs: list[dict]) -> list[dict]:
+def _classify_download_jobs(
+    jobs: list[dict], results: list[dict] | None = None
+) -> list[dict]:
     if not NODE:
         raise unittest.SkipTest("Node.js is required for Queue state tests")
     runner = r"""
@@ -26,24 +28,35 @@ const source = fs.readFileSync('static/app.js', 'utf8');
 const start = source.indexOf('function parseProgress');
 const end = source.indexOf('function renderQueueVodItem');
 if (start < 0 || end < 0 || end <= start) throw new Error('Queue classifier source not found');
-const lastResults = [];
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const jobs = Array.isArray(input) ? input : input.jobs;
+const lastResults = Array.isArray(input) ? [] : (input.results || []);
 const localVideoCache = new Map();
 function rememberedSearchResults() { return []; }
 eval(source.slice(start, end));
-const jobs = JSON.parse(fs.readFileSync(0, 'utf8'));
-const result = queueItemsFromJobs(jobs).map(item => ({
+const queue = queueItemsFromJobs(jobs);
+const displayItems = [
+  ...distinguishQueueItems(queue.filter(item => item.state === 'error' && !item.resolved)),
+  ...distinguishQueueItems(queue.filter(item => item.state === 'completed').reverse()),
+];
+const labels = new Map(displayItems.map(item => [queueItemKey(item), item.distinguishingLabel]));
+const result = queue.map(item => ({
   index: item.index,
   state: item.state,
   progress: item.progress,
   extra: item.extra,
   error: item.error,
+  resolved: item.resolved,
+  title: item.title,
+  vodId: item.vodId,
+  distinguishingLabel: labels.get(queueItemKey(item)) || '',
 }));
 process.stdout.write(JSON.stringify(result));
 """
     completed = subprocess.run(
         [NODE, "-e", runner],
         cwd=ROOT,
-        input=json.dumps(jobs),
+        input=json.dumps({"jobs": jobs, "results": results or []}),
         text=True,
         capture_output=True,
         check=False,
@@ -74,6 +87,71 @@ def _download_job(
     if item_statuses is not None:
         job["item_statuses"] = item_statuses
     return job
+
+
+def _upload_job(
+    statuses: list[str],
+    progresses: list[int | None],
+    *,
+    errors: list[str] | None = None,
+    resolved: list[bool] | None = None,
+    status: str = "l\u00e4uft",
+) -> dict:
+    count = len(statuses)
+    return {
+        "id": "upload-1",
+        "label": "Local YouTube Upload",
+        "type": "youtube_upload",
+        "status": status,
+        "urls": [f"C:/media/vod-{index + 1}.mp4" for index in range(count)],
+        "item_statuses": statuses,
+        "item_progress": progresses,
+        "item_errors": errors or ["" for _ in range(count)],
+        "item_resolved": resolved or [False for _ in range(count)],
+        "item_metadata": [
+            {
+                "streamer": "Example",
+                "date": "18.08.2026",
+                "title": f"Upload VOD {index + 1}",
+            }
+            for index in range(count)
+        ],
+        "log": ["YouTube Upload vod-1.mp4: 52%"],
+    }
+
+
+def _render_queue_item_with_saved_open_state(item: dict) -> str:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for Queue render tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function renderQueueVodItem');
+const end = source.indexOf('function renderQueueGroup');
+if (start < 0 || end < 0 || end <= start) throw new Error('Queue renderer source not found');
+const queueDetailOpenState = {'youtube_upload:upload-1:0': true};
+function escapeHtml(value) { return String(value || ''); }
+function niceStatus(value) { return value; }
+function renderProgressBar() { return ''; }
+function queueErrorSummary(value) { return String(value || ''); }
+function queueItemKey(value) { return `${value.job.type || 'download'}:${value.job.id}:${value.index}`; }
+eval(source.slice(start, end));
+const item = JSON.parse(fs.readFileSync(0, 'utf8'));
+const first = renderQueueVodItem(item, true);
+const second = renderQueueVodItem(item, true);
+process.stdout.write(JSON.stringify({first, second}));
+"""
+    completed = subprocess.run(
+        [NODE, "-e", runner],
+        cwd=ROOT,
+        input=json.dumps(item),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)["second"]
 
 
 class _IdParser(HTMLParser):
@@ -152,6 +230,18 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn("Move to Uploaded Archive", JAVASCRIPT)
         self.assertIn("Delete the local VOD file and its sidecars", JAVASCRIPT)
 
+    def test_prepare_metadata_is_secondary_under_actions(self) -> None:
+        self.assertNotIn('id="prepareSelectedLocalVideos"', TEMPLATE)
+        self.assertNotIn("More actions", JAVASCRIPT)
+        self.assertIn("<summary>Actions</summary>", JAVASCRIPT)
+        self.assertIn(">Prepare metadata</button>", JAVASCRIPT)
+        self.assertNotIn(">Prepare</button>", JAVASCRIPT)
+
+    def test_missing_local_archive_rows_have_no_local_actions(self) -> None:
+        self.assertIn("Upload history retained; local actions are unavailable.", JAVASCRIPT)
+        self.assertIn("v.local_file_exists !== false", JAVASCRIPT)
+        self.assertIn("Size unavailable", JAVASCRIPT)
+
     def test_streamer_editor_preserves_text_storage_contract(self) -> None:
         self.assertIn('id="streamerAddInput"', TEMPLATE)
         self.assertIn('id="streamerEditorList"', TEMPLATE)
@@ -194,6 +284,142 @@ class V11UiContractTests(unittest.TestCase):
 
 
 class V11QueueStateRegressionTests(unittest.TestCase):
+    def test_one_upload_active_has_only_that_vod_running(self) -> None:
+        items = _classify_download_jobs(
+            [_upload_job(["l\u00e4uft", "wartet"], [52, None])]
+        )
+
+        self.assertEqual([item["state"] for item in items], ["running", "waiting"])
+
+    def test_sequential_upload_advances_one_item_at_a_time(self) -> None:
+        items = _classify_download_jobs(
+            [_upload_job(["fertig", "l\u00e4uft", "wartet"], [100, 17, None])]
+        )
+
+        self.assertEqual(
+            [item["state"] for item in items],
+            ["completed", "running", "waiting"],
+        )
+
+    def test_upload_progress_is_not_copied_to_waiting_items(self) -> None:
+        items = _classify_download_jobs(
+            [_upload_job(["l\u00e4uft", "wartet", "wartet"], [52, None, None])]
+        )
+
+        self.assertEqual([item["progress"] for item in items], [52, None, None])
+
+    def test_upload_metadata_identifies_errors_without_unknown_fallbacks(self) -> None:
+        items = _classify_download_jobs(
+            [
+                _upload_job(
+                    ["fehler"],
+                    [None],
+                    errors=["quota exceeded"],
+                    status="fehler",
+                )
+            ]
+        )
+
+        self.assertEqual(items[0]["title"], "Upload VOD 1")
+        self.assertEqual(items[0]["error"], "quota exceeded")
+
+    def test_resolved_error_remains_failed_but_is_flagged_for_active_filter(self) -> None:
+        items = _classify_download_jobs(
+            [
+                _upload_job(
+                    ["fehler"],
+                    [None],
+                    errors=["quota exceeded"],
+                    resolved=[True],
+                    status="fehler",
+                )
+            ]
+        )
+
+        self.assertEqual(items[0]["state"], "error")
+        self.assertTrue(items[0]["resolved"])
+        self.assertIn("item.state === 'error' && !item.resolved", JAVASCRIPT)
+
+    def test_error_detail_open_state_survives_repeated_render(self) -> None:
+        html = _render_queue_item_with_saved_open_state(
+            {
+                "job": {
+                    "id": "upload-1",
+                    "type": "youtube_upload",
+                    "label": "Upload",
+                    "log": ["YouTube Upload failed for vod-1.mp4: quota exceeded"],
+                },
+                "index": 0,
+                "state": "error",
+                "operation": "YouTube upload failed",
+                "streamer": "Example",
+                "date": "18.08.2026",
+                "title": "Upload VOD 1",
+                "error": "quota exceeded",
+                "resolved": False,
+                "progress": None,
+                "extra": "",
+            }
+        )
+
+        self.assertIn('data-queue-detail-id="youtube_upload:upload-1:0" open', html)
+        self.assertIn("Mark as resolved", html)
+
+    def test_completed_metadata_collisions_remain_distinct_by_vod_id(self) -> None:
+        job = _download_job(
+            ["fertig", "fertig"],
+            ["VOD 1/2 download completed.", "VOD 2/2 download completed."],
+            status="fertig",
+            count=2,
+        )
+        results = [
+            {
+                "url": url,
+                "streamer": "Example",
+                "date": "18.08.2026",
+                "title": "Same visible title",
+            }
+            for url in job["urls"]
+        ]
+
+        items = _classify_download_jobs([job], results)
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual([item["state"] for item in items], ["completed", "completed"])
+        labels = [item["distinguishingLabel"] for item in items]
+        self.assertEqual(len(set(labels)), 2)
+        self.assertEqual(
+            labels,
+            ["VOD ID 1234567890", "VOD ID 1234567891"],
+        )
+
+    def test_error_metadata_collisions_use_size_and_concise_filename(self) -> None:
+        job = _upload_job(
+            ["fehler", "fehler"],
+            [None, None],
+            errors=["failed", "failed"],
+            status="fehler",
+        )
+        for index, metadata in enumerate(job["item_metadata"]):
+            metadata.update(
+                {
+                    "title": "Same visible title",
+                    "vod_id": "",
+                    "size_bytes": 2 * 1024**3,
+                    "name": f"C:/server/private/distinct-vod-{index + 1}.mp4",
+                }
+            )
+
+        items = _classify_download_jobs([job])
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual([item["state"] for item in items], ["error", "error"])
+        labels = [item["distinguishingLabel"] for item in items]
+        self.assertEqual(len(set(labels)), 2)
+        self.assertTrue(all("2.00 GB" in label for label in labels))
+        self.assertIn("distinct-vod-1.mp4", labels[0])
+        self.assertIn("distinct-vod-2.mp4", labels[1])
+        self.assertTrue(all("C:/server" not in label for label in labels))
     def test_single_active_download_stays_running_when_start_marker_was_trimmed(self) -> None:
         jobs = [
             _download_job(

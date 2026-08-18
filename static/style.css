@@ -705,6 +705,7 @@ main { width:100%; max-width:1320px; }
 .queue-vod-copy { min-width:0; display:grid; gap:4px; }
 .queue-vod-copy strong { line-height:1.4; overflow-wrap:anywhere; }
 .queue-vod-identity { color:var(--muted); font-size:12px; }
+.queue-row-disambiguator { font-size:12px; overflow-wrap:anywhere; }
 .queue-item-error { padding:10px 12px; border-radius:12px; background:rgba(91,28,36,.7); color:#ffd3db; line-height:1.45; font-size:13px; overflow-wrap:anywhere; }
 .queue-vod-item pre { max-width:100%; overflow:auto; white-space:pre; }
 .completed-section details > summary { display:flex; gap:8px; align-items:center; font-size:18px; }

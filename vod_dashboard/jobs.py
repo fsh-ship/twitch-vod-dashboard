@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import re
 import subprocess
 import threading
 import time
@@ -109,6 +110,7 @@ class JobManager:
                 "urls": urls,
                 "total_urls": len(urls),
                 "item_statuses": ["wartet" for _ in urls],
+                "item_resolved": [False for _ in urls],
                 "log": [],
                 "returncode": None,
             }
@@ -119,6 +121,7 @@ class JobManager:
         paths: list[str],
         label: str,
         *,
+        item_metadata: Optional[list[Dict[str, Any]]] = None,
         counter_getter: Optional[CounterGetter] = None,
         counter_setter: Optional[CounterSetter] = None,
     ) -> str:
@@ -131,6 +134,11 @@ class JobManager:
                 "status": "wartet",
                 "created": self._created_at(),
                 "urls": paths,
+                "item_statuses": ["wartet" for _ in paths],
+                "item_progress": [None for _ in paths],
+                "item_errors": ["" for _ in paths],
+                "item_resolved": [False for _ in paths],
+                "item_metadata": list(item_metadata or [{} for _ in paths]),
                 "log": [],
                 "returncode": None,
                 "type": "youtube_upload",
@@ -150,6 +158,15 @@ class JobManager:
                 return False
             job["log"].append(text.rstrip())
             job["log"] = job["log"][-self.MAX_LOG_ENTRIES :]
+            if job.get("type") == "youtube_upload":
+                match = re.search(r"YouTube Upload\s+.+?:\s*(\d+)%", text, re.I)
+                if match:
+                    statuses = job.get("item_statuses") or []
+                    progress = job.get("item_progress") or []
+                    for index, status in enumerate(statuses):
+                        if status == "l\u00e4uft" and index < len(progress):
+                            progress[index] = max(0, min(100, int(match.group(1))))
+                            break
         if log_callback is not None:
             log_callback(f"Job {job_id}: {text.rstrip()}")
         return True
@@ -215,6 +232,91 @@ class JobManager:
             for index, status in enumerate(statuses):
                 if status in {"wartet", "läuft"}:
                     statuses[index] = "fehler"
+
+    def set_upload_item_status(
+        self,
+        job_id: str,
+        item_number: int,
+        status: str,
+        *,
+        progress: Optional[int] = None,
+        error: str = "",
+    ) -> bool:
+        """Transition one one-based upload item without inferring state from logs."""
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None or job.get("type") != "youtube_upload":
+                return False
+            index = item_number - 1
+            statuses = job.get("item_statuses")
+            progresses = job.get("item_progress")
+            errors = job.get("item_errors")
+            if (
+                not isinstance(statuses, list)
+                or not isinstance(progresses, list)
+                or not isinstance(errors, list)
+                or index < 0
+                or index >= len(statuses)
+            ):
+                return False
+            statuses[index] = status
+            progresses[index] = progress
+            errors[index] = str(error or "")
+        return True
+
+    def fail_unfinished_upload_items(self, job_id: str, error: str) -> None:
+        """Fail upload items that never started after a job-level failure."""
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return
+            statuses = job.get("item_statuses") or []
+            errors = job.get("item_errors") or []
+            progresses = job.get("item_progress") or []
+            for index, status in enumerate(statuses):
+                if status in {"wartet", "l\u00e4uft"}:
+                    statuses[index] = "fehler"
+                    if index < len(errors):
+                        errors[index] = str(error or "")
+                    if index < len(progresses):
+                        progresses[index] = None
+
+    def resolve_error(self, job_id: str, item_number: int) -> bool:
+        """Dismiss one failed item while retaining its failure and diagnostics."""
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return False
+            index = item_number - 1
+            statuses = job.get("item_statuses")
+            resolved = job.get("item_resolved")
+            if not isinstance(resolved, list):
+                resolved = [False for _ in statuses] if isinstance(statuses, list) else []
+                job["item_resolved"] = resolved
+            if (
+                not isinstance(statuses, list)
+                or not isinstance(resolved, list)
+                or index < 0
+                or index >= len(statuses)
+                or statuses[index] != "fehler"
+            ):
+                return False
+            resolved[index] = True
+        return True
+
+    def unfinished_upload_paths(self) -> set[str]:
+        """Return files already represented by a queued or running upload item."""
+        with self.lock:
+            paths: set[str] = set()
+            for job in self.jobs.values():
+                if job.get("type") != "youtube_upload":
+                    continue
+                statuses = job.get("item_statuses") or []
+                for index, raw in enumerate(job.get("urls") or []):
+                    status = statuses[index] if index < len(statuses) else job.get("status")
+                    if status in {"wartet", "l\u00e4uft"}:
+                        paths.add(str(raw))
+            return paths
 
     def finish_job(self, job_id: str, returncode: int, status: str) -> None:
         with self.lock:
@@ -528,7 +630,10 @@ def run_upload_job(
     uploaded = 0
     try:
         dependencies.get_youtube_service(settings, interactive=False)
-        for raw in paths:
+        for item_number, raw in enumerate(paths, start=1):
+            manager.set_upload_item_status(
+                job_id, item_number, "l\u00e4uft", progress=0
+            )
             try:
                 path = dependencies.safe_local_video_path(raw, settings)
                 dependencies.append_log(job_id, f"Uploading local VOD file: {path}")
@@ -537,13 +642,23 @@ def run_upload_job(
                 )
                 if video_id:
                     uploaded += 1
+                    manager.set_upload_item_status(
+                        job_id, item_number, "fertig", progress=100
+                    )
                 else:
                     failed += 1
+                    error = "Upload completed without a YouTube video ID."
+                    manager.set_upload_item_status(
+                        job_id, item_number, "fehler", error=error
+                    )
                     dependencies.append_log(
                         job_id, f"Upload completed without a video ID: {path.name}"
                     )
             except Exception as exc:
                 failed += 1
+                manager.set_upload_item_status(
+                    job_id, item_number, "fehler", error=str(exc)
+                )
                 dependencies.append_log(
                     job_id, f"YouTube Upload failed for {Path(raw).name}: {exc}"
                 )
@@ -554,6 +669,7 @@ def run_upload_job(
             f"Local upload completed: {uploaded} successful, {failed} failed.",
         )
     except Exception as exc:
+        manager.fail_unfinished_upload_items(job_id, str(exc))
         manager.finish_job(job_id, -2, "fehler")
         dependencies.append_log(
             job_id, f"Local YouTube upload did not start: {exc}"

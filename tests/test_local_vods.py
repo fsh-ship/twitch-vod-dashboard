@@ -38,6 +38,7 @@ class LocalVodServiceTests(unittest.TestCase):
         "in_uploaded_folder",
         "status",
         "uploaded_at",
+        "local_file_exists",
     }
 
     def setUp(self):
@@ -280,7 +281,7 @@ class LocalVodServiceTests(unittest.TestCase):
         os.utime(uploaded, (1_699_000_000, 1_699_000_000))
         self.settings["youtube_uploaded_files"] = [str(uploaded)]
 
-        result = self.enumerate()
+        result = self.enumerate(include_uploaded=True)
 
         self.assertEqual(
             [item["name"] for item in result["videos"]],
@@ -288,6 +289,61 @@ class LocalVodServiceTests(unittest.TestCase):
         )
         self.assertEqual(result["counts"]["pending"], 2)
         self.assertEqual(result["counts"]["uploaded"], 1)
+
+    def test_uploaded_rows_are_hidden_until_archive_is_requested(self):
+        uploaded = self.make_video("Example/uploaded.mp4")
+        self.settings["youtube_uploaded_files"] = [str(uploaded)]
+
+        self.assertEqual(self.enumerate(include_uploaded=False)["videos"], [])
+        archived = self.enumerate(include_uploaded=True)
+        self.assertEqual([item["name"] for item in archived["videos"]], ["uploaded.mp4"])
+        self.assertEqual(archived["counts"]["pending"], 0)
+
+    def test_unfinished_upload_is_excluded_from_ready(self):
+        active = self.make_video("Example/active.mp4")
+
+        result = local_vods.enumerate_local_vods(
+            self.settings,
+            False,
+            media_policy=self.policy,
+            uploaded_folder_fallback=self.uploaded_root,
+            app_dir=self.app_dir,
+            payload_builder=lambda path, settings, uploaded: self.payload(path, uploaded),
+            unfinished_upload_paths={str(active)},
+        )
+
+        self.assertEqual(result["videos"], [])
+        self.assertEqual(result["counts"]["pending"], 0)
+
+    def test_known_incomplete_video_artifacts_are_not_discovered(self):
+        ready = self.make_video("Example/finished.mp4")
+        for name in (
+            "stream.temp.mp4",
+            "stream.part.mkv",
+            "stream.partial.webm",
+            "stream.download.mov",
+            "stream.ytdl.m4v",
+            "stream.mp4.temp",
+        ):
+            self.make_video(f"Example/{name}")
+
+        result = self.enumerate()
+
+        self.assertEqual([item["path"] for item in result["videos"]], [str(ready)])
+
+    def test_missing_uploaded_file_is_archive_only_and_not_uploadable(self):
+        missing = (self.media_root / "Example" / "removed.mp4").resolve()
+        self.settings["youtube_uploaded_files"] = [str(missing)]
+
+        self.assertEqual(self.enumerate(include_uploaded=False)["videos"], [])
+        archived = self.enumerate(include_uploaded=True)
+        self.assertEqual(len(archived["videos"]), 1)
+        payload = archived["videos"][0]
+        self.assertFalse(payload["local_file_exists"])
+        self.assertTrue(payload["already_uploaded"])
+        self.assertEqual(payload["status"], "Local file removed")
+        self.assertIsNone(payload["size_bytes"])
+        self.assertEqual(archived["counts"]["pending"], 0)
 
     def test_uploaded_folder_filter_status_and_count_semantics(self):
         video = self.make_video("_hochgeladen/Example/archived.mp4")
@@ -303,7 +359,7 @@ class LocalVodServiceTests(unittest.TestCase):
         self.assertTrue(payload["already_uploaded"])
         self.assertEqual(payload["status"], "Archived")
         self.assertEqual(included["counts"]["pending"], 0)
-        self.assertEqual(included["counts"]["uploaded"], 0)
+        self.assertEqual(included["counts"]["uploaded"], 1)
 
     def test_nested_streamer_directory_relative_folder(self):
         video = self.make_video("Streamer/2026/August/nested.mov")

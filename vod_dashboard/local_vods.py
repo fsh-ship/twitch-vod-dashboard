@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Set
 
-from vod_dashboard.media import MediaPathPolicy, VIDEO_EXTENSIONS
+from vod_dashboard.media import MediaPathPolicy, is_complete_video_file
 
 
 def local_video_metadata_payload(
@@ -87,6 +87,38 @@ def local_video_metadata_payload(
         "in_uploaded_folder": in_uploaded_folder,
         "status": status,
         "uploaded_at": marker.get("uploaded_at") or "",
+        "local_file_exists": True,
+    }
+
+
+def _missing_uploaded_payload(path: Path) -> Dict[str, Any]:
+    return {
+        "path": str(path),
+        "name": path.name,
+        "folder": str(path.parent),
+        "relative_folder": "",
+        "size_gb": None,
+        "size_bytes": None,
+        "mtime": "",
+        "streamer": path.parent.name,
+        "date_de": "",
+        "title": path.stem,
+        "vod_id": "",
+        "youtube_title": path.stem,
+        "youtube_description": "",
+        "description_file": "",
+        "description_file_exists": False,
+        "metadata_file": "",
+        "metadata_file_exists": False,
+        "marker_file": "",
+        "prepared": False,
+        "dashboard_uploaded": True,
+        "manually_uploaded": False,
+        "already_uploaded": True,
+        "in_uploaded_folder": False,
+        "status": "Local file removed",
+        "uploaded_at": "",
+        "local_file_exists": False,
     }
 
 
@@ -100,6 +132,7 @@ def enumerate_local_vods(
     payload_builder: Callable[
         [Path, Mapping[str, Any], Set[str]], Dict[str, Any]
     ],
+    unfinished_upload_paths: Set[str] | None = None,
     log_callback: Callable[[str], None] | None = None,
 ) -> Dict[str, Any]:
     root = media_policy.download_path(settings)
@@ -110,12 +143,13 @@ def enumerate_local_vods(
         map(str, settings.get("youtube_uploaded_files") or [])
     )
     items: List[Dict[str, Any]] = []
+    unavailable = set(unfinished_upload_paths or set())
 
     if root.exists():
         for discovered_path in root.rglob("*"):
             if (
                 not discovered_path.is_file()
-                or discovered_path.suffix.lower() not in VIDEO_EXTENSIONS
+                or not is_complete_video_file(discovered_path)
             ):
                 continue
             path = discovered_path
@@ -125,16 +159,40 @@ def enumerate_local_vods(
                 )
                 if media_policy.is_path_inside(path, app_dir):
                     continue
+                if str(path) in unavailable:
+                    continue
                 if (
                     not include_uploaded
                     and media_policy.is_path_inside(path, uploaded_root)
                 ):
                     continue
-                items.append(payload_builder(path, settings, uploaded))
+                payload = payload_builder(path, settings, uploaded)
+                if not include_uploaded and payload.get("already_uploaded"):
+                    continue
+                items.append(payload)
             except Exception as exc:
                 if log_callback:
                     log_callback(
                         f"Could not read local VOD file {path}: {exc}"
+                    )
+
+    if include_uploaded:
+        existing_names = {str(item.get("name") or "").casefold() for item in items}
+        missing_names: Set[str] = set()
+        for raw in reversed(list(settings.get("youtube_uploaded_files") or [])):
+            try:
+                path = media_policy.safe_local_video_path(
+                    raw, settings, must_exist=False
+                )
+                name_key = path.name.casefold()
+                if path.exists() or name_key in existing_names or name_key in missing_names:
+                    continue
+                items.append(_missing_uploaded_payload(path))
+                missing_names.add(name_key)
+            except Exception as exc:
+                if log_callback:
+                    log_callback(
+                        f"Could not read uploaded VOD history entry {raw}: {exc}"
                     )
 
     items.sort(
@@ -147,12 +205,7 @@ def enumerate_local_vods(
     pending = [
         item for item in items if not item.get("already_uploaded")
     ]
-    marked = [
-        item
-        for item in items
-        if item.get("manually_uploaded")
-        or item.get("dashboard_uploaded")
-    ]
+    marked = [item for item in items if item.get("already_uploaded")]
     total_bytes = sum(
         int(item.get("size_bytes") or 0) for item in items
     )
