@@ -165,6 +165,21 @@ class LocalYouTubeHelperTests(unittest.TestCase):
         long_path = Path(("x" * 120) + ".mp4")
         self.assertEqual(youtube.guess_video_title(long_path), "x" * 95)
 
+    def test_youtube_title_sanitization_contract(self):
+        cases = (
+            ("A < B", "A B"),
+            ("A > B", "A B"),
+            ("<test>", "test"),
+            ("A <<<<>>>> B", "A B"),
+            ("  A   <  B\n\t C  ", "A B C"),
+            ("<<<<>>>>", "YouTube Upload"),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(
+                    youtube.sanitize_youtube_title(value), expected
+                )
+
     def test_windows_filename_sanitization_contract(self):
         self.assertEqual(youtube.sanitize_windows_filename("CON"), "_CON")
         self.assertEqual(
@@ -233,6 +248,55 @@ class LocalYouTubeHelperTests(unittest.TestCase):
         self.assertEqual(metadata["meta"]["duration"], "01:02:03")
         self.assertIn("Date: 04.03.2026", metadata["description"])
         self.assertIn("Duration: 01:02:03", metadata["description"])
+
+    def test_sanitized_title_matches_preview_preparation_and_upload(self):
+        video = self.make_video()
+        original_title = "A < B"
+        self.write_info(video, self.info_payload(title=original_title))
+        settings = {
+            **self.settings,
+            "youtube_title_template": "YouTube archive: {title} >>>",
+            "manual_upload_rename_video": False,
+            "move_uploaded_vods": False,
+        }
+
+        preview = self.build_metadata(video, settings)
+        self.assertEqual(preview["title"], "YouTube archive: A B")
+        self.assertEqual(preview["meta"]["title"], original_title)
+
+        prepared = self.prepare(video, settings)
+        persisted = json.loads(
+            prepared.with_suffix(".youtube.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(persisted["title"], preview["title"])
+
+        service = mock.Mock()
+        service.videos.return_value.insert.return_value.next_chunk.return_value = (
+            None,
+            {"id": "youtube-video-1"},
+        )
+        youtube.upload_video_to_youtube(
+            video,
+            settings,
+            media_policy=self.policy,
+            service_getter=mock.Mock(return_value=service),
+            metadata_builder=lambda path, values: self.build_metadata(
+                path, values
+            ),
+            media_upload_factory=mock.Mock(return_value=object()),
+            history_recorder=mock.Mock(),
+            move_after_upload=mock.Mock(return_value=video),
+        )
+        uploaded_title = service.videos.return_value.insert.call_args.kwargs[
+            "body"
+        ]["snippet"]["title"]
+        self.assertEqual(uploaded_title, preview["title"])
+        self.assertEqual(
+            self.metadata(video)["title"],
+            original_title,
+        )
 
     def test_template_rendering_whitespace_and_failure_fallback(self):
         meta = {"title": "VOD", "date_de": "04.03.2026"}
@@ -1052,6 +1116,24 @@ class YouTubeUploadHelperTests(unittest.TestCase):
         dependencies["history_recorder"].assert_called_once_with(
             self.video.resolve()
         )
+
+    def test_upload_sanitizes_title_at_the_api_boundary(self):
+        service = mock.Mock()
+        service.videos.return_value.insert.return_value.next_chunk.return_value = (
+            None,
+            {"id": "youtube-video-1"},
+        )
+        metadata = self.metadata()
+        metadata["title"] = "A << > B"
+
+        self.upload(
+            service,
+            metadata_builder=mock.Mock(return_value=metadata),
+        )
+
+        body = service.videos.return_value.insert.call_args.kwargs["body"]
+        self.assertEqual(body["snippet"]["title"], "A B")
+        self.assertEqual(metadata["title"], "A << > B")
 
     def test_invalid_privacy_falls_back_to_private(self):
         self.settings["youtube_privacy_status"] = "friends"

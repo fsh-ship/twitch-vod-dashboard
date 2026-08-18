@@ -590,7 +590,10 @@ def upload_video_to_youtube(
     youtube_metadata = metadata_builder(path, settings)
     body = {
         "snippet": {
-            "title": youtube_metadata["title"],
+            "title": sanitize_youtube_title(
+                youtube_metadata.get("title"),
+                fallback=safe_filename_title(path),
+            ),
             "description": youtube_metadata["description"],
             "tags": tags,
             "categoryId": str(
@@ -819,6 +822,30 @@ def apply_youtube_template(
     return result.strip()
 
 
+def sanitize_youtube_title(
+    value: Any,
+    fallback: Any = "YouTube Upload",
+    max_len: int = 95,
+) -> str:
+    """Return a safe final YouTube title without changing source metadata."""
+
+    def clean(candidate: Any) -> str:
+        characters = []
+        for character in str(candidate or ""):
+            if character in "<>":
+                characters.append(" ")
+            elif unicodedata.category(character).startswith("C"):
+                characters.append(" ")
+            else:
+                characters.append(character)
+        return re.sub(r"\s+", " ", "".join(characters)).strip()
+
+    title = clean(value) or clean(fallback) or "YouTube Upload"
+    if max_len > 0 and len(title) > max_len:
+        title = title[:max_len].rstrip()
+    return title or "YouTube Upload"
+
+
 def build_youtube_metadata(
     path: Path,
     settings: Dict[str, Any],
@@ -859,12 +886,13 @@ def build_youtube_metadata(
         or settings.get("youtube_description")
         or ""
     )
-    title = template_renderer(
+    expanded_title = template_renderer(
         title_template, meta, title_builder(path)
     )
-    if not title:
-        title = title_builder(path)
-    title = title[:95] if len(title) > 95 else title
+    title = sanitize_youtube_title(
+        expanded_title,
+        fallback=title_builder(path),
+    )
     description = template_renderer(
         description_template,
         meta,
@@ -962,8 +990,12 @@ def prepare_file_for_manual_youtube_upload(
     if not settings.get("manual_upload_prepare_enabled", True):
         return path
 
-    metadata = metadata_builder(path, settings)
-    title = metadata.get("title") or title_builder(path)
+    metadata = dict(metadata_builder(path, settings))
+    title = sanitize_youtube_title(
+        metadata.get("title"),
+        fallback=title_builder(path),
+    )
+    metadata["title"] = title
     description = metadata.get("description") or ""
     target_path = path
 

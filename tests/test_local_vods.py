@@ -219,6 +219,20 @@ class LocalVodServiceTests(unittest.TestCase):
         self.assertIsInstance(payload["size_bytes"], int)
         self.assertIsInstance(payload["size_gb"], float)
 
+    def test_queue_keeps_original_title_and_displays_sanitized_youtube_title(self):
+        video = self.make_video(
+            "Example/2026-08-10 - Example - Stream [1234567890].mp4"
+        )
+        self.write_info(video, title="A < B")
+
+        payload = self.payload(video)
+
+        self.assertEqual(payload["title"], "A < B")
+        self.assertEqual(
+            payload["youtube_title"],
+            "Example VOD - 10.08.2026 - A B",
+        )
+
     def test_metadata_fallback_without_info_json(self):
         video = self.make_video(
             "Fallback/2026-08-09 Fallback title [2345678901].mkv"
