@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -17,6 +18,9 @@ Job = Dict[str, Any]
 LogCallback = Callable[[str], None]
 CounterGetter = Callable[[], int]
 CounterSetter = Callable[[int], None]
+
+UPLOAD_SPEED_EMA_ALPHA = 0.3
+MIN_UPLOAD_ETA_SPEED_BPS = 1024.0
 
 
 @dataclass(frozen=True)
@@ -57,11 +61,14 @@ class JobManager:
         lock: Optional[threading.Lock] = None,
         counter: int = 0,
         now: Optional[Callable[[], datetime]] = None,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self.jobs = registry if registry is not None else {}
         self.lock = lock if lock is not None else threading.Lock()
         self.counter = counter
         self._now = now or datetime.now
+        self._clock = clock or time.time
+        self._upload_measurements: Dict[tuple[str, int], Dict[str, Any]] = {}
 
     @classmethod
     def compatible_with(
@@ -136,6 +143,11 @@ class JobManager:
                 "urls": paths,
                 "item_statuses": ["wartet" for _ in paths],
                 "item_progress": [None for _ in paths],
+                "item_bytes_uploaded": [None for _ in paths],
+                "item_total_bytes": [None for _ in paths],
+                "item_bytes_per_second": [None for _ in paths],
+                "item_eta_seconds": [None for _ in paths],
+                "item_updated_at": [None for _ in paths],
                 "item_errors": ["" for _ in paths],
                 "item_resolved": [False for _ in paths],
                 "item_metadata": list(item_metadata or [{} for _ in paths]),
@@ -163,9 +175,13 @@ class JobManager:
                 if match:
                     statuses = job.get("item_statuses") or []
                     progress = job.get("item_progress") or []
+                    uploaded = job.get("item_bytes_uploaded") or []
                     for index, status in enumerate(statuses):
                         if status == "l\u00e4uft" and index < len(progress):
-                            progress[index] = max(0, min(100, int(match.group(1))))
+                            if index >= len(uploaded) or uploaded[index] is None:
+                                progress[index] = max(
+                                    0, min(100, int(match.group(1)))
+                                )
                             break
         if log_callback is not None:
             log_callback(f"Job {job_id}: {text.rstrip()}")
@@ -262,6 +278,129 @@ class JobManager:
             statuses[index] = status
             progresses[index] = progress
             errors[index] = str(error or "")
+            metric_defaults = {
+                "item_bytes_uploaded": None,
+                "item_total_bytes": None,
+                "item_bytes_per_second": None,
+                "item_eta_seconds": None,
+                "item_updated_at": None,
+            }
+            for key, default in metric_defaults.items():
+                values = job.get(key)
+                if not isinstance(values, list):
+                    values = [default for _ in statuses]
+                    job[key] = values
+                elif len(values) < len(statuses):
+                    values.extend(default for _ in range(len(statuses) - len(values)))
+            measurement_key = (str(job_id), index)
+            if status == "l\u00e4uft":
+                for key, default in metric_defaults.items():
+                    job[key][index] = default
+                self._upload_measurements.pop(measurement_key, None)
+            else:
+                job["item_bytes_per_second"][index] = None
+                job["item_eta_seconds"][index] = None
+                if status == "fertig":
+                    total_bytes = job["item_total_bytes"][index]
+                    if isinstance(total_bytes, int) and total_bytes > 0:
+                        job["item_bytes_uploaded"][index] = total_bytes
+                self._upload_measurements.pop(measurement_key, None)
+        return True
+
+    def update_active_upload_progress(
+        self,
+        job_id: str,
+        bytes_uploaded: Any,
+        total_bytes: Any,
+        *,
+        observed_at: Optional[float] = None,
+    ) -> bool:
+        """Record exact resumable-upload bytes and a smoothed transfer ETA."""
+        try:
+            uploaded = max(0, int(bytes_uploaded))
+            total = int(total_bytes)
+            timestamp = float(
+                self._clock() if observed_at is None else observed_at
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if total <= 0 or not math.isfinite(timestamp):
+            return False
+        uploaded = min(uploaded, total)
+
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None or job.get("type") != "youtube_upload":
+                return False
+            statuses = job.get("item_statuses")
+            if not isinstance(statuses, list):
+                return False
+            try:
+                index = statuses.index("l\u00e4uft")
+            except ValueError:
+                return False
+
+            metric_keys = (
+                "item_progress",
+                "item_bytes_uploaded",
+                "item_total_bytes",
+                "item_bytes_per_second",
+                "item_eta_seconds",
+                "item_updated_at",
+            )
+            for key in metric_keys:
+                values = job.get(key)
+                if not isinstance(values, list):
+                    values = [None for _ in statuses]
+                    job[key] = values
+                elif len(values) < len(statuses):
+                    values.extend(None for _ in range(len(statuses) - len(values)))
+
+            progress = min(100.0, max(0.0, uploaded * 100.0 / total))
+            job["item_progress"][index] = round(progress, 1)
+            job["item_bytes_uploaded"][index] = uploaded
+            job["item_total_bytes"][index] = total
+            job["item_updated_at"][index] = timestamp
+
+            key = (str(job_id), index)
+            previous = self._upload_measurements.get(key)
+            smoothed_speed: Optional[float] = None
+            if previous is not None:
+                elapsed = timestamp - previous["timestamp"]
+                transferred = uploaded - int(previous["bytes_uploaded"])
+                if elapsed > 0 and transferred >= 0:
+                    instant_speed = transferred / elapsed
+                    old_speed = previous.get("smoothed_speed")
+                    smoothed_speed = (
+                        instant_speed
+                        if old_speed is None
+                        else (
+                            UPLOAD_SPEED_EMA_ALPHA * instant_speed
+                            + (1.0 - UPLOAD_SPEED_EMA_ALPHA) * old_speed
+                        )
+                    )
+
+            job["item_bytes_per_second"][index] = (
+                round(smoothed_speed, 2)
+                if smoothed_speed is not None
+                and math.isfinite(smoothed_speed)
+                and smoothed_speed >= 0
+                else None
+            )
+            remaining = total - uploaded
+            job["item_eta_seconds"][index] = (
+                int(math.ceil(remaining / smoothed_speed))
+                if smoothed_speed is not None
+                and math.isfinite(smoothed_speed)
+                and smoothed_speed >= MIN_UPLOAD_ETA_SPEED_BPS
+                and remaining > 0
+                else None
+            )
+            self._upload_measurements[key] = {
+                "timestamp": timestamp,
+                "bytes_uploaded": float(uploaded),
+                "smoothed_speed": smoothed_speed,
+            }
         return True
 
     def fail_unfinished_upload_items(self, job_id: str, error: str) -> None:
@@ -273,6 +412,8 @@ class JobManager:
             statuses = job.get("item_statuses") or []
             errors = job.get("item_errors") or []
             progresses = job.get("item_progress") or []
+            speeds = job.get("item_bytes_per_second") or []
+            etas = job.get("item_eta_seconds") or []
             for index, status in enumerate(statuses):
                 if status in {"wartet", "l\u00e4uft"}:
                     statuses[index] = "fehler"
@@ -280,6 +421,11 @@ class JobManager:
                         errors[index] = str(error or "")
                     if index < len(progresses):
                         progresses[index] = None
+                    if index < len(speeds):
+                        speeds[index] = None
+                    if index < len(etas):
+                        etas[index] = None
+                    self._upload_measurements.pop((str(job_id), index), None)
 
     def resolve_error(self, job_id: str, item_number: int) -> bool:
         """Dismiss one failed item while retaining its failure and diagnostics."""

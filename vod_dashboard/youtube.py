@@ -577,6 +577,7 @@ def upload_video_to_youtube(
     history_recorder: Callable[[Path], None],
     move_after_upload: Callable[..., Path],
     job_log_callback: Optional[Callable[[str, str], None]] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Optional[str]:
     path = media_policy.safe_local_video_path(path, settings)
     service = service_getter(settings, interactive=False)
@@ -641,12 +642,21 @@ def upload_video_to_youtube(
     response = None
     while response is None:
         status, response = upload_request.next_chunk()
-        if status and job_id and job_log_callback:
-            job_log_callback(
-                job_id,
-                f"YouTube Upload {path.name}: "
-                f"{int(status.progress() * 100)}%",
-            )
+        if status:
+            total_bytes = getattr(status, "total_size", None)
+            if not isinstance(total_bytes, int) or total_bytes <= 0:
+                total_bytes = path.stat().st_size
+            bytes_uploaded = getattr(status, "resumable_progress", None)
+            if not isinstance(bytes_uploaded, int):
+                bytes_uploaded = int(status.progress() * total_bytes)
+            if progress_callback and total_bytes > 0:
+                progress_callback(bytes_uploaded, total_bytes)
+            if job_id and job_log_callback:
+                job_log_callback(
+                    job_id,
+                    f"YouTube Upload {path.name}: "
+                    f"{int(status.progress() * 100)}%",
+                )
     video_id = response.get("id") if response else None
     if video_id and job_id and job_log_callback:
         job_log_callback(

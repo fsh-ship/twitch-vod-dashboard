@@ -675,6 +675,12 @@ def youtube_mode_label(settings: Dict[str, Any]) -> str:
 
 
 def upload_video_to_youtube(path: Path, settings: Dict[str, Any], job_id: Optional[str] = None) -> Optional[str]:
+    def update_progress(uploaded: int, total: int) -> None:
+        if job_id is not None:
+            _job_manager_for_compatibility().update_active_upload_progress(
+                job_id, uploaded, total
+            )
+
     return dashboard_youtube.upload_video_to_youtube(
         path,
         settings,
@@ -688,6 +694,7 @@ def upload_video_to_youtube(path: Path, settings: Dict[str, Any], job_id: Option
         history_recorder=remember_youtube_uploaded_file,
         move_after_upload=move_uploaded_vod_to_done_folder,
         job_log_callback=append_job_log,
+        progress_callback=update_progress if job_id is not None else None,
     )
 
 

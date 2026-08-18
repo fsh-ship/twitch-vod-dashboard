@@ -698,6 +698,9 @@ main { width:100%; max-width:1320px; }
 
 .queue-section .section-heading { margin-bottom:12px; }
 .section-count { min-width:32px; height:32px; display:grid; place-items:center; padding:0 10px; border:1px solid var(--line); border-radius:999px; color:#dbe7ff; font-weight:800; }
+.running-estimate { display:grid; gap:3px; min-width:0; margin:-2px 0 12px; padding:9px 12px; border-left:2px solid rgba(122,162,255,.55); color:#cbd9f0; font-size:13px; overflow-wrap:anywhere; }
+.running-estimate span { color:var(--muted); }
+.running-estimate strong { font-size:13px; font-weight:700; }
 .queue-vod-item { display:grid; gap:10px; padding:14px; border:1px solid var(--line); border-radius:16px; background:#0e1522; min-width:0; }
 .queue-vod-item.compact { padding:11px 13px; }
 .queue-vod-item.has-error { border-color:rgba(255,107,107,.48); background:rgba(72,24,31,.45); }

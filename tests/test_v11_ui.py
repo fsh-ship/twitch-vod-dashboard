@@ -44,6 +44,8 @@ const result = queue.map(item => ({
   index: item.index,
   state: item.state,
   progress: item.progress,
+  bytesPerSecond: item.bytesPerSecond ?? null,
+  etaSeconds: item.etaSeconds ?? null,
   extra: item.extra,
   error: item.error,
   resolved: item.resolved,
@@ -57,6 +59,49 @@ process.stdout.write(JSON.stringify(result));
         [NODE, "-e", runner],
         cwd=ROOT,
         input=json.dumps({"jobs": jobs, "results": results or []}),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
+def _evaluate_queue_eta(
+    jobs: list[dict], now_ms: int = 1_787_082_600_000
+) -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for Queue ETA tests")
+    runner = r"""
+process.env.TZ = 'UTC';
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function parseProgress');
+const end = source.indexOf('function renderQueueVodItem');
+if (start < 0 || end < 0 || end <= start) throw new Error('Queue ETA source not found');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const lastResults = input.results || [];
+const localVideoCache = new Map();
+function rememberedSearchResults() { return []; }
+eval(source.slice(start, end));
+const items = queueItemsFromJobs(input.jobs || [], input.nowMs);
+process.stdout.write(JSON.stringify({
+  items: items.map(item => ({
+    state: item.state,
+    extra: item.extra,
+    etaSeconds: item.etaSeconds ?? null,
+  })),
+  estimate: overallRunningEstimate(items, input.nowMs),
+  durations: [42, 480, 4320].map(formatRemainingDuration),
+}));
+"""
+    completed = subprocess.run(
+        [NODE, "-e", runner],
+        cwd=ROOT,
+        input=json.dumps(
+            {"jobs": jobs, "results": [], "nowMs": now_ms}
+        ),
         text=True,
         capture_output=True,
         check=False,
@@ -436,7 +481,7 @@ class V11QueueStateRegressionTests(unittest.TestCase):
         self.assertEqual([item["state"] for item in items], ["running"])
         self.assertEqual(items[0]["progress"], 37.4)
         self.assertIn("4.20MiB/s", items[0]["extra"])
-        self.assertIn("ETA 00:42", items[0]["extra"])
+        self.assertIn("42 sec remaining", items[0]["extra"])
 
     def test_multi_download_marks_only_the_active_item_running(self) -> None:
         jobs = [
@@ -517,6 +562,154 @@ class V11QueueStateRegressionTests(unittest.TestCase):
         items = _classify_download_jobs(jobs)
 
         self.assertEqual([item["state"] for item in items], ["running"])
+
+
+class V12QueueEtaRegressionTests(unittest.TestCase):
+    @staticmethod
+    def upload_job(
+        statuses: list[str],
+        etas: list[int | None],
+        speeds: list[float | None],
+        *,
+        status: str = "l\u00e4uft",
+    ) -> dict:
+        job = _upload_job(
+            statuses,
+            [62 if value == "l\u00e4uft" else None for value in statuses],
+            status=status,
+        )
+        job["item_bytes_uploaded"] = [620_000_000 for _ in statuses]
+        job["item_total_bytes"] = [1_000_000_000 for _ in statuses]
+        job["item_bytes_per_second"] = speeds
+        job["item_eta_seconds"] = etas
+        job["item_updated_at"] = [1_787_082_600.0 for _ in statuses]
+        return job
+
+    def test_active_upload_displays_speed_and_remaining_time(self) -> None:
+        speed = 7.8 * 1024**2
+        result = _evaluate_queue_eta(
+            [self.upload_job(["l\u00e4uft"], [18 * 60], [speed])]
+        )
+
+        self.assertEqual(result["items"][0]["etaSeconds"], 18 * 60)
+        self.assertIn("7.8 MB/s", result["items"][0]["extra"])
+        self.assertIn("18 min remaining", result["items"][0]["extra"])
+
+    def test_zero_speed_and_insufficient_samples_have_no_eta(self) -> None:
+        zero = _evaluate_queue_eta(
+            [self.upload_job(["l\u00e4uft"], [None], [0.0])]
+        )
+        insufficient = _evaluate_queue_eta(
+            [self.upload_job(["l\u00e4uft"], [None], [None])]
+        )
+
+        self.assertEqual(zero["items"][0]["extra"], "0 B/s")
+        self.assertIsNone(zero["estimate"])
+        self.assertEqual(insufficient["items"][0]["extra"], "")
+        self.assertIsNone(insufficient["estimate"])
+
+    def test_human_readable_eta_covers_seconds_minutes_and_hours(self) -> None:
+        result = _evaluate_queue_eta([])
+
+        self.assertEqual(
+            result["durations"],
+            [
+                "42 sec remaining",
+                "8 min remaining",
+                "1 hr 12 min remaining",
+            ],
+        )
+
+    def test_one_running_upload_produces_overall_completion(self) -> None:
+        now_ms = (19 * 3600 + 50 * 60) * 1000
+        job = self.upload_job(["l\u00e4uft"], [24 * 60], [1024**2])
+        job["item_updated_at"] = [now_ms / 1000]
+        result = _evaluate_queue_eta([job], now_ms=now_ms)
+
+        self.assertEqual(result["estimate"]["etaSeconds"], 24 * 60)
+        self.assertEqual(
+            result["estimate"]["completionLabel"],
+            "Estimated completion 20:14",
+        )
+        self.assertEqual(
+            result["estimate"]["remainingLabel"],
+            "24 min remaining",
+        )
+
+    def test_completion_clock_stays_stable_between_backend_samples(self) -> None:
+        sample_ms = (19 * 3600 + 50 * 60) * 1000
+        job = self.upload_job(["l\u00e4uft"], [24 * 60], [1024**2])
+        job["item_updated_at"] = [sample_ms / 1000]
+
+        result = _evaluate_queue_eta(
+            [job], now_ms=sample_ms + 2 * 60 * 1000
+        )
+
+        self.assertEqual(result["items"][0]["etaSeconds"], 22 * 60)
+        self.assertEqual(
+            result["estimate"]["completionLabel"],
+            "Estimated completion 20:14",
+        )
+
+    def test_concurrent_download_and_upload_use_longest_eta(self) -> None:
+        download = _download_job(
+            ["l\u00e4uft"],
+            [
+                "--- VOD 1/1 ---",
+                "[download] 42.0% of 2.00GiB at 4.20MiB/s ETA 00:42",
+            ],
+        )
+        upload = self.upload_job(
+            ["l\u00e4uft"], [2 * 60], [2 * 1024**2]
+        )
+
+        result = _evaluate_queue_eta([download, upload])
+
+        self.assertEqual(result["estimate"]["etaSeconds"], 2 * 60)
+        self.assertEqual(
+            sorted(item["etaSeconds"] for item in result["items"]),
+            [42, 120],
+        )
+
+    def test_waiting_items_are_excluded_from_overall_eta(self) -> None:
+        result = _evaluate_queue_eta(
+            [
+                self.upload_job(
+                    ["l\u00e4uft", "wartet"],
+                    [60, 600],
+                    [1024**2, 1024**2],
+                )
+            ]
+        )
+
+        self.assertEqual(result["estimate"]["etaSeconds"], 60)
+        self.assertEqual(
+            [item["etaSeconds"] for item in result["items"]],
+            [60, None],
+        )
+
+    def test_completed_and_failed_items_do_not_contribute(self) -> None:
+        completed = self.upload_job(
+            ["fertig"], [600], [1024**2], status="fertig"
+        )
+        failed = self.upload_job(
+            ["fehler"], [900], [1024**2], status="fehler"
+        )
+
+        result = _evaluate_queue_eta([completed, failed])
+
+        self.assertIsNone(result["estimate"])
+        self.assertEqual(
+            [item["etaSeconds"] for item in result["items"]],
+            [None, None],
+        )
+
+    def test_eta_ui_is_responsive_and_uses_no_tilde_notation(self) -> None:
+        self.assertIn('id="queueRunningEstimate"', TEMPLATE)
+        self.assertIn(".running-estimate", STYLESHEET)
+        self.assertIn("min-width:0", STYLESHEET)
+        self.assertIn("max-width:430px", STYLESHEET)
+        self.assertNotIn("~", TEMPLATE + JAVASCRIPT + STYLESHEET)
 
 
 if __name__ == "__main__":

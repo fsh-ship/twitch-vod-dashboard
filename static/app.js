@@ -822,6 +822,76 @@ function parseProgress(logs) {
   return info;
 }
 
+function parseEtaSeconds(value) {
+  const parts = String(value || '').trim().split(':');
+  if (parts.length < 2 || parts.length > 3 || parts.some(part => !/^\d+$/.test(part))) return null;
+  const numbers = parts.map(Number);
+  const seconds = parts.length === 3
+    ? numbers[0] * 3600 + numbers[1] * 60 + numbers[2]
+    : numbers[0] * 60 + numbers[1];
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
+
+function formatRemainingDuration(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return '';
+  if (seconds < 60) return `${Math.ceil(seconds)} sec remaining`;
+  const totalMinutes = Math.ceil(seconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes} min remaining`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours} hr${hours === 1 ? '' : 's'}${minutes ? ` ${minutes} min` : ''} remaining`;
+}
+
+function formatTransferSpeed(value) {
+  if (value === null || value === undefined || value === '') return '';
+  const bytesPerSecond = Number(value);
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond < 0) return '';
+  if (bytesPerSecond < 1024) return `${Math.round(bytesPerSecond)} B/s`;
+  if (bytesPerSecond < 1024 ** 2) return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`;
+  if (bytesPerSecond < 1024 ** 3) return `${(bytesPerSecond / (1024 ** 2)).toFixed(1)} MB/s`;
+  return `${(bytesPerSecond / (1024 ** 3)).toFixed(2)} GB/s`;
+}
+
+function currentEtaSeconds(value, updatedAt, nowMs=Date.now()) {
+  const etaSeconds = Number(value);
+  if (!Number.isFinite(etaSeconds) || etaSeconds <= 0) return null;
+  const timestamp = Number(updatedAt);
+  const nowSeconds = Number(nowMs) / 1000;
+  const age = Number.isFinite(timestamp) && timestamp > 0 && timestamp <= nowSeconds
+    ? Math.max(0, nowSeconds - timestamp)
+    : 0;
+  const remaining = Math.ceil(etaSeconds - age);
+  return remaining > 0 ? remaining : null;
+}
+
+function overallRunningEstimate(items, nowMs=Date.now()) {
+  const etas = (items || [])
+    .filter(item => item && item.state === 'running')
+    .map(item => Number(item.etaSeconds))
+    .filter(value => Number.isFinite(value) && value > 0);
+  if (!etas.length) return null;
+  const etaSeconds = Math.max(...etas);
+  const completion = new Date(nowMs + etaSeconds * 1000).toLocaleTimeString([], {
+    hour: '2-digit', minute: '2-digit', hour12: false
+  });
+  return {
+    etaSeconds,
+    completionLabel: `Estimated completion ${completion}`,
+    remainingLabel: formatRemainingDuration(etaSeconds),
+  };
+}
+
+function renderOverallRunningEstimate(items) {
+  const box = $('queueRunningEstimate');
+  if (!box) return;
+  const estimate = overallRunningEstimate(items);
+  box.classList.toggle('hidden', !estimate);
+  box.innerHTML = estimate
+    ? `<span>${escapeHtml(estimate.completionLabel)}</span><strong>${escapeHtml(estimate.remainingLabel)}</strong>`
+    : '';
+}
+
 function niceStatus(status) {
   if (status === 'läuft') return 'Running';
   if (status === 'fertig') return 'Completed';
@@ -883,7 +953,7 @@ function updateQueueSummary(jobs) {
     $('queueEta').textContent = [
       info.downloadProgress !== null ? `${info.downloadProgress}%` : '',
       info.downloadSpeed,
-      info.eta ? `about ${info.eta} remaining` : ''
+      formatRemainingDuration(parseEtaSeconds(info.eta))
     ].filter(Boolean).join(' · ');
   }
 }
@@ -929,7 +999,7 @@ function queueItemKey(item) {
   return `${item.job.type || 'download'}:${item.job.id}:${item.index}`;
 }
 
-function queueItemsFromJobs(jobs) {
+function queueItemsFromJobs(jobs, nowMs=Date.now()) {
   const items = [];
   (jobs || []).slice().reverse().forEach(job => {
     const logs = job.log || [];
@@ -942,6 +1012,11 @@ function queueItemsFromJobs(jobs) {
         const metadata = (Array.isArray(job.item_metadata) && job.item_metadata[zeroIndex]) || {};
         const trackedStatus = Array.isArray(job.item_statuses) ? job.item_statuses[zeroIndex] : '';
         const trackedProgress = Array.isArray(job.item_progress) ? job.item_progress[zeroIndex] : null;
+        const trackedBytesUploaded = Array.isArray(job.item_bytes_uploaded) ? job.item_bytes_uploaded[zeroIndex] : null;
+        const trackedTotalBytes = Array.isArray(job.item_total_bytes) ? job.item_total_bytes[zeroIndex] : null;
+        const trackedBytesPerSecond = Array.isArray(job.item_bytes_per_second) ? job.item_bytes_per_second[zeroIndex] : null;
+        const trackedEtaSeconds = Array.isArray(job.item_eta_seconds) ? job.item_eta_seconds[zeroIndex] : null;
+        const trackedUpdatedAt = Array.isArray(job.item_updated_at) ? job.item_updated_at[zeroIndex] : null;
         const trackedError = Array.isArray(job.item_errors) ? job.item_errors[zeroIndex] : '';
         const resolved = !!(Array.isArray(job.item_resolved) && job.item_resolved[zeroIndex]);
         const failure = [...logs].reverse().find(line => String(line).includes(name) && /(?:failed|error|without a video ID)/i.test(String(line))) || '';
@@ -958,12 +1033,21 @@ function queueItemsFromJobs(jobs) {
         else if (job.status === 'läuft' && started && !progress.uploadFile) stateName = 'running';
         else if (job.status === 'fehler') stateName = 'error';
         const operation = stateName === 'running' ? 'Uploading to YouTube' : stateName === 'completed' ? 'YouTube upload completed' : stateName === 'error' ? 'YouTube upload failed' : 'Waiting to upload';
+        const etaSeconds = stateName === 'running' ? currentEtaSeconds(trackedEtaSeconds, trackedUpdatedAt, nowMs) : null;
+        const speedLabel = stateName === 'running' ? formatTransferSpeed(trackedBytesPerSecond) : '';
         items.push({
           job, state: stateName, operation, resolved,
           streamer: metadata.streamer || local.streamer || '', date: metadata.date || local.date_de || '', title: metadata.title || local.title || local.youtube_title || name,
           vodId: metadata.vod_id || local.vod_id || '', filename: queuePathName(metadata.name || local.name || name),
           sizeBytes: metadata.size_bytes ?? local.size_bytes ?? null, sizeGb: metadata.size_gb ?? local.size_gb ?? null,
-          progress: stateName === 'running' ? trackedProgress : null, extra: '', error: trackedError || failure || (stateName === 'error' ? queueErrorFromLines(logs) : ''), index: zeroIndex
+          progress: stateName === 'running' ? trackedProgress : null,
+          bytesUploaded: stateName === 'running' ? trackedBytesUploaded : null,
+          totalBytes: stateName === 'running' ? trackedTotalBytes : null,
+          bytesPerSecond: stateName === 'running' ? trackedBytesPerSecond : null,
+          etaSeconds,
+          updatedAt: stateName === 'running' ? trackedUpdatedAt : null,
+          extra: [speedLabel, formatRemainingDuration(etaSeconds)].filter(Boolean).join(' · '),
+          error: trackedError || failure || (stateName === 'error' ? queueErrorFromLines(logs) : ''), index: zeroIndex
         });
       });
       return;
@@ -991,12 +1075,14 @@ function queueItemsFromJobs(jobs) {
       else if (job.status === 'fehler') stateName = 'error';
       const vodId = queueVodId(url);
       const operation = stateName === 'running' ? 'Downloading' : stateName === 'completed' ? 'Download completed' : stateName === 'error' ? 'Download failed' : 'Waiting to download';
+      const etaSeconds = stateName === 'running' ? parseEtaSeconds(progress.eta) : null;
       items.push({
         job, state: stateName, operation, resolved,
         streamer: meta.streamer || '', date: meta.date || '', title: meta.title || (vodId ? `Twitch VOD ${vodId}` : job.label),
         vodId, filename: '', sizeBytes: null, sizeGb: null,
         progress: stateName === 'running' ? progress.downloadProgress : null,
-        extra: stateName === 'running' ? [progress.downloadSpeed, progress.eta ? `ETA ${progress.eta}` : ''].filter(Boolean).join(' · ') : '',
+        etaSeconds,
+        extra: stateName === 'running' ? [progress.downloadSpeed, formatRemainingDuration(etaSeconds)].filter(Boolean).join(' · ') : '',
         error: stateName === 'error' ? queueErrorFromLines(segment.length ? segment : logs) : '', index: zeroIndex
       });
     });
@@ -1121,6 +1207,7 @@ function renderVodQueue(jobs) {
   renderQueueGroup('queueWaiting', waiting, 'Nothing is waiting.', true);
   renderQueueGroup('queueErrors', errors, 'No errors.', true);
   renderQueueGroup('queueCompleted', completed, 'Nothing completed in this session.', true);
+  renderOverallRunningEstimate(running);
   if ($('queueActive')) $('queueActive').textContent = String(running.length);
   if ($('queueWaitingCount')) $('queueWaitingCount').textContent = String(waiting.length);
   if ($('queueFailed')) $('queueFailed').textContent = String(errors.length);
@@ -1514,7 +1601,7 @@ $('youtubeLoadPlaylists').addEventListener('click', () => loadYoutubePlaylists()
 $('saveYoutubeSettings').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'youtube'));
 $('saveYoutubeSettingsBottom').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'youtube'));
 
-setInterval(() => pollJobs().catch(() => {}), 2000);
+setInterval(() => pollJobs().catch(() => {}), 5000);
 loadState().then(() => {
   setDateRange(7);
   showPage(localStorage.getItem('vodActivePage') || 'dashboard');

@@ -1150,21 +1150,29 @@ class YouTubeUploadHelperTests(unittest.TestCase):
 
     def test_progress_uses_next_chunk_until_response(self):
         service = mock.Mock()
-        status = mock.Mock()
-        status.progress.return_value = 0.427
+        status = SimpleNamespace(
+            resumable_progress=427_000,
+            total_size=1_000_000,
+            progress=lambda: 0.427,
+        )
         upload_request = service.videos.return_value.insert.return_value
         upload_request.next_chunk.side_effect = [
             (status, None),
             (None, {"id": "youtube-video-1"}),
         ]
         logger = mock.Mock()
+        progress_callback = mock.Mock()
 
         result, _ = self.upload(
-            service, job_id="job-1", job_log_callback=logger
+            service,
+            job_id="job-1",
+            job_log_callback=logger,
+            progress_callback=progress_callback,
         )
 
         self.assertEqual(result, "youtube-video-1")
         self.assertEqual(upload_request.next_chunk.call_count, 2)
+        progress_callback.assert_called_once_with(427_000, 1_000_000)
         self.assertIn(
             mock.call("job-1", "YouTube Upload vod.mp4: 42%"),
             logger.call_args_list,

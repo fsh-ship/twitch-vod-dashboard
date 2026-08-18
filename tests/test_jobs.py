@@ -83,6 +83,11 @@ class JobManagerTests(unittest.TestCase):
                 "urls": ["C:/media/vod.mp4"],
                 "item_statuses": ["wartet"],
                 "item_progress": [None],
+                "item_bytes_uploaded": [None],
+                "item_total_bytes": [None],
+                "item_bytes_per_second": [None],
+                "item_eta_seconds": [None],
+                "item_updated_at": [None],
                 "item_errors": [""],
                 "item_resolved": [False],
                 "item_metadata": [{}],
@@ -138,6 +143,84 @@ class JobManagerTests(unittest.TestCase):
         self.assertEqual(
             manager.jobs[job_id]["item_statuses"], ["\u006c\u00e4uft", "wartet"]
         )
+
+    def test_active_upload_bytes_produce_speed_and_eta(self):
+        manager = self.manager()
+        job_id = manager.create_upload_job(["C:/media/one.mp4"], "Upload")
+        manager.start_job(job_id)
+        manager.set_upload_item_status(job_id, 1, "l\u00e4uft", progress=0)
+        mib = 1024**2
+
+        manager.update_active_upload_progress(
+            job_id, 10 * mib, 100 * mib, observed_at=0
+        )
+        manager.update_active_upload_progress(
+            job_id, 20 * mib, 100 * mib, observed_at=5
+        )
+
+        job = manager.jobs[job_id]
+        self.assertEqual(job["item_progress"], [20.0])
+        self.assertEqual(job["item_bytes_uploaded"], [20 * mib])
+        self.assertEqual(job["item_total_bytes"], [100 * mib])
+        self.assertEqual(job["item_bytes_per_second"], [2 * mib])
+        self.assertEqual(job["item_eta_seconds"], [40])
+        self.assertEqual(job["item_updated_at"], [5.0])
+
+    def test_upload_eta_needs_two_transfer_samples(self):
+        manager = self.manager()
+        job_id = manager.create_upload_job(["C:/media/one.mp4"], "Upload")
+        manager.start_job(job_id)
+        manager.set_upload_item_status(job_id, 1, "l\u00e4uft", progress=0)
+
+        manager.update_active_upload_progress(
+            job_id, 10_000, 100_000, observed_at=1
+        )
+
+        job = manager.jobs[job_id]
+        self.assertIsNone(job["item_bytes_per_second"][0])
+        self.assertIsNone(job["item_eta_seconds"][0])
+
+    def test_zero_upload_speed_never_produces_an_invalid_eta(self):
+        manager = self.manager()
+        job_id = manager.create_upload_job(["C:/media/one.mp4"], "Upload")
+        manager.start_job(job_id)
+        manager.set_upload_item_status(job_id, 1, "l\u00e4uft", progress=0)
+
+        manager.update_active_upload_progress(
+            job_id, 10_000, 100_000, observed_at=1
+        )
+        manager.update_active_upload_progress(
+            job_id, 10_000, 100_000, observed_at=6
+        )
+
+        job = manager.jobs[job_id]
+        self.assertEqual(job["item_bytes_per_second"], [0.0])
+        self.assertEqual(job["item_eta_seconds"], [None])
+
+    def test_upload_speed_uses_ema_to_smooth_fluctuating_samples(self):
+        manager = self.manager()
+        job_id = manager.create_upload_job(["C:/media/one.mp4"], "Upload")
+        manager.start_job(job_id)
+        manager.set_upload_item_status(job_id, 1, "l\u00e4uft", progress=0)
+        mib = 1024**2
+
+        manager.update_active_upload_progress(
+            job_id, 0, 400 * mib, observed_at=0
+        )
+        manager.update_active_upload_progress(
+            job_id, 100 * mib, 400 * mib, observed_at=10
+        )
+        manager.update_active_upload_progress(
+            job_id, 110 * mib, 400 * mib, observed_at=20
+        )
+
+        job = manager.jobs[job_id]
+        self.assertAlmostEqual(
+            job["item_bytes_per_second"][0] / mib,
+            7.3,
+            places=2,
+        )
+        self.assertEqual(job["item_eta_seconds"], [40])
 
     def test_unfinished_upload_paths_and_resolved_error_state(self):
         manager = self.manager()
