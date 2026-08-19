@@ -135,6 +135,7 @@ def _download_job(
     }
     if item_statuses is not None:
         job["item_statuses"] = item_statuses
+    job["item_ids"] = [f"1-item-{index + 1}" for index in range(item_count)]
     return job
 
 
@@ -153,6 +154,7 @@ def _upload_job(
         "type": "youtube_upload",
         "status": status,
         "urls": [f"C:/media/vod-{index + 1}.mp4" for index in range(count)],
+        "item_ids": [f"upload-1-item-{index + 1}" for index in range(count)],
         "item_statuses": statuses,
         "item_progress": progresses,
         "item_errors": errors or ["" for _ in range(count)],
@@ -178,14 +180,16 @@ const source = fs.readFileSync('static/app.js', 'utf8');
 const start = source.indexOf('function renderQueueVodItem');
 const end = source.indexOf('function renderQueueGroup');
 if (start < 0 || end < 0 || end <= start) throw new Error('Queue renderer source not found');
-const queueDetailOpenState = {'youtube_upload:upload-1:0': true};
+const queueDetailOpenState = {'youtube_upload:upload-1:upload-1-item-1': true};
 function escapeHtml(value) { return String(value || ''); }
 function niceStatus(value) { return value; }
 function renderProgressBar() { return ''; }
 function queueErrorSummary(value) { return String(value || ''); }
-function queueItemKey(value) { return `${value.job.type || 'download'}:${value.job.id}:${value.index}`; }
+function queueItemKey(value) { return `${value.job.type || 'download'}:${value.job.id}:${value.itemId || value.index}`; }
 eval(source.slice(start, end));
 const item = JSON.parse(fs.readFileSync(0, 'utf8'));
+item.itemId = item.itemId || 'upload-1-item-1';
+item.capabilities = item.capabilities || {};
 const first = renderQueueVodItem(item, true);
 const second = renderQueueVodItem(item, true);
 process.stdout.write(JSON.stringify({first, second}));
@@ -292,6 +296,22 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn("Show All Details", TEMPLATE)
         self.assertIn("queue-vod-item compact", JAVASCRIPT)
         self.assertIn("local-video-table-head", TEMPLATE)
+
+    def test_queue_controls_are_backend_capability_driven_without_reorder(self) -> None:
+        self.assertIn('id="queueLaneControls"', TEMPLATE)
+        self.assertIn("job.item_capabilities", JAVASCRIPT)
+        for label in (
+            "Pause Queue",
+            "Resume Queue",
+            "Stop after current",
+            "Remove from Queue",
+            "Retry",
+            "Cancel",
+        ):
+            self.assertIn(label, JAVASCRIPT)
+        self.assertNotIn("Move Up", JAVASCRIPT)
+        self.assertNotIn("Move Down", JAVASCRIPT)
+        self.assertIn("Active work continues; no new item will start.", JAVASCRIPT)
 
     def test_dashboard_idle_state_is_conditional_and_compact(self) -> None:
         self.assertIn('id="dashboardRunningSection"', TEMPLATE)
@@ -421,6 +441,8 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("overflow-x:hidden", STYLESHEET)
         self.assertIn(".sidebar.mobile-open", STYLESHEET)
         self.assertIn(".search-results-table td[data-label]::before", STYLESHEET)
+        self.assertIn(".queue-lane-controls { grid-template-columns:1fr; }", STYLESHEET)
+        self.assertIn(".queue-item-actions button { width:100%; min-height:44px; }", STYLESHEET)
 
 
 class V11QueueStateRegressionTests(unittest.TestCase):
@@ -502,7 +524,7 @@ class V11QueueStateRegressionTests(unittest.TestCase):
             }
         )
 
-        self.assertIn('data-queue-detail-id="youtube_upload:upload-1:0" open', html)
+        self.assertIn('data-queue-detail-id="youtube_upload:upload-1:upload-1-item-1" open', html)
         self.assertIn("Mark as resolved", html)
 
     def test_completed_upload_details_exclude_another_active_vod(self) -> None:
@@ -555,7 +577,7 @@ class V11QueueStateRegressionTests(unittest.TestCase):
         )
         self.assertIn("watch?v=old", html)
         self.assertNotIn("vod-2.mp4: 12%", html)
-        self.assertIn('data-queue-detail-id="youtube_upload:upload-1:0" open', html)
+        self.assertIn('data-queue-detail-id="youtube_upload:upload-1:upload-1-item-1" open', html)
 
     def test_same_streamer_vods_have_independent_polling_stable_keys(self) -> None:
         job = _upload_job(["fertig", "l\u00e4uft"], [100, 12])
@@ -573,7 +595,10 @@ class V11QueueStateRegressionTests(unittest.TestCase):
 
         self.assertEqual(
             [item["key"] for item in first_poll],
-            ["youtube_upload:upload-1:0", "youtube_upload:upload-1:1"],
+            [
+                "youtube_upload:upload-1:upload-1-item-1",
+                "youtube_upload:upload-1:upload-1-item-2",
+            ],
         )
         self.assertEqual(
             [item["key"] for item in second_poll],

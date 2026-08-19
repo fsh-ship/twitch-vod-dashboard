@@ -112,6 +112,7 @@
           </section>
           <section class="card queue-section">
             <div class="section-heading"><div><p class="eyebrow">In progress</p><h2>Running</h2></div><span id="queueActive" class="section-count">0</span></div>
+            <div id="queueLaneControls" class="queue-lane-controls" aria-live="polite"></div>
             <div id="queueRunningEstimate" class="running-estimate hidden" aria-live="polite"></div>
             <div id="queueRunning" class="queue-vod-list muted">No downloads or uploads are currently running.</div>
           </section>
@@ -128,6 +129,9 @@
           </section>
           <section class="card queue-section completed-section">
             <details id="queueCompletedDetails"><summary>Completed <span id="queueDone">0</span></summary><div id="queueCompleted" class="queue-vod-list muted">Nothing completed in this session.</div></details>
+          </section>
+          <section id="queueCancelledSection" class="card queue-section completed-section hidden">
+            <details><summary>Cancelled <span id="queueCancelledCount">0</span></summary><div id="queueCancelled" class="queue-vod-list muted">Nothing cancelled in this session.</div></details>
           </section>
           <div id="jobs" class="hidden" aria-hidden="true"></div>
           <span id="queueTotal" class="hidden">0</span><span id="queueCurrent" class="hidden"></span><span id="queueEta" class="hidden"></span>

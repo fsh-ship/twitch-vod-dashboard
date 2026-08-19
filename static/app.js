@@ -878,7 +878,7 @@ function currentEtaSeconds(value, updatedAt, nowMs=Date.now()) {
 
 function overallRunningEstimate(items, nowMs=Date.now()) {
   const etas = (items || [])
-    .filter(item => item && item.state === 'running')
+    .filter(item => item && (item.state === 'running' || item.state === 'cancelling'))
     .map(item => Number(item.etaSeconds))
     .filter(value => Number.isFinite(value) && value > 0);
   if (!etas.length) return null;
@@ -958,7 +958,7 @@ function updateQueueSummary(jobs) {
     return;
   }
   const info = parseProgress(activeJob.log || []);
-  const activeItem = queueItemsFromJobs([activeJob]).find(item => item.state === 'running');
+  const activeItem = queueItemsFromJobs([activeJob]).find(item => item.state === 'running' || item.state === 'cancelling');
   const current = [activeJob.label, info.currentItem].filter(Boolean).join(' · ');
   if ($('queueCurrent')) $('queueCurrent').textContent = current || activeJob.label;
   if ($('queueEta')) {
@@ -1035,7 +1035,12 @@ function queueErrorSummary(raw, operation) {
 }
 
 function queueItemKey(item) {
-  return `${item.job.type || 'download'}:${item.job.id}:${item.index}`;
+  return `${item.job.type || 'download'}:${item.job.id}:${item.itemId || item.index}`;
+}
+
+function explicitQueueItemState(job, index) {
+  const state = Array.isArray(job.item_states) ? job.item_states[index] : '';
+  return ({queued:'waiting', running:'running', cancelling:'cancelling', completed:'completed', failed:'error', cancelled:'cancelled', interrupted:'interrupted'})[state] || '';
 }
 
 function queueItemsFromJobs(jobs, nowMs=Date.now()) {
@@ -1050,6 +1055,8 @@ function queueItemsFromJobs(jobs, nowMs=Date.now()) {
         const segment = uploadLogSegment(logs, path);
         const local = localVideoCache.get(path) || [...localVideoCache.values()].find(v => v.name === name) || {};
         const metadata = (Array.isArray(job.item_metadata) && job.item_metadata[zeroIndex]) || {};
+        const itemId = (Array.isArray(job.item_ids) && job.item_ids[zeroIndex]) || `${job.id}-item-${zeroIndex + 1}`;
+        const capabilities = (Array.isArray(job.item_capabilities) && job.item_capabilities[zeroIndex]) || {};
         const trackedStatus = Array.isArray(job.item_statuses) ? job.item_statuses[zeroIndex] : '';
         const trackedProgress = Array.isArray(job.item_progress) ? job.item_progress[zeroIndex] : null;
         const trackedBytesUploaded = Array.isArray(job.item_bytes_uploaded) ? job.item_bytes_uploaded[zeroIndex] : null;
@@ -1062,30 +1069,34 @@ function queueItemsFromJobs(jobs, nowMs=Date.now()) {
         const failure = [...segment].reverse().find(line => /(?:failed|error|without a video ID)/i.test(String(line))) || '';
         const completion = segment.some(line => /YouTube Upload completed:/i.test(String(line)));
         const started = segment.some(line => /(?:Uploading local VOD file:|YouTube Upload starting:)/i.test(String(line)));
-        let stateName = 'waiting';
-        if (trackedStatus === 'fehler') stateName = 'error';
-        else if (trackedStatus === 'fertig') stateName = 'completed';
-        else if (trackedStatus === 'läuft') stateName = 'running';
-        else if (trackedStatus === 'wartet') stateName = 'waiting';
-        else if (failure) stateName = 'error';
-        else if (completion || job.status === 'fertig') stateName = 'completed';
-        else if (job.status === 'läuft' && progress.uploadFile && progress.uploadFile.includes(name)) stateName = 'running';
-        else if (job.status === 'läuft' && started && !progress.uploadFile) stateName = 'running';
-        else if (job.status === 'fehler') stateName = 'error';
-        const operation = stateName === 'running' ? 'Uploading to YouTube' : stateName === 'completed' ? 'YouTube upload completed' : stateName === 'error' ? 'YouTube upload failed' : 'Waiting to upload';
-        const etaSeconds = stateName === 'running' ? currentEtaSeconds(trackedEtaSeconds, trackedUpdatedAt, nowMs) : null;
-        const speedLabel = stateName === 'running' ? formatTransferSpeed(trackedBytesPerSecond) : '';
+        const explicitState = explicitQueueItemState(job, zeroIndex);
+        let stateName = explicitState || 'waiting';
+        if (!explicitState) {
+          if (trackedStatus === 'fehler') stateName = 'error';
+          else if (trackedStatus === 'fertig') stateName = 'completed';
+          else if (trackedStatus === 'läuft') stateName = 'running';
+          else if (trackedStatus === 'wartet') stateName = 'waiting';
+          else if (failure) stateName = 'error';
+          else if (completion || job.status === 'fertig') stateName = 'completed';
+          else if (job.status === 'läuft' && progress.uploadFile && progress.uploadFile.includes(name)) stateName = 'running';
+          else if (job.status === 'läuft' && started && !progress.uploadFile) stateName = 'running';
+          else if (job.status === 'fehler') stateName = 'error';
+        }
+        const operation = stateName === 'running' ? 'Uploading to YouTube' : stateName === 'cancelling' ? 'Cancelling YouTube upload' : stateName === 'completed' ? 'YouTube upload completed' : stateName === 'error' ? 'YouTube upload failed' : stateName === 'cancelled' ? 'YouTube upload cancelled' : stateName === 'interrupted' ? 'YouTube upload interrupted' : 'Waiting to upload';
+        const activeTransfer = stateName === 'running' || stateName === 'cancelling';
+        const etaSeconds = activeTransfer ? currentEtaSeconds(trackedEtaSeconds, trackedUpdatedAt, nowMs) : null;
+        const speedLabel = activeTransfer ? formatTransferSpeed(trackedBytesPerSecond) : '';
         items.push({
-          job, state: stateName, operation, resolved,
+          job, itemId, capabilities, state: stateName, operation, resolved,
           streamer: metadata.streamer || local.streamer || '', date: metadata.date || local.date_de || '', title: metadata.title || local.title || local.youtube_title || name,
           vodId: metadata.vod_id || local.vod_id || '', filename: queuePathName(metadata.name || local.name || name),
           sizeBytes: metadata.size_bytes ?? local.size_bytes ?? null, sizeGb: metadata.size_gb ?? local.size_gb ?? null,
-          progress: stateName === 'running' ? trackedProgress : null,
-          bytesUploaded: stateName === 'running' ? trackedBytesUploaded : null,
-          totalBytes: stateName === 'running' ? trackedTotalBytes : null,
-          bytesPerSecond: stateName === 'running' ? trackedBytesPerSecond : null,
+          progress: activeTransfer ? trackedProgress : null,
+          bytesUploaded: activeTransfer ? trackedBytesUploaded : null,
+          totalBytes: activeTransfer ? trackedTotalBytes : null,
+          bytesPerSecond: activeTransfer ? trackedBytesPerSecond : null,
           etaSeconds,
-          updatedAt: stateName === 'running' ? trackedUpdatedAt : null,
+          updatedAt: activeTransfer ? trackedUpdatedAt : null,
           extra: [speedLabel, formatRemainingDuration(etaSeconds)].filter(Boolean).join(' · '),
           detailLogs: segment,
           error: trackedError || failure || (stateName === 'error' ? queueErrorFromLines(segment) : ''), index: zeroIndex
@@ -1100,6 +1111,8 @@ function queueItemsFromJobs(jobs, nowMs=Date.now()) {
       const segment = downloadLogSegment(logs, index);
       const failed = segment.some(line => /ended with error code/i.test(String(line)));
       const completed = segment.some(line => new RegExp(`VOD\\s+${index}\\/\\d+ download completed`, 'i').test(String(line)));
+      const itemId = (Array.isArray(job.item_ids) && job.item_ids[zeroIndex]) || `${job.id}-item-${zeroIndex + 1}`;
+      const capabilities = (Array.isArray(job.item_capabilities) && job.item_capabilities[zeroIndex]) || {};
       const trackedStatus = Array.isArray(job.item_statuses) ? job.item_statuses[zeroIndex] : '';
       const trackedProgress = Array.isArray(job.item_progress) ? job.item_progress[zeroIndex] : null;
       const trackedProcessedSeconds = Array.isArray(job.item_processed_seconds) ? job.item_processed_seconds[zeroIndex] : null;
@@ -1107,50 +1120,54 @@ function queueItemsFromJobs(jobs, nowMs=Date.now()) {
       const trackedEtaSeconds = Array.isArray(job.item_eta_seconds) ? job.item_eta_seconds[zeroIndex] : null;
       const trackedUpdatedAt = Array.isArray(job.item_updated_at) ? job.item_updated_at[zeroIndex] : null;
       const resolved = !!(Array.isArray(job.item_resolved) && job.item_resolved[zeroIndex]);
-      let stateName = 'waiting';
-      if (trackedStatus === 'fehler') stateName = 'error';
-      else if (trackedStatus === 'fertig') stateName = 'completed';
-      else if (trackedStatus === 'läuft') stateName = 'running';
-      else if (trackedStatus === 'wartet' && job.status === 'fehler') stateName = 'error';
-      else if (trackedStatus === 'wartet' && job.status === 'fertig') stateName = 'completed';
-      else if (trackedStatus === 'wartet') stateName = 'waiting';
-      else if (failed) stateName = 'error';
-      else if (completed || job.status === 'fertig') stateName = 'completed';
-      else if (job.status === 'läuft' && progress.batchCurrent === index) stateName = 'running';
-      else if (job.status === 'läuft' && progress.batchCurrent && progress.batchCurrent > index) stateName = 'completed';
-      else if (job.status === 'fehler') stateName = 'error';
+      const explicitState = explicitQueueItemState(job, zeroIndex);
+      let stateName = explicitState || 'waiting';
+      if (!explicitState) {
+        if (trackedStatus === 'fehler') stateName = 'error';
+        else if (trackedStatus === 'fertig') stateName = 'completed';
+        else if (trackedStatus === 'läuft') stateName = 'running';
+        else if (trackedStatus === 'wartet' && job.status === 'fehler') stateName = 'error';
+        else if (trackedStatus === 'wartet' && job.status === 'fertig') stateName = 'completed';
+        else if (trackedStatus === 'wartet') stateName = 'waiting';
+        else if (failed) stateName = 'error';
+        else if (completed || job.status === 'fertig') stateName = 'completed';
+        else if (job.status === 'läuft' && progress.batchCurrent === index) stateName = 'running';
+        else if (job.status === 'läuft' && progress.batchCurrent && progress.batchCurrent > index) stateName = 'completed';
+        else if (job.status === 'fehler') stateName = 'error';
+      }
       const vodId = queueVodId(url);
-      const operation = stateName === 'running' ? 'Downloading' : stateName === 'completed' ? 'Download completed' : stateName === 'error' ? 'Download failed' : 'Waiting to download';
+      const operation = stateName === 'running' ? 'Downloading' : stateName === 'cancelling' ? 'Cancelling download' : stateName === 'completed' ? 'Download completed' : stateName === 'error' ? 'Download failed' : stateName === 'cancelled' ? 'Download cancelled' : stateName === 'interrupted' ? 'Download interrupted' : 'Waiting to download';
       const hasStructuredDownloadState = Array.isArray(job.item_progress) && Array.isArray(job.item_eta_seconds);
       const structuredProgress = Number(trackedProgress);
       const hasStructuredProgress = trackedProgress !== null && trackedProgress !== '' && Number.isFinite(structuredProgress);
-      const displayedProgress = stateName === 'running'
+      const activeTransfer = stateName === 'running' || stateName === 'cancelling';
+      const displayedProgress = activeTransfer
         ? (hasStructuredProgress ? structuredProgress : (hasStructuredDownloadState ? null : progress.downloadProgress))
         : null;
       const hasStructuredEta = trackedEtaSeconds !== null && trackedEtaSeconds !== '' && Number.isFinite(Number(trackedEtaSeconds));
-      const structuredEta = stateName === 'running' && hasStructuredEta
+      const structuredEta = activeTransfer && hasStructuredEta
         ? currentEtaSeconds(trackedEtaSeconds, trackedUpdatedAt, nowMs)
         : null;
-      const etaSeconds = stateName === 'running'
+      const etaSeconds = activeTransfer
         ? (hasStructuredEta ? structuredEta : (hasStructuredDownloadState ? null : parseEtaSeconds(progress.eta)))
         : null;
-      const speedLabel = stateName === 'running'
+      const speedLabel = activeTransfer
         ? (/^\d+(?:\.\d+)?x$/i.test(String(trackedSpeedLabel || '').trim())
           ? ''
           : (trackedSpeedLabel || (hasStructuredDownloadState ? '' : progress.downloadSpeed)))
         : '';
-      const processedLabel = stateName === 'running' && displayedProgress === null
+      const processedLabel = activeTransfer && displayedProgress === null
         ? formatProcessedDuration(trackedProcessedSeconds)
         : '';
       items.push({
-        job, state: stateName, operation, resolved,
+        job, itemId, capabilities, state: stateName, operation, resolved,
         streamer: meta.streamer || '', date: meta.date || '', title: meta.title || (vodId ? `Twitch VOD ${vodId}` : job.label),
         vodId, filename: '', sizeBytes: null, sizeGb: null,
         progress: displayedProgress,
-        processedSeconds: stateName === 'running' ? trackedProcessedSeconds : null,
+        processedSeconds: activeTransfer ? trackedProcessedSeconds : null,
         etaSeconds,
-        updatedAt: stateName === 'running' ? trackedUpdatedAt : null,
-        extra: stateName === 'running' ? [processedLabel, speedLabel, formatRemainingDuration(etaSeconds)].filter(Boolean).join(' · ') : '',
+        updatedAt: activeTransfer ? trackedUpdatedAt : null,
+        extra: activeTransfer ? [processedLabel, speedLabel, formatRemainingDuration(etaSeconds)].filter(Boolean).join(' · ') : '',
         detailLogs: segment,
         error: stateName === 'error' ? queueErrorFromLines(segment.length ? segment : logs) : '', index: zeroIndex
       });
@@ -1225,33 +1242,44 @@ function distinguishQueueItems(items) {
 }
 
 function renderQueueVodItem(item, compact=false) {
+  const capabilities = item.capabilities || {};
+  const itemId = item.itemId || `${item.job.id}-item-${item.index + 1}`;
   const identity = [item.streamer, item.date].filter(Boolean).join(' · ');
-  const status = item.state === 'running' ? item.operation : niceStatus(item.state === 'waiting' ? 'wartet' : item.state === 'completed' ? 'fertig' : 'fehler');
+  const status = ({running:item.operation, cancelling:'Cancelling...', waiting:'Queued', completed:'Completed', error:'Failed', cancelled:'Cancelled', interrupted:'Interrupted'})[item.state] || 'Queued';
   const itemLogs = Array.isArray(item.detailLogs) ? item.detailLogs : [];
   const logText = itemLogs.length
     ? itemLogs.slice(-120).join('\n')
     : 'No item-specific technical log is available.';
-  const progress = item.state === 'running' ? renderProgressBar(item.operation, item.progress, item.extra) : '';
-  const progressDetails = item.state === 'running' && !progress && item.extra
+  const activeTransfer = item.state === 'running' || item.state === 'cancelling';
+  const progress = activeTransfer ? renderProgressBar(item.operation, item.progress, item.extra) : '';
+  const progressDetails = activeTransfer && !progress && item.extra
     ? `<div class="queue-progress-text muted">${escapeHtml(item.extra)}</div>`
     : '';
   const detailId = queueItemKey(item);
   const detailOpen = queueDetailOpenState[detailId] ? ' open' : '';
   const error = item.error ? `<div class="queue-item-error">${escapeHtml(queueErrorSummary(item.error, item.operation))}</div>` : '';
-  const resolveAction = item.state === 'error' && !item.resolved ? `<button type="button" class="quiet-button queue-resolve-error" data-job-id="${escapeHtml(item.job.id)}" data-item-index="${item.index}">Mark as resolved</button>` : '';
+  const actionButtons = [];
+  if (capabilities.can_cancel) actionButtons.push(`<button type="button" class="danger-outline queue-item-action" data-queue-action="cancel" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}">Cancel</button>`);
+  if (capabilities.can_stop_after_current) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="stop" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}">Stop after current</button>`);
+  if (capabilities.can_remove) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="remove" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}">Remove from Queue</button>`);
+  if (capabilities.can_retry) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="retry" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}">Retry</button>`);
+  if (item.state === 'error' && !item.resolved && capabilities.can_resolve !== false) actionButtons.push(`<button type="button" class="quiet-button queue-resolve-error" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}">Mark as resolved</button>`);
+  const retryBlock = capabilities.retry_block_reason ? `<div class="queue-item-note muted">${escapeHtml(capabilities.retry_block_reason)}</div>` : '';
+  const actions = actionButtons.length ? `<div class="queue-item-actions">${actionButtons.join('')}</div>` : '';
   if (compact) {
     return `<article class="queue-vod-item compact ${item.state === 'error' ? 'has-error' : ''}">
       <div class="queue-row-identity"><strong>${escapeHtml(item.streamer || 'Unknown streamer')}</strong><span>${escapeHtml(item.date || 'Unknown date')}</span></div>
       <div class="queue-row-title">${escapeHtml(item.title || item.job.label)}</div>
       ${item.distinguishingLabel ? `<div class="queue-row-disambiguator muted">${escapeHtml(item.distinguishingLabel)}</div>` : ''}
-      <span class="pill ${item.state === 'error' ? 'bad' : item.state === 'completed' ? 'good' : 'muted'}">${escapeHtml(status)}</span>
-      <details class="technical-details queue-row-details" data-queue-detail-id="${escapeHtml(detailId)}"${detailOpen}><summary>${item.state === 'error' ? 'View error' : 'Technical details'}</summary><div class="job-detail-grid"><div><span class="muted">Job ID</span><strong>${escapeHtml(item.job.id)}</strong></div><div><span class="muted">Operation</span><strong>${escapeHtml(item.operation)}</strong></div></div>${error}${resolveAction}<pre>${escapeHtml(logText)}</pre></details>
+      <span class="pill ${item.state === 'error' || item.state === 'interrupted' ? 'bad' : item.state === 'completed' ? 'good' : 'muted'}">${escapeHtml(status)}</span>
+      ${retryBlock}${actions}
+      <details class="technical-details queue-row-details" data-queue-detail-id="${escapeHtml(detailId)}"${detailOpen}><summary>${item.state === 'error' ? 'View error' : 'Technical details'}</summary><div class="job-detail-grid"><div><span class="muted">Job ID</span><strong>${escapeHtml(item.job.id)}</strong></div><div><span class="muted">Item ID</span><strong>${escapeHtml(itemId)}</strong></div><div><span class="muted">Operation</span><strong>${escapeHtml(item.operation)}</strong></div></div>${error}<pre>${escapeHtml(logText)}</pre></details>
     </article>`;
   }
   return `<article class="queue-vod-item ${compact ? 'compact' : ''} ${item.state === 'error' ? 'has-error' : ''}">
-    <div class="queue-vod-main"><div class="queue-vod-copy">${identity ? `<div class="queue-vod-identity">${escapeHtml(identity)}</div>` : ''}<strong>${escapeHtml(item.title || item.job.label)}</strong></div><span class="pill ${item.state === 'error' ? 'bad' : item.state === 'completed' ? 'good' : item.state === 'running' ? 'accent' : 'muted'}">${escapeHtml(status)}</span></div>
-    ${error}${progress}${progressDetails}
-    <details class="technical-details" data-queue-detail-id="${escapeHtml(detailId)}"${detailOpen}><summary>Technical details</summary><div class="job-detail-grid"><div><span class="muted">Job ID</span><strong>${escapeHtml(item.job.id)}</strong></div><div><span class="muted">Operation</span><strong>${escapeHtml(item.operation)}</strong></div></div><pre>${escapeHtml(logText)}</pre></details>
+    <div class="queue-vod-main"><div class="queue-vod-copy">${identity ? `<div class="queue-vod-identity">${escapeHtml(identity)}</div>` : ''}<strong>${escapeHtml(item.title || item.job.label)}</strong></div><span class="pill ${item.state === 'error' || item.state === 'interrupted' ? 'bad' : item.state === 'completed' ? 'good' : activeTransfer ? 'accent' : 'muted'}">${escapeHtml(status)}</span></div>
+    ${error}${retryBlock}${progress}${progressDetails}${actions}
+    <details class="technical-details" data-queue-detail-id="${escapeHtml(detailId)}"${detailOpen}><summary>Technical details</summary><div class="job-detail-grid"><div><span class="muted">Job ID</span><strong>${escapeHtml(item.job.id)}</strong></div><div><span class="muted">Item ID</span><strong>${escapeHtml(itemId)}</strong></div><div><span class="muted">Operation</span><strong>${escapeHtml(item.operation)}</strong></div></div><pre>${escapeHtml(logText)}</pre></details>
   </article>`;
 }
 
@@ -1263,7 +1291,27 @@ function renderQueueGroup(id, items, emptyMessage, compact=false) {
   box.querySelectorAll('.queue-resolve-error').forEach(button => button.addEventListener('click', async () => {
     button.disabled = true;
     try {
-      await api('/api/jobs/resolve-error', {method:'POST', body:JSON.stringify({job_id:button.dataset.jobId, item_index:Number(button.dataset.itemIndex)})});
+      await api('/api/jobs/resolve-error', {method:'POST', body:JSON.stringify({job_id:button.dataset.jobId, item_id:button.dataset.itemId})});
+      await pollJobs();
+    } catch (error) {
+      button.disabled = false;
+      showToast(error.message, 'bad');
+    }
+  }));
+  const actionRoutes = {
+    cancel: ['/api/jobs/cancel-item', 'Cancelling...'],
+    stop: ['/api/jobs/stop-after-current', 'Queue will stop after the current item.'],
+    remove: ['/api/jobs/remove-item', 'Removed from Queue. The local file was not deleted.'],
+    retry: ['/api/jobs/retry-item', 'Fresh retry added to the Queue.'],
+  };
+  box.querySelectorAll('.queue-item-action').forEach(button => button.addEventListener('click', async () => {
+    const action = button.dataset.queueAction;
+    const route = actionRoutes[action];
+    if (!route) return;
+    button.disabled = true;
+    showToast(route[1]);
+    try {
+      await api(route[0], {method:'POST', body:JSON.stringify({job_id:button.dataset.jobId, item_id:button.dataset.itemId})});
       await pollJobs();
     } catch (error) {
       button.disabled = false;
@@ -1272,23 +1320,57 @@ function renderQueueGroup(id, items, emptyMessage, compact=false) {
   }));
 }
 
-function renderVodQueue(jobs) {
+function renderQueueLaneControls(queueControls={}) {
+  const box = $('queueLaneControls');
+  if (!box) return;
+  const lanes = [
+    ['download', 'Downloads'],
+    ['youtube_upload', 'Uploads'],
+  ];
+  box.innerHTML = lanes.map(([lane, label]) => {
+    const control = queueControls[lane] || {};
+    const paused = !!control.queue_paused;
+    const note = paused
+      ? (control.stop_after_current && control.has_active_item ? 'Stops after current' : 'Queue paused')
+      : 'Queue running';
+    return `<div class="queue-lane-control"><span><strong>${label}</strong><small>${note}</small></span><button type="button" class="quiet-button queue-lane-action" data-lane="${lane}" data-action="${paused ? 'resume' : 'pause'}">${paused ? 'Resume Queue' : 'Pause Queue'}</button></div>`;
+  }).join('');
+  box.querySelectorAll('.queue-lane-action').forEach(button => button.addEventListener('click', async () => {
+    button.disabled = true;
+    const action = button.dataset.action;
+    showToast(action === 'pause' ? 'Active work continues; no new item will start.' : 'Queue resumed.');
+    try {
+      await api(`/api/queue/${action}`, {method:'POST', body:JSON.stringify({lane:button.dataset.lane})});
+      await pollJobs();
+    } catch (error) {
+      button.disabled = false;
+      showToast(error.message, 'bad');
+    }
+  }));
+}
+
+function renderVodQueue(jobs, queueControls={}) {
   const items = queueItemsFromJobs(jobs);
-  const running = items.filter(item => item.state === 'running');
+  const running = items.filter(item => item.state === 'running' || item.state === 'cancelling');
   const waiting = items.filter(item => item.state === 'waiting');
-  const errors = distinguishQueueItems(items.filter(item => item.state === 'error' && !item.resolved));
+  const errors = distinguishQueueItems(items.filter(item => (item.state === 'error' || item.state === 'interrupted') && !item.resolved));
   const completed = distinguishQueueItems(items.filter(item => item.state === 'completed').reverse());
+  const cancelled = distinguishQueueItems(items.filter(item => item.state === 'cancelled').reverse());
   renderQueueGroup('queueRunning', running, 'No downloads or uploads are currently running.');
   renderQueueGroup('queueWaiting', waiting, 'Nothing is waiting.', true);
   renderQueueGroup('queueErrors', errors, 'No errors.', true);
   renderQueueGroup('queueCompleted', completed, 'Nothing completed in this session.', true);
+  renderQueueGroup('queueCancelled', cancelled, 'Nothing cancelled in this session.', true);
+  renderQueueLaneControls(queueControls);
   renderOverallRunningEstimate(running);
   if ($('queueActive')) $('queueActive').textContent = String(running.length);
   if ($('queueWaitingCount')) $('queueWaitingCount').textContent = String(waiting.length);
   if ($('queueFailed')) $('queueFailed').textContent = String(errors.length);
   if ($('queueDone')) $('queueDone').textContent = String(completed.length);
+  if ($('queueCancelledCount')) $('queueCancelledCount').textContent = String(cancelled.length);
+  if ($('queueCancelledSection')) $('queueCancelledSection').classList.toggle('hidden', cancelled.length === 0);
   if ($('queueErrorsSection')) $('queueErrorsSection').classList.toggle('hidden', errors.length === 0);
-  return {items, running, waiting, errors, completed};
+  return {items, running, waiting, errors, completed, cancelled};
 }
 
 
@@ -1298,7 +1380,7 @@ async function pollJobs() {
   collectOpenStates();
   const box = $('jobs');
   updateQueueSummary(data.jobs || []);
-  renderVodQueue(data.jobs || []);
+  renderVodQueue(data.jobs || [], data.queue_controls || {});
   if (!data.jobs.length) {
     box.textContent = 'No downloads in this session yet.';
     updateQueueSummary([]);
@@ -1361,7 +1443,7 @@ async function refreshDashboard() {
     const yt = data.youtube || {};
     const disk = data.disk || {};
     const queue = queueItemsFromJobs(jobsData.jobs || []);
-    const running = queue.filter(item => item.state === 'running');
+    const running = queue.filter(item => item.state === 'running' || item.state === 'cancelling');
     const waiting = queue.filter(item => item.state === 'waiting');
     const errors = queue.filter(item => item.state === 'error' && !item.resolved);
     const hasActivity = running.length > 0 || waiting.length > 0;

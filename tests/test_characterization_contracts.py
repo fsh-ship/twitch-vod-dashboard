@@ -226,6 +226,16 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
             ("/api/vod/validate", "POST", "api_vod_validate"),
             ("/api/download", "POST", "api_download"),
             ("/api/jobs", "GET", "api_jobs"),
+            ("/api/queue/pause", "POST", "api_pause_queue"),
+            ("/api/queue/resume", "POST", "api_resume_queue"),
+            (
+                "/api/jobs/stop-after-current",
+                "POST",
+                "api_stop_after_current",
+            ),
+            ("/api/jobs/remove-item", "POST", "api_remove_queue_item"),
+            ("/api/jobs/cancel-item", "POST", "api_cancel_queue_item"),
+            ("/api/jobs/retry-item", "POST", "api_retry_queue_item"),
             ("/api/jobs/resolve-error", "POST", "api_resolve_job_error"),
             ("/api/local-videos", "GET", "api_local_videos"),
             ("/api/local-video/open", "POST", "api_local_video_open"),
@@ -420,7 +430,10 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
         )
 
         jobs = self.client.get("/api/jobs").get_json()
-        self.assert_typed_keys(jobs, {"jobs": list})
+        self.assert_typed_keys(
+            jobs,
+            {"jobs": list, "queue_controls": dict, "persistence": str},
+        )
 
         local_videos = self.client.get("/api/local-videos").get_json()
         self.assert_typed_keys(
@@ -1995,9 +2008,12 @@ class JobContractTests(IsolatedDashboardTestCase):
                 "id",
                 "label",
                 "status",
+                "state",
                 "created",
                 "urls",
                 "total_urls",
+                "item_ids",
+                "item_states",
                 "item_statuses",
                 "item_progress",
                 "item_processed_seconds",
@@ -2007,6 +2023,9 @@ class JobContractTests(IsolatedDashboardTestCase):
                 "item_updated_at",
                 "item_total_duration_seconds",
                 "item_resolved",
+                "item_failure_kinds",
+                "item_retry_job_ids",
+                "stop_after_current",
                 "log",
                 "returncode",
             },

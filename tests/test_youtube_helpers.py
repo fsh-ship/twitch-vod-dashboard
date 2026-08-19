@@ -1187,6 +1187,38 @@ class YouTubeUploadHelperTests(unittest.TestCase):
             logger.call_args_list,
         )
 
+    def test_cooperative_cancel_stops_after_current_chunk_boundary(self):
+        service = mock.Mock()
+        status = SimpleNamespace(
+            resumable_progress=500_000,
+            total_size=1_000_000,
+            progress=lambda: 0.5,
+        )
+        upload_request = service.videos.return_value.insert.return_value
+        upload_request.next_chunk.return_value = (status, None)
+        cancel_requested = mock.Mock(side_effect=[False, True])
+
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            self.upload(
+                service,
+                cancel_requested=cancel_requested,
+            )
+
+        upload_request.next_chunk.assert_called_once_with()
+        self.assertEqual(cancel_requested.call_count, 2)
+
+    def test_transport_failure_is_marked_outcome_uncertain(self):
+        service = mock.Mock()
+        service.videos.return_value.insert.return_value.next_chunk.side_effect = (
+            ConnectionError("connection lost")
+        )
+
+        with self.assertRaises(youtube.YouTubeUploadOutcomeUncertain) as caught:
+            self.upload(service)
+
+        self.assertTrue(caught.exception.upload_outcome_uncertain)
+        self.assertIn("YouTube Studio", str(caught.exception))
+
     def test_upload_api_failure_propagates_without_retry_or_side_effects(self):
         service = mock.Mock()
         upload_request = service.videos.return_value.insert.return_value

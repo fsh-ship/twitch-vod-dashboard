@@ -6,8 +6,10 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 import math
+import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -21,6 +23,31 @@ CounterSetter = Callable[[int], None]
 
 UPLOAD_SPEED_EMA_ALPHA = 0.3
 MIN_UPLOAD_ETA_SPEED_BPS = 1024.0
+ITEM_STATES = {
+    "queued",
+    "running",
+    "cancelling",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+}
+TERMINAL_ITEM_STATES = {"completed", "failed", "cancelled", "interrupted"}
+LEGACY_TO_ITEM_STATE = {
+    "wartet": "queued",
+    "läuft": "running",
+    "fertig": "completed",
+    "fehler": "failed",
+}
+ITEM_STATE_TO_LEGACY = {
+    "queued": "wartet",
+    "running": "läuft",
+    "cancelling": "läuft",
+    "completed": "fertig",
+    "failed": "fehler",
+    "cancelled": "fertig",
+    "interrupted": "fehler",
+}
 DOWNLOAD_DURATION_MARKER = "VOD-DASHBOARD-DURATION="
 _FFMPEG_TIME_RE = re.compile(
     r"(?:^|\s)time=\s*(-?\d+:\d{2}:\d{2}(?:\.\d+)?)",
@@ -98,6 +125,71 @@ def ffmpeg_download_metrics(
     }
 
 
+def download_process_group_options(platform_name: Optional[str] = None) -> Dict[str, Any]:
+    """Return portable ownership options for the yt-dlp/ffmpeg process tree."""
+    platform = os.name if platform_name is None else platform_name
+    if platform == "posix":
+        return {"start_new_session": True}
+    creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    return {"creationflags": creation_flag} if creation_flag else {}
+
+
+def terminate_download_process_tree(
+    process: Any,
+    *,
+    platform_name: Optional[str] = None,
+    graceful_timeout: float = 8.0,
+    terminate_timeout: float = 3.0,
+) -> None:
+    """Gracefully stop and reap an owned yt-dlp tree, escalating if needed."""
+    if process is None or process.poll() is not None:
+        if process is not None:
+            process.wait()
+        return
+    platform = os.name if platform_name is None else platform_name
+    if platform == "posix":
+        process_group = os.getpgid(process.pid)
+        os.killpg(process_group, signal.SIGINT)
+        try:
+            process.wait(timeout=graceful_timeout)
+            return
+        except subprocess.TimeoutExpired:
+            os.killpg(process_group, signal.SIGTERM)
+        try:
+            process.wait(timeout=terminate_timeout)
+            return
+        except subprocess.TimeoutExpired:
+            os.killpg(process_group, getattr(signal, "SIGKILL", 9))
+            process.wait()
+            return
+
+    control_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+    if control_break is not None:
+        try:
+            process.send_signal(control_break)
+            process.wait(timeout=graceful_timeout)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T"],
+            capture_output=True,
+            timeout=terminate_timeout,
+            check=False,
+        )
+        process.wait(timeout=terminate_timeout)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+            timeout=terminate_timeout,
+            check=False,
+        )
+        process.wait()
+
+
 @dataclass(frozen=True)
 class DownloadWorkerDependencies:
     load_settings: Callable[[], Dict[str, Any]]
@@ -114,6 +206,7 @@ class DownloadWorkerDependencies:
     download_directory: Callable[[Dict[str, Any]], Path]
     popen: Callable[..., Any] = subprocess.Popen
     clock: Callable[[], float] = time.time
+    enqueue_upload_job: Optional[Callable[[list[str], str], str]] = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +237,18 @@ class JobManager:
         self._now = now or datetime.now
         self._clock = clock or time.time
         self._upload_measurements: Dict[tuple[str, int], Dict[str, Any]] = {}
+        self._condition = threading.Condition(self.lock)
+        self._lane_paused = {"download": False, "youtube_upload": False}
+        self._lane_stop_after_current = {
+            "download": False,
+            "youtube_upload": False,
+        }
+        self._lane_active: Dict[str, Optional[tuple[str, str]]] = {
+            "download": None,
+            "youtube_upload": None,
+        }
+        self._cancel_events: Dict[tuple[str, str], threading.Event] = {}
+        self._download_processes: Dict[tuple[str, str], Any] = {}
 
     @classmethod
     def compatible_with(
@@ -173,6 +278,18 @@ class JobManager:
     def _created_at(self) -> str:
         return self._now().strftime("%Y-%m-%d %H:%M:%S")
 
+    @staticmethod
+    def _lane_for_job(job: Job) -> str:
+        return (
+            "youtube_upload"
+            if job.get("type") == "youtube_upload"
+            else "download"
+        )
+
+    @staticmethod
+    def _item_ids(job_id: str, count: int) -> list[str]:
+        return [f"{job_id}-item-{index + 1}" for index in range(count)]
+
     def create_download_job(
         self,
         urls: list[str],
@@ -184,13 +301,17 @@ class JobManager:
         """Create download-job state without starting its worker."""
         with self.lock:
             job_id = self._next_job_id(counter_getter, counter_setter)
+            item_ids = self._item_ids(job_id, len(urls))
             self.jobs[job_id] = {
                 "id": job_id,
                 "label": label,
                 "status": "wartet",
+                "state": "queued",
                 "created": self._created_at(),
                 "urls": urls,
                 "total_urls": len(urls),
+                "item_ids": item_ids,
+                "item_states": ["queued" for _ in urls],
                 "item_statuses": ["wartet" for _ in urls],
                 "item_progress": [None for _ in urls],
                 "item_processed_seconds": [None for _ in urls],
@@ -200,6 +321,9 @@ class JobManager:
                 "item_updated_at": [None for _ in urls],
                 "item_total_duration_seconds": [None for _ in urls],
                 "item_resolved": [False for _ in urls],
+                "item_failure_kinds": ["" for _ in urls],
+                "item_retry_job_ids": ["" for _ in urls],
+                "stop_after_current": False,
                 "log": [],
                 "returncode": None,
             }
@@ -217,12 +341,16 @@ class JobManager:
         """Create YouTube-upload job state without starting its worker."""
         with self.lock:
             job_id = self._next_job_id(counter_getter, counter_setter)
+            item_ids = self._item_ids(job_id, len(paths))
             self.jobs[job_id] = {
                 "id": job_id,
                 "label": label,
                 "status": "wartet",
+                "state": "queued",
                 "created": self._created_at(),
                 "urls": paths,
+                "item_ids": item_ids,
+                "item_states": ["queued" for _ in paths],
                 "item_statuses": ["wartet" for _ in paths],
                 "item_progress": [None for _ in paths],
                 "item_bytes_uploaded": [None for _ in paths],
@@ -232,7 +360,10 @@ class JobManager:
                 "item_updated_at": [None for _ in paths],
                 "item_errors": ["" for _ in paths],
                 "item_resolved": [False for _ in paths],
+                "item_failure_kinds": ["" for _ in paths],
+                "item_retry_job_ids": ["" for _ in paths],
                 "item_metadata": list(item_metadata or [{} for _ in paths]),
+                "stop_after_current": False,
                 "log": [],
                 "returncode": None,
                 "type": "youtube_upload",
@@ -373,6 +504,381 @@ class JobManager:
             job.update(changes)
         return True
 
+    def _ensure_control_lists_locked(self, job: Job) -> None:
+        sources = job.get("urls") if isinstance(job.get("urls"), list) else []
+        count = len(sources)
+        job_id = str(job.get("id") or "job")
+        ids = job.get("item_ids")
+        if not isinstance(ids, list):
+            ids = self._item_ids(job_id, count)
+            job["item_ids"] = ids
+        elif len(ids) < count:
+            ids.extend(
+                f"{job_id}-item-{index + 1}"
+                for index in range(len(ids), count)
+            )
+        statuses = job.get("item_statuses")
+        if not isinstance(statuses, list):
+            statuses = ["wartet" for _ in range(count)]
+            job["item_statuses"] = statuses
+        elif len(statuses) < count:
+            statuses.extend("wartet" for _ in range(count - len(statuses)))
+        states = job.get("item_states")
+        if not isinstance(states, list):
+            states = [
+                LEGACY_TO_ITEM_STATE.get(
+                    statuses[index] if index < len(statuses) else "wartet",
+                    "queued",
+                )
+                for index in range(count)
+            ]
+            job["item_states"] = states
+        elif len(states) < count:
+            states.extend("queued" for _ in range(count - len(states)))
+        for key in ("item_failure_kinds", "item_retry_job_ids"):
+            values = job.get(key)
+            if not isinstance(values, list):
+                job[key] = ["" for _ in range(count)]
+            elif len(values) < count:
+                values.extend("" for _ in range(count - len(values)))
+        job.setdefault("stop_after_current", False)
+
+    def _item_index_locked(self, job: Job, item_id: str) -> Optional[int]:
+        self._ensure_control_lists_locked(job)
+        try:
+            return job["item_ids"].index(str(item_id))
+        except ValueError:
+            return None
+
+    def _set_item_state_locked(
+        self,
+        job: Job,
+        index: int,
+        state: str,
+        *,
+        failure_kind: str = "",
+    ) -> None:
+        if state not in ITEM_STATES:
+            raise ValueError(f"Unsupported Queue item state: {state}")
+        self._ensure_control_lists_locked(job)
+        job["item_states"][index] = state
+        job["item_statuses"][index] = ITEM_STATE_TO_LEGACY[state]
+        job["item_failure_kinds"][index] = (
+            str(failure_kind or "") if state == "failed" else ""
+        )
+
+    def _recompute_job_state_locked(self, job: Job) -> None:
+        self._ensure_control_lists_locked(job)
+        states = list(job.get("item_states") or [])
+        if any(state in {"running", "cancelling"} for state in states):
+            job["state"] = "running"
+            job["status"] = "läuft"
+        elif any(state == "queued" for state in states):
+            job["state"] = "queued"
+            job["status"] = "wartet"
+        elif any(state == "failed" for state in states):
+            job["state"] = "failed"
+            job["status"] = "fehler"
+        elif any(state == "interrupted" for state in states):
+            job["state"] = "interrupted"
+            job["status"] = "fehler"
+        elif states and all(state == "cancelled" for state in states):
+            job["state"] = "cancelled"
+            job["status"] = "fertig"
+        else:
+            job["state"] = "completed"
+            job["status"] = "fertig"
+
+    def _item_capabilities_locked(self, job: Job, index: int) -> Dict[str, Any]:
+        state = job["item_states"][index]
+        failure_kind = job["item_failure_kinds"][index]
+        retry_job_id = job["item_retry_job_ids"][index]
+        uncertain = (
+            job.get("type") == "youtube_upload"
+            and failure_kind == "uncertain"
+        )
+        return {
+            "can_cancel": state == "running",
+            "can_remove": state == "queued",
+            "can_retry": state == "failed" and not retry_job_id and not uncertain,
+            "can_resolve": state == "failed",
+            "can_stop_after_current": state == "running",
+            "retry_pending": retry_job_id == "__pending__",
+            "retry_job_id": "" if retry_job_id == "__pending__" else retry_job_id,
+            "retry_block_reason": (
+                "YouTube may have accepted this upload. Verify it in YouTube Studio before starting a new upload."
+                if uncertain
+                else ""
+            ),
+        }
+
+    def queue_controls_snapshot(self) -> Dict[str, Dict[str, bool]]:
+        with self.lock:
+            return {
+                lane: {
+                    "queue_paused": bool(self._lane_paused[lane]),
+                    "stop_after_current": bool(
+                        self._lane_stop_after_current[lane]
+                    ),
+                    "has_active_item": self._lane_active[lane] is not None,
+                }
+                for lane in self._lane_paused
+            }
+
+    def pause_queue(self, lane: str, *, stop_after_current: bool = False) -> bool:
+        if lane not in self._lane_paused:
+            return False
+        with self._condition:
+            self._lane_paused[lane] = True
+            if stop_after_current:
+                self._lane_stop_after_current[lane] = True
+            active = self._lane_active.get(lane)
+            if active:
+                job = self.jobs.get(active[0])
+                if job:
+                    job["stop_after_current"] = bool(stop_after_current)
+            self._condition.notify_all()
+        return True
+
+    def resume_queue(self, lane: str) -> bool:
+        if lane not in self._lane_paused:
+            return False
+        with self._condition:
+            self._lane_paused[lane] = False
+            self._lane_stop_after_current[lane] = False
+            for job in self.jobs.values():
+                if self._lane_for_job(job) == lane:
+                    job["stop_after_current"] = False
+            self._condition.notify_all()
+        return True
+
+    def request_stop_after_current(self, job_id: str, item_id: str) -> bool:
+        with self._condition:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return False
+            index = self._item_index_locked(job, item_id)
+            if index is None or job["item_states"][index] != "running":
+                return False
+            lane = self._lane_for_job(job)
+            if self._lane_active.get(lane) != (str(job_id), str(item_id)):
+                return False
+            self._lane_paused[lane] = True
+            self._lane_stop_after_current[lane] = True
+            job["stop_after_current"] = True
+            self._condition.notify_all()
+            return True
+
+    def _job_is_next_for_lane_locked(self, job_id: str, lane: str) -> bool:
+        for candidate_id, candidate in self.jobs.items():
+            if self._lane_for_job(candidate) != lane:
+                continue
+            self._ensure_control_lists_locked(candidate)
+            if any(state == "queued" for state in candidate["item_states"]):
+                return str(candidate_id) == str(job_id)
+        return True
+
+    def claim_next_item(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Atomically claim the next eligible item for one process-local lane."""
+        with self._condition:
+            while True:
+                job = self.jobs.get(job_id)
+                if job is None:
+                    return None
+                self._ensure_control_lists_locked(job)
+                queued = [
+                    index
+                    for index, state in enumerate(job["item_states"])
+                    if state == "queued"
+                ]
+                if not queued:
+                    self._recompute_job_state_locked(job)
+                    return None
+                lane = self._lane_for_job(job)
+                if (
+                    self._lane_paused[lane]
+                    or self._lane_active[lane] is not None
+                    or not self._job_is_next_for_lane_locked(job_id, lane)
+                ):
+                    self._recompute_job_state_locked(job)
+                    self._condition.wait()
+                    continue
+                index = queued[0]
+                item_id = job["item_ids"][index]
+                self._set_item_state_locked(job, index, "running")
+                self._lane_active[lane] = (str(job_id), str(item_id))
+                self._cancel_events.setdefault(
+                    (str(job_id), str(item_id)), threading.Event()
+                )
+                self._recompute_job_state_locked(job)
+                return {
+                    "job_id": str(job_id),
+                    "item_id": str(item_id),
+                    "index": index,
+                    "item_number": index + 1,
+                    "value": job["urls"][index],
+                    "lane": lane,
+                }
+
+    def finish_claimed_item(
+        self,
+        job_id: str,
+        item_id: str,
+        state: str,
+        *,
+        failure_kind: str = "",
+    ) -> bool:
+        with self._condition:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return False
+            index = self._item_index_locked(job, item_id)
+            if index is None:
+                return False
+            self._set_item_state_locked(
+                job, index, state, failure_kind=failure_kind
+            )
+            if job.get("type") == "youtube_upload" and state == "completed":
+                progress = job.get("item_progress")
+                if isinstance(progress, list) and index < len(progress):
+                    progress[index] = 100
+            lane = self._lane_for_job(job)
+            if self._lane_active.get(lane) == (str(job_id), str(item_id)):
+                self._lane_active[lane] = None
+            self._download_processes.pop((str(job_id), str(item_id)), None)
+            self._recompute_job_state_locked(job)
+            self._condition.notify_all()
+        return True
+
+    def remove_queued_item(self, job_id: str, item_id: str) -> bool:
+        with self._condition:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return False
+            index = self._item_index_locked(job, item_id)
+            if index is None:
+                return False
+            state = job["item_states"][index]
+            if state == "cancelled":
+                return True
+            if state != "queued":
+                return False
+            self._set_item_state_locked(job, index, "cancelled")
+            self._recompute_job_state_locked(job)
+            self._condition.notify_all()
+        return True
+
+    def request_cancel_item(self, job_id: str, item_id: str) -> Optional[str]:
+        with self._condition:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return None
+            index = self._item_index_locked(job, item_id)
+            if index is None:
+                return None
+            state = job["item_states"][index]
+            if state == "cancelled":
+                return self._lane_for_job(job)
+            if state not in {"running", "cancelling"}:
+                return None
+            self._set_item_state_locked(job, index, "cancelling")
+            event = self._cancel_events.setdefault(
+                (str(job_id), str(item_id)), threading.Event()
+            )
+            event.set()
+            self._recompute_job_state_locked(job)
+            self._condition.notify_all()
+            return self._lane_for_job(job)
+
+    def is_cancel_requested(self, job_id: str, item_id: str) -> bool:
+        with self.lock:
+            event = self._cancel_events.get((str(job_id), str(item_id)))
+            return bool(event and event.is_set())
+
+    def item_state(self, job_id: str, item_id: str) -> Optional[str]:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return None
+            index = self._item_index_locked(job, item_id)
+            return job["item_states"][index] if index is not None else None
+
+    def register_download_process(
+        self, job_id: str, item_id: str, process: Any
+    ) -> bool:
+        with self.lock:
+            key = (str(job_id), str(item_id))
+            self._download_processes[key] = process
+            event = self._cancel_events.get(key)
+            return bool(event and event.is_set())
+
+    def download_process(self, job_id: str, item_id: str) -> Any:
+        with self.lock:
+            return self._download_processes.get((str(job_id), str(item_id)))
+
+    def terminate_registered_download(
+        self,
+        job_id: str,
+        item_id: str,
+        *,
+        terminator: Callable[..., None] = terminate_download_process_tree,
+    ) -> bool:
+        process = self.download_process(job_id, item_id)
+        if process is None:
+            return False
+        terminator(process)
+        return True
+
+    def reserve_retry(
+        self, job_id: str, item_id: str
+    ) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return None
+            index = self._item_index_locked(job, item_id)
+            if index is None or job["item_states"][index] != "failed":
+                return None
+            existing = job["item_retry_job_ids"][index]
+            if existing:
+                return {
+                    "reserved": False,
+                    "retry_job_id": "" if existing == "__pending__" else existing,
+                    "pending": existing == "__pending__",
+                }
+            if (
+                job.get("type") == "youtube_upload"
+                and job["item_failure_kinds"][index] == "uncertain"
+            ):
+                return {
+                    "reserved": False,
+                    "blocked": True,
+                    "reason": self._item_capabilities_locked(job, index)[
+                        "retry_block_reason"
+                    ],
+                }
+            job["item_retry_job_ids"][index] = "__pending__"
+            return {
+                "reserved": True,
+                "type": job.get("type") or "download",
+                "value": job["urls"][index],
+                "label": job.get("label") or "Queue retry",
+                "index": index,
+            }
+
+    def finalize_retry(
+        self, job_id: str, item_id: str, retry_job_id: str
+    ) -> bool:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return False
+            index = self._item_index_locked(job, item_id)
+            if index is None:
+                return False
+            job["item_retry_job_ids"][index] = str(retry_job_id or "")
+            return True
+
     def get_job(self, job_id: str) -> Optional[Job]:
         """Return a detached snapshot of one job."""
         with self.lock:
@@ -382,7 +888,21 @@ class JobManager:
     def snapshot_jobs(self, reverse: bool = False) -> list[Job]:
         """Return detached jobs in creation order, or newest first."""
         with self.lock:
-            result = [deepcopy(job) for job in self.jobs.values()]
+            result = []
+            for job in self.jobs.values():
+                self._ensure_control_lists_locked(job)
+                lane = self._lane_for_job(job)
+                snapshot = deepcopy(job)
+                snapshot["lane"] = lane
+                snapshot["queue_paused"] = bool(self._lane_paused[lane])
+                snapshot["stop_after_current"] = bool(
+                    self._lane_stop_after_current[lane]
+                )
+                snapshot["item_capabilities"] = [
+                    self._item_capabilities_locked(job, index)
+                    for index in range(len(job["item_states"]))
+                ]
+                result.append(snapshot)
         if reverse:
             result.reverse()
         return result
@@ -410,7 +930,11 @@ class JobManager:
             index = item_number - 1
             if not isinstance(statuses, list) or index < 0 or index >= len(statuses):
                 return False
-            statuses[index] = status
+            self._ensure_control_lists_locked(job)
+            state = LEGACY_TO_ITEM_STATE.get(status, status)
+            if state not in ITEM_STATES:
+                return False
+            self._set_item_state_locked(job, index, state)
             metrics = self._download_metric_lists(job)
             for key in (
                 "item_progress",
@@ -435,7 +959,7 @@ class JobManager:
             metrics = self._download_metric_lists(job)
             for index, status in enumerate(statuses):
                 if status in {"wartet", "läuft"}:
-                    statuses[index] = "fehler"
+                    self._set_item_state_locked(job, index, "failed")
                     for key in (
                         "item_progress",
                         "item_processed_seconds",
@@ -472,7 +996,11 @@ class JobManager:
                 or index >= len(statuses)
             ):
                 return False
-            statuses[index] = status
+            self._ensure_control_lists_locked(job)
+            state = LEGACY_TO_ITEM_STATE.get(status, status)
+            if state not in ITEM_STATES:
+                return False
+            self._set_item_state_locked(job, index, state)
             progresses[index] = progress
             errors[index] = str(error or "")
             metric_defaults = {
@@ -490,14 +1018,14 @@ class JobManager:
                 elif len(values) < len(statuses):
                     values.extend(default for _ in range(len(statuses) - len(values)))
             measurement_key = (str(job_id), index)
-            if status == "l\u00e4uft":
+            if state == "running":
                 for key, default in metric_defaults.items():
                     job[key][index] = default
                 self._upload_measurements.pop(measurement_key, None)
             else:
                 job["item_bytes_per_second"][index] = None
                 job["item_eta_seconds"][index] = None
-                if status == "fertig":
+                if state == "completed":
                     total_bytes = job["item_total_bytes"][index]
                     if isinstance(total_bytes, int) and total_bytes > 0:
                         job["item_bytes_uploaded"][index] = total_bytes
@@ -510,6 +1038,7 @@ class JobManager:
         bytes_uploaded: Any,
         total_bytes: Any,
         *,
+        item_id: Optional[str] = None,
         observed_at: Optional[float] = None,
     ) -> bool:
         """Record exact resumable-upload bytes and a smoothed transfer ETA."""
@@ -532,10 +1061,23 @@ class JobManager:
             statuses = job.get("item_statuses")
             if not isinstance(statuses, list):
                 return False
-            try:
-                index = statuses.index("l\u00e4uft")
-            except ValueError:
-                return False
+            self._ensure_control_lists_locked(job)
+            if item_id is not None:
+                index = self._item_index_locked(job, item_id)
+                if index is None or job["item_states"][index] not in {
+                    "running",
+                    "cancelling",
+                }:
+                    return False
+            else:
+                try:
+                    index = next(
+                        index
+                        for index, state in enumerate(job["item_states"])
+                        if state in {"running", "cancelling"}
+                    )
+                except StopIteration:
+                    return False
 
             metric_keys = (
                 "item_progress",
@@ -613,7 +1155,7 @@ class JobManager:
             etas = job.get("item_eta_seconds") or []
             for index, status in enumerate(statuses):
                 if status in {"wartet", "l\u00e4uft"}:
-                    statuses[index] = "fehler"
+                    self._set_item_state_locked(job, index, "failed")
                     if index < len(errors):
                         errors[index] = str(error or "")
                     if index < len(progresses):
@@ -647,6 +1189,14 @@ class JobManager:
             resolved[index] = True
         return True
 
+    def resolve_error_by_id(self, job_id: str, item_id: str) -> bool:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return False
+            index = self._item_index_locked(job, item_id)
+        return self.resolve_error(job_id, index + 1) if index is not None else False
+
     def unfinished_upload_paths(self) -> set[str]:
         """Return files already represented by a queued or running upload item."""
         with self.lock:
@@ -654,10 +1204,11 @@ class JobManager:
             for job in self.jobs.values():
                 if job.get("type") != "youtube_upload":
                     continue
-                statuses = job.get("item_statuses") or []
+                self._ensure_control_lists_locked(job)
+                states = job.get("item_states") or []
                 for index, raw in enumerate(job.get("urls") or []):
-                    status = statuses[index] if index < len(statuses) else job.get("status")
-                    if status in {"wartet", "l\u00e4uft"}:
+                    state = states[index] if index < len(states) else "queued"
+                    if state in {"queued", "running", "cancelling"}:
                         paths.add(str(raw))
             return paths
 
@@ -689,9 +1240,8 @@ def run_download_job(
     postprocess_mode = dependencies.clean_postprocess_mode(
         settings.get("batch_postprocess_mode")
     )
-    urls = manager.start_job(job_id)
-
-    total = len(urls)
+    initial_job = manager.get_job(job_id) or {}
+    total = len(initial_job.get("urls") or [])
     failed = 0
     succeeded = 0
     deferred_items: list[Dict[str, Any]] = []
@@ -810,30 +1360,34 @@ def run_download_job(
                     "YouTube Auto-Upload: only the newest matching file is uploaded for each VOD.",
                 )
 
-            for video_path in candidates:
-                try:
-                    dependencies.append_log(
-                        job_id, f"YouTube Auto-Upload File: {video_path}"
-                    )
-                    dependencies.upload_to_youtube(
-                        video_path, settings, job_id=job_id
-                    )
-                except Exception as exc:
-                    dependencies.append_log(
-                        job_id,
-                        f"YouTube Upload failed for {video_path.name}: {exc}",
-                    )
+            if dependencies.enqueue_upload_job is None:
+                raise RuntimeError(
+                    "The automatic upload Queue controller is unavailable."
+                )
+            upload_job_id = dependencies.enqueue_upload_job(
+                [str(video_path) for video_path in candidates],
+                "Automatic YouTube Upload",
+            )
+            dependencies.append_log(
+                job_id,
+                f"YouTube Auto-Upload queued as upload job {upload_job_id}.",
+            )
         except Exception as exc:
             dependencies.append_log(
                 job_id, f"YouTube Auto-Upload did not start: {exc}"
             )
 
     try:
-        if not urls:
+        if not total:
             raise RuntimeError("The job contains no URLs.")
 
-        for idx, url in enumerate(urls, start=1):
-            manager.set_download_item_status(job_id, idx, "läuft")
+        while True:
+            claimed = manager.claim_next_item(job_id)
+            if claimed is None:
+                break
+            idx = int(claimed["item_number"])
+            item_id = str(claimed["item_id"])
+            url = str(claimed["value"])
             dependencies.append_log(job_id, "")
             dependencies.append_log(job_id, f"--- VOD {idx}/{total} ---")
             dependencies.append_log(job_id, f"URL: {url}")
@@ -848,6 +1402,7 @@ def run_download_job(
             )
             dependencies.append_log(job_id, "URLs in this step: 1")
             try:
+                process_options = download_process_group_options()
                 proc = dependencies.popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -856,16 +1411,32 @@ def run_download_job(
                     encoding="utf-8",
                     errors="replace",
                     cwd=str(dependencies.download_directory(settings)),
+                    **process_options,
                 )
+                cancel_before_output = manager.register_download_process(
+                    job_id, item_id, proc
+                )
+                if cancel_before_output:
+                    manager.terminate_registered_download(job_id, item_id)
                 assert proc.stdout is not None
                 for line in proc.stdout:
                     dependencies.append_log(job_id, line)
                 rc = proc.wait()
                 manager.set_returncode(job_id, rc)
 
-                if rc == 0:
+                if manager.is_cancel_requested(job_id, item_id):
+                    manager.finish_claimed_item(
+                        job_id, item_id, "cancelled"
+                    )
+                    dependencies.append_log(
+                        job_id,
+                        f"VOD {idx}/{total} download cancelled. Partial files were retained.",
+                    )
+                elif rc == 0:
                     succeeded += 1
-                    manager.set_download_item_status(job_id, idx, "fertig")
+                    manager.finish_claimed_item(
+                        job_id, item_id, "completed"
+                    )
                     dependencies.append_log(
                         job_id, f"VOD {idx}/{total} download completed."
                     )
@@ -893,7 +1464,9 @@ def run_download_job(
                         )
                 else:
                     failed += 1
-                    manager.set_download_item_status(job_id, idx, "fehler")
+                    manager.finish_claimed_item(
+                        job_id, item_id, "failed", failure_kind="known"
+                    )
                     dependencies.append_log(
                         job_id,
                         f"VOD {idx}/{total} ended with error code {rc}. Continuing with the next VOD.",
@@ -922,16 +1495,24 @@ def run_download_job(
                     known_candidates=item.get("candidates") or [],
                 )
 
+        final_job = manager.get_job(job_id) or {}
+        final_states = final_job.get("item_states") or []
+        cancelled = sum(state == "cancelled" for state in final_states)
         status = "fertig" if failed == 0 else "fehler"
         manager.finish_job(job_id, 0 if failed == 0 else 1, status)
-        if failed == 0:
+        if failed == 0 and cancelled == 0:
             dependencies.append_log(
                 job_id, f"Batch completed: {succeeded}/{total} VOD(s) successful."
+            )
+        elif failed == 0:
+            dependencies.append_log(
+                job_id,
+                f"Batch ended: {succeeded} successful, {cancelled} cancelled.",
             )
         else:
             dependencies.append_log(
                 job_id,
-                f"Batch completed: {succeeded}/{total} successful, {failed} failed.",
+                f"Batch completed: {succeeded} successful, {failed} failed, {cancelled} cancelled.",
             )
     except FileNotFoundError:
         manager.fail_unfinished_download_items(job_id)
@@ -953,7 +1534,8 @@ def run_upload_job(
 ) -> None:
     """Run the existing sequential local YouTube upload lifecycle."""
     settings = dependencies.load_settings()
-    paths = manager.start_job(job_id)
+    initial_job = manager.get_job(job_id) or {}
+    paths = list(initial_job.get("urls") or [])
     dependencies.append_log(
         job_id, f"Starting local YouTube upload: {len(paths)} file(s)"
     )
@@ -973,20 +1555,34 @@ def run_upload_job(
     uploaded = 0
     try:
         dependencies.get_youtube_service(settings, interactive=False)
-        for item_number, raw in enumerate(paths, start=1):
+        while True:
+            claimed = manager.claim_next_item(job_id)
+            if claimed is None:
+                break
+            item_number = int(claimed["item_number"])
+            item_id = str(claimed["item_id"])
+            raw = str(claimed["value"])
             manager.set_upload_item_status(
-                job_id, item_number, "l\u00e4uft", progress=0
+                job_id, item_number, "running", progress=0
             )
             try:
                 path = dependencies.safe_local_video_path(raw, settings)
                 dependencies.append_log(job_id, f"Uploading local VOD file: {path}")
                 video_id = dependencies.upload_to_youtube(
-                    path, settings, job_id=job_id
+                    path, settings, job_id=job_id, item_id=item_id
                 )
-                if video_id:
+                if manager.is_cancel_requested(job_id, item_id):
+                    manager.finish_claimed_item(
+                        job_id, item_id, "cancelled"
+                    )
+                    dependencies.append_log(
+                        job_id,
+                        f"YouTube upload cancelled after the current chunk: {path.name}",
+                    )
+                elif video_id:
                     uploaded += 1
-                    manager.set_upload_item_status(
-                        job_id, item_number, "fertig", progress=100
+                    manager.finish_claimed_item(
+                        job_id, item_id, "completed"
                     )
                 else:
                     failed += 1
@@ -994,23 +1590,57 @@ def run_upload_job(
                     manager.set_upload_item_status(
                         job_id, item_number, "fehler", error=error
                     )
+                    manager.finish_claimed_item(
+                        job_id,
+                        item_id,
+                        "failed",
+                        failure_kind="uncertain",
+                    )
                     dependencies.append_log(
                         job_id, f"Upload completed without a video ID: {path.name}"
                     )
             except Exception as exc:
-                failed += 1
-                manager.set_upload_item_status(
-                    job_id, item_number, "fehler", error=str(exc)
-                )
-                dependencies.append_log(
-                    job_id, f"YouTube Upload failed for {Path(raw).name}: {exc}"
-                )
+                if manager.is_cancel_requested(job_id, item_id):
+                    manager.finish_claimed_item(
+                        job_id, item_id, "cancelled"
+                    )
+                    dependencies.append_log(
+                        job_id,
+                        f"YouTube upload cancelled after the current chunk: {Path(raw).name}",
+                    )
+                else:
+                    failed += 1
+                    failure_kind = (
+                        "uncertain"
+                        if getattr(exc, "upload_outcome_uncertain", False)
+                        else "known"
+                    )
+                    manager.set_upload_item_status(
+                        job_id, item_number, "fehler", error=str(exc)
+                    )
+                    manager.finish_claimed_item(
+                        job_id,
+                        item_id,
+                        "failed",
+                        failure_kind=failure_kind,
+                    )
+                    dependencies.append_log(
+                        job_id, f"YouTube Upload failed for {Path(raw).name}: {exc}"
+                    )
+        final_job = manager.get_job(job_id) or {}
+        cancelled = sum(
+            state == "cancelled"
+            for state in final_job.get("item_states") or []
+        )
         status = "fertig" if failed == 0 else "fehler"
         manager.finish_job(job_id, 0 if failed == 0 else 1, status)
-        dependencies.append_log(
-            job_id,
-            f"Local upload completed: {uploaded} successful, {failed} failed.",
-        )
+        summary = f"Local upload completed: {uploaded} successful, {failed} failed."
+        if cancelled:
+            summary = (
+                f"Local upload completed: {uploaded} successful, {failed} failed, "
+                f"{cancelled} cancelled."
+            )
+        dependencies.append_log(job_id, summary)
     except Exception as exc:
         manager.fail_unfinished_upload_items(job_id, str(exc))
         manager.finish_job(job_id, -2, "fehler")

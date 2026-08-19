@@ -1,4 +1,6 @@
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -12,10 +14,12 @@ from vod_dashboard.jobs import (
     JobManager,
     UploadWorkerDependencies,
     ffmpeg_download_metrics,
+    download_process_group_options,
     parse_ffmpeg_speed_multiplier,
     parse_ffmpeg_time_seconds,
     run_download_job,
     run_upload_job,
+    terminate_download_process_tree,
 )
 
 
@@ -61,9 +65,12 @@ class JobManagerTests(unittest.TestCase):
                 "id": "1",
                 "label": "One VOD",
                 "status": "wartet",
+                "state": "queued",
                 "created": "2026-08-11 12:34:56",
                 "urls": urls,
                 "total_urls": 1,
+                "item_ids": ["1-item-1"],
+                "item_states": ["queued"],
                 "item_statuses": ["wartet"],
                 "item_progress": [None],
                 "item_processed_seconds": [None],
@@ -73,6 +80,9 @@ class JobManagerTests(unittest.TestCase):
                 "item_updated_at": [None],
                 "item_total_duration_seconds": [None],
                 "item_resolved": [False],
+                "item_failure_kinds": [""],
+                "item_retry_job_ids": [""],
+                "stop_after_current": False,
                 "log": [],
                 "returncode": None,
             },
@@ -89,8 +99,11 @@ class JobManagerTests(unittest.TestCase):
                 "id": "1",
                 "label": "Upload",
                 "status": "wartet",
+                "state": "queued",
                 "created": "2026-08-11 12:34:56",
                 "urls": ["C:/media/vod.mp4"],
+                "item_ids": ["1-item-1"],
+                "item_states": ["queued"],
                 "item_statuses": ["wartet"],
                 "item_progress": [None],
                 "item_bytes_uploaded": [None],
@@ -100,7 +113,10 @@ class JobManagerTests(unittest.TestCase):
                 "item_updated_at": [None],
                 "item_errors": [""],
                 "item_resolved": [False],
+                "item_failure_kinds": [""],
+                "item_retry_job_ids": [""],
                 "item_metadata": [{}],
+                "stop_after_current": False,
                 "log": [],
                 "returncode": None,
                 "type": "youtube_upload",
@@ -428,6 +444,271 @@ class JobManagerTests(unittest.TestCase):
         thread.start.assert_called_once_with()
 
 
+class QueueControlManagerTests(unittest.TestCase):
+    def setUp(self):
+        self.manager = JobManager()
+
+    def test_item_ids_are_immutable_across_state_and_presentation_changes(self):
+        first = self.manager.create_download_job(["one", "two"], "First")
+        second = self.manager.create_download_job(["three"], "Second")
+        original = list(self.manager.jobs[first]["item_ids"])
+
+        claim = self.manager.claim_next_item(first)
+        self.manager.finish_claimed_item(first, claim["item_id"], "completed")
+        newest_first = self.manager.snapshot_jobs(reverse=True)
+
+        self.assertEqual(self.manager.jobs[first]["item_ids"], original)
+        self.assertEqual([job["id"] for job in newest_first], [second, first])
+        self.assertEqual(newest_first[1]["item_ids"], original)
+
+    def test_worker_claims_next_item_from_manager(self):
+        job_id = self.manager.create_download_job(["one", "two"], "Queue")
+
+        first = self.manager.claim_next_item(job_id)
+        self.manager.finish_claimed_item(job_id, first["item_id"], "completed")
+        second = self.manager.claim_next_item(job_id)
+
+        self.assertEqual(first["value"], "one")
+        self.assertEqual(second["value"], "two")
+        self.assertNotEqual(first["item_id"], second["item_id"])
+
+    def test_backend_exposes_only_legal_item_capabilities(self):
+        job_id = self.manager.create_download_job(["one"], "Queue")
+        queued = self.manager.snapshot_jobs()[0]["item_capabilities"][0]
+        claim = self.manager.claim_next_item(job_id)
+        running = self.manager.snapshot_jobs()[0]["item_capabilities"][0]
+
+        self.assertTrue(queued["can_remove"])
+        self.assertFalse(queued["can_cancel"])
+        self.assertTrue(running["can_cancel"])
+        self.assertTrue(running["can_stop_after_current"])
+        self.assertFalse(running["can_remove"])
+        self.manager.finish_claimed_item(job_id, claim["item_id"], "failed")
+        failed = self.manager.snapshot_jobs()[0]["item_capabilities"][0]
+        self.assertTrue(failed["can_retry"])
+
+    def test_pause_allows_active_item_to_finish_and_resume_releases_next(self):
+        job_id = self.manager.create_download_job(["one", "two"], "Queue")
+        first = self.manager.claim_next_item(job_id)
+        self.assertTrue(self.manager.pause_queue("download"))
+        self.manager.finish_claimed_item(job_id, first["item_id"], "completed")
+        claimed = []
+        claimed_event = threading.Event()
+
+        def claim_waiting():
+            claimed.append(self.manager.claim_next_item(job_id))
+            claimed_event.set()
+
+        thread = threading.Thread(target=claim_waiting)
+        thread.start()
+        self.assertFalse(claimed_event.wait(0.1))
+        self.assertEqual(self.manager.jobs[job_id]["item_states"], ["completed", "queued"])
+
+        self.assertTrue(self.manager.resume_queue("download"))
+        self.assertTrue(claimed_event.wait(1))
+        thread.join(1)
+        self.assertEqual(claimed[0]["value"], "two")
+
+    def test_stop_after_current_gates_lane_until_resume(self):
+        job_id = self.manager.create_download_job(["one", "two"], "Queue")
+        first = self.manager.claim_next_item(job_id)
+        self.assertTrue(
+            self.manager.request_stop_after_current(job_id, first["item_id"])
+        )
+        self.manager.finish_claimed_item(job_id, first["item_id"], "completed")
+        claimed_event = threading.Event()
+
+        def claim_waiting():
+            self.manager.claim_next_item(job_id)
+            claimed_event.set()
+
+        thread = threading.Thread(target=claim_waiting)
+        thread.start()
+        self.assertFalse(claimed_event.wait(0.1))
+        controls = self.manager.queue_controls_snapshot()["download"]
+        self.assertTrue(controls["queue_paused"])
+        self.assertTrue(controls["stop_after_current"])
+
+        self.manager.resume_queue("download")
+        self.assertTrue(claimed_event.wait(1))
+        thread.join(1)
+
+    def test_remove_waiting_marks_cancelled_and_preserves_local_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "vod.mp4"
+            video.write_bytes(b"video")
+            job_id = self.manager.create_upload_job([str(video)], "Upload")
+            item_id = self.manager.jobs[job_id]["item_ids"][0]
+
+            self.assertTrue(self.manager.remove_queued_item(job_id, item_id))
+
+            self.assertTrue(video.exists())
+            self.assertEqual(self.manager.jobs[job_id]["item_states"], ["cancelled"])
+            self.assertNotEqual(self.manager.jobs[job_id]["item_states"][0], "failed")
+            self.assertIsNone(self.manager.claim_next_item(job_id))
+
+    def test_retry_reservation_is_idempotent_and_preserves_original_failure(self):
+        job_id = self.manager.create_download_job(["vod-url"], "Download")
+        item_id = self.manager.jobs[job_id]["item_ids"][0]
+        self.manager.set_download_item_status(job_id, 1, "fehler")
+
+        first = self.manager.reserve_retry(job_id, item_id)
+        second = self.manager.reserve_retry(job_id, item_id)
+        self.manager.finalize_retry(job_id, item_id, "retry-2")
+        third = self.manager.reserve_retry(job_id, item_id)
+
+        self.assertTrue(first["reserved"])
+        self.assertTrue(second["pending"])
+        self.assertEqual(third["retry_job_id"], "retry-2")
+        self.assertEqual(self.manager.jobs[job_id]["item_states"], ["failed"])
+
+    def test_uncertain_upload_failure_blocks_fresh_retry(self):
+        job_id = self.manager.create_upload_job(["vod.mp4"], "Upload")
+        item_id = self.manager.jobs[job_id]["item_ids"][0]
+        self.manager.finish_claimed_item(
+            job_id, item_id, "failed", failure_kind="uncertain"
+        )
+
+        retry = self.manager.reserve_retry(job_id, item_id)
+
+        self.assertTrue(retry["blocked"])
+        self.assertIn("YouTube Studio", retry["reason"])
+
+    def test_upload_cancel_transitions_cancelling_then_cancelled_at_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "vod.mp4"
+            video.write_bytes(b"video")
+            job_id = self.manager.create_upload_job([str(video)], "Upload")
+            item_id = self.manager.jobs[job_id]["item_ids"][0]
+            entered = threading.Event()
+            release_chunk = threading.Event()
+
+            def upload(*_args, **_kwargs):
+                entered.set()
+                release_chunk.wait(1)
+                if self.manager.is_cancel_requested(job_id, item_id):
+                    raise RuntimeError("cancelled at chunk boundary")
+                return "video-id"
+
+            dependencies = UploadWorkerDependencies(
+                load_settings=lambda: {
+                    "youtube_enabled": True,
+                    "youtube_privacy_status": "private",
+                    "youtube_playlist_id": "",
+                },
+                append_log=self.manager.append_job_log,
+                get_youtube_service=mock.Mock(),
+                safe_local_video_path=lambda raw, _settings: Path(raw),
+                upload_to_youtube=upload,
+            )
+            worker = threading.Thread(
+                target=run_upload_job,
+                args=(job_id, self.manager, dependencies),
+            )
+            worker.start()
+            self.assertTrue(entered.wait(1))
+
+            self.assertEqual(
+                self.manager.request_cancel_item(job_id, item_id),
+                "youtube_upload",
+            )
+            self.assertEqual(self.manager.item_state(job_id, item_id), "cancelling")
+            release_chunk.set()
+            worker.join(1)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(self.manager.item_state(job_id, item_id), "cancelled")
+
+    def test_upload_lane_pause_blocks_automatic_controller_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "auto.mp4"
+            video.write_bytes(b"video")
+            job_id = self.manager.create_upload_job(
+                [str(video)], "Automatic YouTube Upload"
+            )
+            upload_started = threading.Event()
+            dependencies = UploadWorkerDependencies(
+                load_settings=lambda: {
+                    "youtube_enabled": True,
+                    "youtube_privacy_status": "private",
+                    "youtube_playlist_id": "",
+                },
+                append_log=self.manager.append_job_log,
+                get_youtube_service=mock.Mock(),
+                safe_local_video_path=lambda raw, _settings: Path(raw),
+                upload_to_youtube=lambda *_args, **_kwargs: (
+                    upload_started.set() or "video-id"
+                ),
+            )
+            self.manager.pause_queue("youtube_upload")
+            worker = threading.Thread(
+                target=run_upload_job,
+                args=(job_id, self.manager, dependencies),
+            )
+            worker.start()
+            self.assertFalse(upload_started.wait(0.1))
+
+            self.manager.resume_queue("youtube_upload")
+            self.assertTrue(upload_started.wait(1))
+            worker.join(1)
+
+
+class DownloadProcessControlTests(unittest.TestCase):
+    def test_posix_downloads_start_in_dedicated_session(self):
+        self.assertEqual(
+            download_process_group_options("posix"),
+            {"start_new_session": True},
+        )
+
+    def test_graceful_download_cancel_signals_group_and_reaps_process(self):
+        process = mock.Mock(pid=4321)
+        process.poll.return_value = None
+        process.wait.return_value = 0
+
+        with mock.patch(
+            "vod_dashboard.jobs.os.getpgid", return_value=9876, create=True
+        ), mock.patch(
+            "vod_dashboard.jobs.os.killpg", create=True
+        ) as kill_group:
+            terminate_download_process_tree(
+                process, platform_name="posix", graceful_timeout=0.01
+            )
+
+        kill_group.assert_called_once_with(9876, signal.SIGINT)
+        process.wait.assert_called_once_with(timeout=0.01)
+
+    def test_stubborn_download_cancel_escalates_entire_group(self):
+        process = mock.Mock(pid=4321)
+        process.poll.return_value = None
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired("yt-dlp", 0.01),
+            subprocess.TimeoutExpired("yt-dlp", 0.01),
+            0,
+        ]
+
+        with mock.patch(
+            "vod_dashboard.jobs.os.getpgid", return_value=9876, create=True
+        ), mock.patch(
+            "vod_dashboard.jobs.os.killpg", create=True
+        ) as kill_group:
+            terminate_download_process_tree(
+                process,
+                platform_name="posix",
+                graceful_timeout=0.01,
+                terminate_timeout=0.01,
+            )
+
+        self.assertEqual(
+            kill_group.call_args_list,
+            [
+                mock.call(9876, signal.SIGINT),
+                mock.call(9876, signal.SIGTERM),
+                mock.call(9876, getattr(signal, "SIGKILL", 9)),
+            ],
+        )
+        self.assertEqual(process.wait.call_count, 3)
+
+
 class DownloadWorkerTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -458,6 +739,7 @@ class DownloadWorkerTests(unittest.TestCase):
         service=None,
         upload=None,
         mode=None,
+        enqueue=None,
     ):
         process_calls = []
         returncodes = iter(returncodes)
@@ -500,6 +782,7 @@ class DownloadWorkerTests(unittest.TestCase):
             download_directory=lambda settings: self.root,
             popen=popen,
             clock=lambda: 123.0,
+            enqueue_upload_job=enqueue,
         )
         return dependencies, process_calls, list_paths
 
@@ -599,15 +882,23 @@ class DownloadWorkerTests(unittest.TestCase):
         prepare = mock.Mock(side_effect=lambda path, *_args, **_kwargs: path)
         service = mock.Mock()
         upload = mock.Mock(return_value="video-id")
+        enqueue = mock.Mock(return_value="upload-2")
         dependencies, _, _ = self.dependencies(
-            candidates=videos, prepare=prepare, service=service, upload=upload
+            candidates=videos,
+            prepare=prepare,
+            service=service,
+            upload=upload,
+            enqueue=enqueue,
         )
 
         run_download_job(job_id, self.manager, dependencies)
 
         service.assert_called_once_with(self.settings, interactive=False)
         self.assertEqual(prepare.call_count, 2)
-        upload.assert_called_once_with(videos[0], self.settings, job_id=job_id)
+        upload.assert_not_called()
+        enqueue.assert_called_once_with(
+            [str(videos[0])], "Automatic YouTube Upload"
+        )
         self.assertEqual(self.manager.jobs[job_id]["status"], "fertig")
 
     def test_after_all_defers_postprocessing_until_every_download_finishes(self):
@@ -661,6 +952,31 @@ class DownloadWorkerTests(unittest.TestCase):
         self.assertEqual(self.manager.jobs[job_id]["returncode"], -1)
         self.assertEqual(self.manager.jobs[job_id]["item_statuses"], ["fehler"])
 
+    def test_cancelled_download_finishes_cancelled_not_failed(self):
+        job_id = self.create_job()
+        item_id = self.manager.jobs[job_id]["item_ids"][0]
+        dependencies, _, _ = self.dependencies()
+        process = mock.Mock()
+
+        def output():
+            self.manager.request_cancel_item(job_id, item_id)
+            yield "download interrupted\n"
+
+        process.stdout = output()
+        process.wait.return_value = -2
+        dependencies = DownloadWorkerDependencies(
+            **{**dependencies.__dict__, "popen": mock.Mock(return_value=process)}
+        )
+
+        run_download_job(job_id, self.manager, dependencies)
+
+        self.assertEqual(self.manager.jobs[job_id]["item_states"], ["cancelled"])
+        self.assertNotEqual(self.manager.jobs[job_id]["state"], "failed")
+        self.assertIn(
+            "VOD 1/1 download cancelled. Partial files were retained.",
+            self.manager.jobs[job_id]["log"],
+        )
+
 
 class UploadWorkerTests(unittest.TestCase):
     def setUp(self):
@@ -698,7 +1014,9 @@ class UploadWorkerTests(unittest.TestCase):
         self.assertEqual(self.manager.jobs[job_id]["returncode"], 0)
         self.assertEqual(self.manager.jobs[job_id]["item_statuses"], ["fertig"])
         self.assertEqual(self.manager.jobs[job_id]["item_progress"], [100])
-        upload.assert_called_once_with(video, self.settings, job_id=job_id)
+        upload.assert_called_once_with(
+            video, self.settings, job_id=job_id, item_id="1-item-1"
+        )
 
     def test_multi_file_upload_success(self):
         paths = [self.root / "one.mp4", self.root / "two.mp4"]
@@ -715,8 +1033,12 @@ class UploadWorkerTests(unittest.TestCase):
         self.assertEqual(
             upload.call_args_list,
             [
-                mock.call(paths[0], self.settings, job_id=job_id),
-                mock.call(paths[1], self.settings, job_id=job_id),
+                mock.call(
+                    paths[0], self.settings, job_id=job_id, item_id="1-item-1"
+                ),
+                mock.call(
+                    paths[1], self.settings, job_id=job_id, item_id="1-item-2"
+                ),
             ],
         )
         self.assertEqual(dependencies.safe_local_video_path.call_count, 2)
@@ -829,6 +1151,8 @@ class AppJobCompatibilityTests(unittest.TestCase):
         with dashboard.job_lock:
             dashboard.jobs.clear()
             dashboard.job_counter = 0
+        dashboard.JOB_MANAGER.resume_queue("download")
+        dashboard.JOB_MANAGER.resume_queue("youtube_upload")
 
     def tearDown(self):
         with dashboard.job_lock:
@@ -879,7 +1203,10 @@ class AppJobCompatibilityTests(unittest.TestCase):
             response = client.get("/api/jobs")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json(), {"jobs": payload})
+        response_payload = response.get_json()
+        self.assertEqual(response_payload["jobs"], payload)
+        self.assertEqual(response_payload["persistence"], "process-local")
+        self.assertIn("download", response_payload["queue_controls"])
         snapshots.assert_called_once_with(reverse=True)
 
     def test_resolve_error_route_hides_actionable_error_without_claiming_success(self):
@@ -894,7 +1221,10 @@ class AppJobCompatibilityTests(unittest.TestCase):
 
         response = client.post(
             "/api/jobs/resolve-error",
-            json={"job_id": job_id, "item_index": 0},
+            json={
+                "job_id": job_id,
+                "item_id": dashboard.JOB_MANAGER.jobs[job_id]["item_ids"][0],
+            },
             headers={"X-CSRF-Token": csrf_token},
         )
 
@@ -903,6 +1233,88 @@ class AppJobCompatibilityTests(unittest.TestCase):
         self.assertEqual(job["item_statuses"], ["fehler"])
         self.assertEqual(job["item_errors"], ["quota exceeded"])
         self.assertEqual(job["item_resolved"], [True])
+
+    def test_retry_failed_download_creates_one_fresh_attempt(self):
+        job_id = dashboard.JOB_MANAGER.create_download_job(
+            ["https://www.twitch.tv/videos/1234567890"], "Download"
+        )
+        dashboard.JOB_MANAGER.set_download_item_status(job_id, 1, "fehler")
+        item_id = dashboard.jobs[job_id]["item_ids"][0]
+        client = dashboard.app.test_client()
+        csrf_token = client.get("/api/auth/status").get_json()["csrf_token"]
+        headers = {"X-CSRF-Token": csrf_token}
+
+        with mock.patch.object(
+            dashboard, "create_job", return_value="retry-download-2"
+        ) as create_retry:
+            first = client.post(
+                "/api/jobs/retry-item",
+                json={"job_id": job_id, "item_id": item_id},
+                headers=headers,
+            )
+            duplicate = client.post(
+                "/api/jobs/retry-item",
+                json={"job_id": job_id, "item_id": item_id},
+                headers=headers,
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(first.get_json()["fresh_attempt"])
+        self.assertTrue(duplicate.get_json()["duplicate"])
+        create_retry.assert_called_once_with(
+            ["https://www.twitch.tv/videos/1234567890"],
+            "Retry Twitch Download",
+        )
+        self.assertEqual(dashboard.jobs[job_id]["item_states"], ["failed"])
+
+    def test_retry_failed_upload_is_new_session_only_when_outcome_known(self):
+        job_id = dashboard.JOB_MANAGER.create_upload_job(
+            ["C:/media/failed.mp4"], "Upload"
+        )
+        dashboard.JOB_MANAGER.set_upload_item_status(
+            job_id, 1, "fehler", error="quota rejected"
+        )
+        item_id = dashboard.jobs[job_id]["item_ids"][0]
+        client = dashboard.app.test_client()
+        csrf_token = client.get("/api/auth/status").get_json()["csrf_token"]
+
+        with mock.patch.object(
+            dashboard, "create_upload_job", return_value="retry-upload-2"
+        ) as create_retry:
+            response = client.post(
+                "/api/jobs/retry-item",
+                json={"job_id": job_id, "item_id": item_id},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["fresh_attempt"])
+        create_retry.assert_called_once_with(
+            ["C:/media/failed.mp4"], "Retry YouTube Upload"
+        )
+
+    def test_retry_uncertain_upload_requires_user_verification(self):
+        job_id = dashboard.JOB_MANAGER.create_upload_job(
+            ["C:/media/uncertain.mp4"], "Upload"
+        )
+        item_id = dashboard.jobs[job_id]["item_ids"][0]
+        dashboard.JOB_MANAGER.finish_claimed_item(
+            job_id, item_id, "failed", failure_kind="uncertain"
+        )
+        client = dashboard.app.test_client()
+        csrf_token = client.get("/api/auth/status").get_json()["csrf_token"]
+
+        with mock.patch.object(dashboard, "create_upload_job") as create_retry:
+            response = client.post(
+                "/api/jobs/retry-item",
+                json={"job_id": job_id, "item_id": item_id},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertTrue(response.get_json()["outcome_uncertain"])
+        self.assertIn("YouTube Studio", response.get_json()["error"])
+        create_retry.assert_not_called()
 
     def test_worker_wrappers_delegate_with_current_patchable_app_helpers(self):
         dashboard.jobs["download"] = {

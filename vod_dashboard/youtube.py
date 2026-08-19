@@ -45,6 +45,12 @@ class YouTubeOAuthBootstrapRequiredError(RuntimeError):
     """Raised when interactive OAuth must be completed outside the app."""
 
 
+class YouTubeUploadOutcomeUncertain(RuntimeError):
+    """The server may have accepted bytes or finalized before contact was lost."""
+
+    upload_outcome_uncertain = True
+
+
 def youtube_available(libraries_available: Optional[bool] = None) -> bool:
     if libraries_available is None:
         libraries_available = GOOGLE_LIBS_AVAILABLE
@@ -595,6 +601,7 @@ def upload_video_to_youtube(
     move_after_upload: Callable[..., Path],
     job_log_callback: Optional[Callable[[str, str], None]] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    cancel_requested: Optional[Callable[[], bool]] = None,
 ) -> Optional[str]:
     path = media_policy.safe_local_video_path(path, settings)
     service = service_getter(settings, interactive=False)
@@ -658,7 +665,26 @@ def upload_video_to_youtube(
     )
     response = None
     while response is None:
-        status, response = upload_request.next_chunk()
+        if response is None and cancel_requested and cancel_requested():
+            raise RuntimeError("YouTube upload cancelled.")
+        try:
+            status, response = upload_request.next_chunk()
+        except Exception as exc:
+            if cancel_requested and cancel_requested():
+                raise RuntimeError("YouTube upload cancelled.") from exc
+            response_status = getattr(
+                getattr(exc, "resp", None), "status", None
+            )
+            known_rejection = (
+                isinstance(response_status, int)
+                and 400 <= response_status < 500
+                and response_status not in {408, 409, 429}
+            )
+            if known_rejection:
+                raise
+            raise YouTubeUploadOutcomeUncertain(
+                f"{exc}. YouTube upload status is uncertain because the resumable request ended without a trustworthy final response. Verify the video in YouTube Studio before retrying."
+            ) from exc
         if status:
             total_bytes = getattr(status, "total_size", None)
             if not isinstance(total_bytes, int) or total_bytes <= 0:
@@ -674,6 +700,8 @@ def upload_video_to_youtube(
                     f"YouTube Upload {path.name}: "
                     f"{int(status.progress() * 100)}%",
                 )
+        if response is None and cancel_requested and cancel_requested():
+            raise RuntimeError("YouTube upload cancelled.")
     video_id = response.get("id") if response else None
     if video_id and job_id and job_log_callback:
         job_log_callback(

@@ -674,12 +674,26 @@ def youtube_mode_label(settings: Dict[str, Any]) -> str:
     )
 
 
-def upload_video_to_youtube(path: Path, settings: Dict[str, Any], job_id: Optional[str] = None) -> Optional[str]:
+def upload_video_to_youtube(
+    path: Path,
+    settings: Dict[str, Any],
+    job_id: Optional[str] = None,
+    item_id: Optional[str] = None,
+) -> Optional[str]:
     def update_progress(uploaded: int, total: int) -> None:
         if job_id is not None:
             _job_manager_for_compatibility().update_active_upload_progress(
-                job_id, uploaded, total
+                job_id, uploaded, total, item_id=item_id
             )
+
+    def cancel_requested() -> bool:
+        return bool(
+            job_id is not None
+            and item_id is not None
+            and _job_manager_for_compatibility().is_cancel_requested(
+                job_id, item_id
+            )
+        )
 
     return dashboard_youtube.upload_video_to_youtube(
         path,
@@ -695,6 +709,7 @@ def upload_video_to_youtube(path: Path, settings: Dict[str, Any], job_id: Option
         move_after_upload=move_uploaded_vod_to_done_folder,
         job_log_callback=append_job_log,
         progress_callback=update_progress if job_id is not None else None,
+        cancel_requested=cancel_requested if item_id is not None else None,
     )
 
 
@@ -775,6 +790,7 @@ def run_download_job(job_id: str) -> None:
         download_directory=download_path,
         popen=subprocess.Popen,
         clock=time.time,
+        enqueue_upload_job=lambda paths, label: create_upload_job(paths, label),
     )
     dashboard_jobs.run_download_job(
         job_id, _job_manager_for_compatibility(), dependencies
@@ -1353,26 +1369,152 @@ def api_download():
 
 @app.get("/api/jobs")
 def api_jobs():
-    jobs_snapshot = _job_manager_for_compatibility().snapshot_jobs(reverse=True)
-    return jsonify({"jobs": jobs_snapshot})
+    manager = _job_manager_for_compatibility()
+    jobs_snapshot = manager.snapshot_jobs(reverse=True)
+    return jsonify({
+        "jobs": jobs_snapshot,
+        "queue_controls": manager.queue_controls_snapshot(),
+        "persistence": "process-local",
+    })
+
+
+def _queue_action_identity() -> tuple[str, str]:
+    data = request.json or {}
+    return (
+        str(data.get("job_id") or "").strip(),
+        str(data.get("item_id") or "").strip(),
+    )
+
+
+@app.post("/api/queue/pause")
+def api_pause_queue():
+    lane = str((request.json or {}).get("lane") or "").strip()
+    if not _job_manager_for_compatibility().pause_queue(lane):
+        return jsonify({"error": "A valid Queue lane is required."}), 400
+    return jsonify({"ok": True, "lane": lane, "queue_paused": True})
+
+
+@app.post("/api/queue/resume")
+def api_resume_queue():
+    lane = str((request.json or {}).get("lane") or "").strip()
+    if not _job_manager_for_compatibility().resume_queue(lane):
+        return jsonify({"error": "A valid Queue lane is required."}), 400
+    return jsonify({"ok": True, "lane": lane, "queue_paused": False})
+
+
+@app.post("/api/jobs/stop-after-current")
+def api_stop_after_current():
+    job_id, item_id = _queue_action_identity()
+    if not job_id or not item_id:
+        return jsonify({"error": "A valid Queue item is required."}), 400
+    if not _job_manager_for_compatibility().request_stop_after_current(
+        job_id, item_id
+    ):
+        return jsonify({"error": "Only the current running item can stop its Queue."}), 409
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "item_id": item_id,
+        "stop_after_current": True,
+    })
+
+
+@app.post("/api/jobs/remove-item")
+def api_remove_queue_item():
+    job_id, item_id = _queue_action_identity()
+    if not job_id or not item_id:
+        return jsonify({"error": "A valid Queue item is required."}), 400
+    if not _job_manager_for_compatibility().remove_queued_item(job_id, item_id):
+        return jsonify({"error": "Only a waiting item can be removed from the Queue."}), 409
+    return jsonify({"ok": True, "job_id": job_id, "item_id": item_id, "state": "cancelled"})
+
+
+@app.post("/api/jobs/cancel-item")
+def api_cancel_queue_item():
+    job_id, item_id = _queue_action_identity()
+    if not job_id or not item_id:
+        return jsonify({"error": "A valid Queue item is required."}), 400
+    manager = _job_manager_for_compatibility()
+    already_requested = manager.is_cancel_requested(job_id, item_id)
+    lane = manager.request_cancel_item(job_id, item_id)
+    if lane is None:
+        return jsonify({"error": "Only the current running item can be cancelled."}), 409
+    if lane == "download" and not already_requested:
+        def terminate_owned_process() -> None:
+            try:
+                manager.terminate_registered_download(job_id, item_id)
+            except Exception as exc:
+                append_job_log(job_id, f"Download cancellation error: {exc}")
+
+        threading.Thread(target=terminate_owned_process, daemon=True).start()
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "item_id": item_id,
+        "state": manager.item_state(job_id, item_id) or "cancelling",
+    })
+
+
+@app.post("/api/jobs/retry-item")
+def api_retry_queue_item():
+    job_id, item_id = _queue_action_identity()
+    if not job_id or not item_id:
+        return jsonify({"error": "A valid Queue item is required."}), 400
+    manager = _job_manager_for_compatibility()
+    retry = manager.reserve_retry(job_id, item_id)
+    if retry is None:
+        return jsonify({"error": "Only a failed Queue item can be retried."}), 409
+    if retry.get("blocked"):
+        return jsonify({"error": retry.get("reason"), "outcome_uncertain": True}), 409
+    if not retry.get("reserved"):
+        return jsonify({
+            "ok": True,
+            "duplicate": True,
+            "pending": bool(retry.get("pending")),
+            "retry_job_id": retry.get("retry_job_id") or "",
+        })
+    try:
+        if retry.get("type") == "youtube_upload":
+            retry_job_id = create_upload_job(
+                [str(retry["value"])], "Retry YouTube Upload"
+            )
+        else:
+            retry_job_id = create_job(
+                [str(retry["value"])], "Retry Twitch Download"
+            )
+    except RuntimeError as exc:
+        manager.finalize_retry(job_id, item_id, "")
+        return jsonify({"error": str(exc)}), 409
+    except Exception:
+        manager.finalize_retry(job_id, item_id, "")
+        raise
+    manager.finalize_retry(job_id, item_id, retry_job_id)
+    manager.update_job(
+        retry_job_id,
+        retry_of={"job_id": job_id, "item_id": item_id},
+    )
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "item_id": item_id,
+        "retry_job_id": retry_job_id,
+        "fresh_attempt": True,
+    })
 
 
 @app.post("/api/jobs/resolve-error")
 def api_resolve_job_error():
     data = request.json or {}
     job_id = str(data.get("job_id") or "").strip()
-    try:
-        item_index = int(data.get("item_index"))
-    except (TypeError, ValueError):
+    item_id = str(data.get("item_id") or "").strip()
+    if not job_id or not item_id:
         return jsonify({"error": "A valid Queue item is required."}), 400
-    if not job_id or item_index < 0:
-        return jsonify({"error": "A valid Queue item is required."}), 400
-    resolved = _job_manager_for_compatibility().resolve_error(
-        job_id, item_index + 1
+    resolved = _job_manager_for_compatibility().resolve_error_by_id(
+        job_id, item_id
     )
     if not resolved:
         return jsonify({"error": "Only an unresolved failed item can be resolved."}), 409
-    return jsonify({"ok": True, "job_id": job_id, "item_index": item_index})
+    return jsonify({"ok": True, "job_id": job_id, "item_id": item_id})
 
 
 
