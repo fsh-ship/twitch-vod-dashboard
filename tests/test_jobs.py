@@ -11,6 +11,9 @@ from vod_dashboard.jobs import (
     DownloadWorkerDependencies,
     JobManager,
     UploadWorkerDependencies,
+    ffmpeg_download_metrics,
+    parse_ffmpeg_speed_multiplier,
+    parse_ffmpeg_time_seconds,
     run_download_job,
     run_upload_job,
 )
@@ -62,6 +65,13 @@ class JobManagerTests(unittest.TestCase):
                 "urls": urls,
                 "total_urls": 1,
                 "item_statuses": ["wartet"],
+                "item_progress": [None],
+                "item_processed_seconds": [None],
+                "item_speed_multiplier": [None],
+                "item_speed_label": [""],
+                "item_eta_seconds": [None],
+                "item_updated_at": [None],
+                "item_total_duration_seconds": [None],
                 "item_resolved": [False],
                 "log": [],
                 "returncode": None,
@@ -128,6 +138,106 @@ class JobManagerTests(unittest.TestCase):
         self.assertEqual(len(manager.jobs[job_id]["log"]), 500)
         self.assertEqual(manager.jobs[job_id]["log"][0], "line-5")
         self.assertEqual(manager.jobs[job_id]["log"][-1], "line-504")
+
+    def test_ffmpeg_time_and_speed_parsing_matches_runtime_output(self):
+        line = (
+            "frame=1585554 fps=3656 q=-1.0 size=25652480KiB "
+            "time=07:20:36.46 bitrate=7949.1kbits/s speed=61x"
+        )
+
+        self.assertAlmostEqual(parse_ffmpeg_time_seconds(line), 26436.46)
+        self.assertEqual(parse_ffmpeg_speed_multiplier(line), 61.0)
+
+    def test_ffmpeg_metrics_use_known_duration_for_percent_and_eta(self):
+        metrics = ffmpeg_download_metrics(
+            "frame=1 time=00:12:00.00 speed=4x", 1000
+        )
+
+        self.assertEqual(metrics["processed_seconds"], 720.0)
+        self.assertEqual(metrics["speed_multiplier"], 4.0)
+        self.assertEqual(metrics["progress"], 72.0)
+        self.assertEqual(metrics["eta_seconds"], 70.0)
+
+    def test_ffmpeg_zero_or_invalid_speed_never_produces_eta(self):
+        zero = ffmpeg_download_metrics(
+            "frame=1 time=00:12:00.00 speed=0x", 1000
+        )
+        invalid = ffmpeg_download_metrics(
+            "frame=1 time=00:12:00.00 speed=N/A", 1000
+        )
+
+        self.assertEqual(zero["speed_multiplier"], 0.0)
+        self.assertIsNone(zero["eta_seconds"])
+        self.assertIsNone(invalid["speed_multiplier"])
+        self.assertIsNone(invalid["eta_seconds"])
+
+    def test_ffmpeg_log_updates_running_item_from_extracted_duration(self):
+        manager = JobManager(clock=lambda: 100.0)
+        job_id = manager.create_download_job(["one"], "Download")
+        manager.set_download_item_status(job_id, 1, "l\u00e4uft")
+
+        manager.append_job_log(job_id, "VOD-DASHBOARD-DURATION=1000")
+        manager.append_job_log(
+            job_id, "frame=1 time=00:12:00.00 speed=4x"
+        )
+
+        job = manager.jobs[job_id]
+        self.assertEqual(job["item_total_duration_seconds"], [1000.0])
+        self.assertEqual(job["item_processed_seconds"], [720.0])
+        self.assertEqual(job["item_speed_multiplier"], [4.0])
+        self.assertEqual(job["item_speed_label"], ["4x"])
+        self.assertEqual(job["item_progress"], [72.0])
+        self.assertEqual(job["item_eta_seconds"], [70])
+        self.assertEqual(job["item_updated_at"], [100.0])
+
+    def test_ffmpeg_progress_without_duration_has_no_percent_or_eta(self):
+        manager = JobManager(clock=lambda: 100.0)
+        job_id = manager.create_download_job(["one"], "Download")
+        manager.set_download_item_status(job_id, 1, "l\u00e4uft")
+
+        manager.append_job_log(
+            job_id, "frame=1 time=07:20:36.46 speed=61x"
+        )
+
+        job = manager.jobs[job_id]
+        self.assertEqual(job["item_processed_seconds"], [26436.46])
+        self.assertEqual(job["item_speed_label"], ["61x"])
+        self.assertEqual(job["item_progress"], [None])
+        self.assertEqual(job["item_eta_seconds"], [None])
+
+    def test_classic_ytdlp_progress_remains_structured(self):
+        manager = JobManager(clock=lambda: 100.0)
+        job_id = manager.create_download_job(["one"], "Download")
+        manager.set_download_item_status(job_id, 1, "l\u00e4uft")
+
+        manager.append_job_log(
+            job_id,
+            "[download] 42.0% of 2.00GiB at 4.20MiB/s ETA 00:42",
+        )
+
+        job = manager.jobs[job_id]
+        self.assertEqual(job["item_progress"], [42.0])
+        self.assertEqual(job["item_speed_label"], ["4.20MiB/s"])
+        self.assertEqual(job["item_eta_seconds"], [42])
+
+    def test_completed_download_clears_active_progress_and_eta(self):
+        manager = JobManager(clock=lambda: 100.0)
+        job_id = manager.create_download_job(["one"], "Download")
+        manager.set_download_item_status(job_id, 1, "l\u00e4uft")
+        manager.append_job_log(job_id, "VOD-DASHBOARD-DURATION=1000")
+        manager.append_job_log(
+            job_id, "frame=1 time=00:12:00.00 speed=4x"
+        )
+
+        manager.set_download_item_status(job_id, 1, "fertig")
+
+        job = manager.jobs[job_id]
+        self.assertEqual(job["item_progress"], [None])
+        self.assertEqual(job["item_processed_seconds"], [None])
+        self.assertEqual(job["item_speed_multiplier"], [None])
+        self.assertEqual(job["item_speed_label"], [""])
+        self.assertEqual(job["item_eta_seconds"], [None])
+        self.assertEqual(job["item_updated_at"], [None])
 
     def test_upload_progress_updates_only_the_explicitly_running_item(self):
         manager = self.manager()

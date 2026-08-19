@@ -21,6 +21,81 @@ CounterSetter = Callable[[int], None]
 
 UPLOAD_SPEED_EMA_ALPHA = 0.3
 MIN_UPLOAD_ETA_SPEED_BPS = 1024.0
+DOWNLOAD_DURATION_MARKER = "VOD-DASHBOARD-DURATION="
+_FFMPEG_TIME_RE = re.compile(
+    r"(?:^|\s)time=\s*(-?\d+:\d{2}:\d{2}(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_FFMPEG_SPEED_RE = re.compile(r"(?:^|\s)speed=\s*([^\s]+)", re.IGNORECASE)
+_CLASSIC_DOWNLOAD_RE = re.compile(
+    r"\[download\]\s+(\d+(?:\.\d+)?)%.*?\bat\s+([^\s]+)\/s"
+    r"(?:.*?\bETA\s+([^\s]+))?",
+    re.IGNORECASE,
+)
+
+
+def _clock_value_seconds(value: Any) -> Optional[float]:
+    parts = str(value or "").strip().split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        hours, minutes, seconds = (
+            int(parts[0]),
+            int(parts[1]),
+            float(parts[2]),
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if hours < 0 or not 0 <= minutes < 60 or not 0 <= seconds < 60:
+        return None
+    total = hours * 3600 + minutes * 60 + seconds
+    return total if math.isfinite(total) else None
+
+
+def parse_ffmpeg_time_seconds(text: Any) -> Optional[float]:
+    """Return ffmpeg's processed media timestamp from one progress line."""
+    match = _FFMPEG_TIME_RE.search(str(text or ""))
+    return _clock_value_seconds(match.group(1)) if match else None
+
+
+def parse_ffmpeg_speed_multiplier(text: Any) -> Optional[float]:
+    """Return ffmpeg's wall-clock speed multiplier, including truthful zero."""
+    match = _FFMPEG_SPEED_RE.search(str(text or ""))
+    if not match:
+        return None
+    raw = match.group(1)
+    if not raw.lower().endswith("x"):
+        return None
+    try:
+        speed = float(raw[:-1])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return speed if math.isfinite(speed) and speed >= 0 else None
+
+
+def ffmpeg_download_metrics(
+    text: Any, total_duration_seconds: Any = None
+) -> Dict[str, Optional[float]]:
+    """Calculate truthful ffmpeg/HLS progress without estimating transfer rate."""
+    processed = parse_ffmpeg_time_seconds(text)
+    speed = parse_ffmpeg_speed_multiplier(text)
+    progress: Optional[float] = None
+    eta: Optional[float] = None
+    try:
+        duration = float(total_duration_seconds)
+    except (TypeError, ValueError, OverflowError):
+        duration = 0.0
+    if processed is not None and math.isfinite(duration) and duration > 0:
+        progress = min(100.0, max(0.0, processed * 100.0 / duration))
+        remaining = max(0.0, duration - processed)
+        if speed is not None and speed > 0 and remaining > 0:
+            eta = remaining / speed
+    return {
+        "processed_seconds": processed,
+        "speed_multiplier": speed,
+        "progress": progress,
+        "eta_seconds": eta,
+    }
 
 
 @dataclass(frozen=True)
@@ -117,6 +192,13 @@ class JobManager:
                 "urls": urls,
                 "total_urls": len(urls),
                 "item_statuses": ["wartet" for _ in urls],
+                "item_progress": [None for _ in urls],
+                "item_processed_seconds": [None for _ in urls],
+                "item_speed_multiplier": [None for _ in urls],
+                "item_speed_label": ["" for _ in urls],
+                "item_eta_seconds": [None for _ in urls],
+                "item_updated_at": [None for _ in urls],
+                "item_total_duration_seconds": [None for _ in urls],
                 "item_resolved": [False for _ in urls],
                 "log": [],
                 "returncode": None,
@@ -183,9 +265,104 @@ class JobManager:
                                     0, min(100, int(match.group(1)))
                                 )
                             break
+            else:
+                self._update_download_progress_from_log(job, text)
         if log_callback is not None:
             log_callback(f"Job {job_id}: {text.rstrip()}")
         return True
+
+    @staticmethod
+    def _download_metric_lists(job: Job) -> Dict[str, list[Any]]:
+        statuses = job.get("item_statuses")
+        count = len(statuses) if isinstance(statuses, list) else 0
+        defaults: Dict[str, Any] = {
+            "item_progress": None,
+            "item_processed_seconds": None,
+            "item_speed_multiplier": None,
+            "item_speed_label": "",
+            "item_eta_seconds": None,
+            "item_updated_at": None,
+            "item_total_duration_seconds": None,
+        }
+        result: Dict[str, list[Any]] = {}
+        for key, default in defaults.items():
+            values = job.get(key)
+            if not isinstance(values, list):
+                values = [default for _ in range(count)]
+                job[key] = values
+            elif len(values) < count:
+                values.extend(default for _ in range(count - len(values)))
+            result[key] = values
+        return result
+
+    def _update_download_progress_from_log(self, job: Job, text: str) -> None:
+        statuses = job.get("item_statuses")
+        if not isinstance(statuses, list):
+            return
+        try:
+            index = statuses.index("l\u00e4uft")
+        except ValueError:
+            return
+        metrics = self._download_metric_lists(job)
+
+        marker_match = re.search(
+            rf"{re.escape(DOWNLOAD_DURATION_MARKER)}\s*([^\s]+)",
+            str(text or ""),
+            re.IGNORECASE,
+        )
+        if marker_match:
+            try:
+                duration = float(marker_match.group(1))
+            except (TypeError, ValueError, OverflowError):
+                duration = 0.0
+            metrics["item_total_duration_seconds"][index] = (
+                duration if math.isfinite(duration) and duration > 0 else None
+            )
+            return
+
+        duration = metrics["item_total_duration_seconds"][index]
+        ffmpeg = ffmpeg_download_metrics(text, duration)
+        has_ffmpeg_time = ffmpeg["processed_seconds"] is not None
+        has_ffmpeg_speed = "speed=" in str(text or "").lower()
+        if has_ffmpeg_time or has_ffmpeg_speed:
+            if has_ffmpeg_time:
+                metrics["item_processed_seconds"][index] = round(
+                    float(ffmpeg["processed_seconds"]), 3
+                )
+                metrics["item_progress"][index] = (
+                    round(float(ffmpeg["progress"]), 1)
+                    if ffmpeg["progress"] is not None
+                    else None
+                )
+            if has_ffmpeg_speed:
+                speed = ffmpeg["speed_multiplier"]
+                metrics["item_speed_multiplier"][index] = speed
+                metrics["item_speed_label"][index] = (
+                    f"{speed:g}x" if speed is not None else ""
+                )
+            metrics["item_eta_seconds"][index] = (
+                int(math.ceil(float(ffmpeg["eta_seconds"])))
+                if ffmpeg["eta_seconds"] is not None
+                else None
+            )
+            metrics["item_updated_at"][index] = float(self._clock())
+            return
+
+        classic = _CLASSIC_DOWNLOAD_RE.search(str(text or ""))
+        if not classic:
+            return
+        metrics["item_progress"][index] = max(
+            0.0, min(100.0, round(float(classic.group(1)), 1))
+        )
+        metrics["item_speed_label"][index] = f"{classic.group(2)}/s"
+        raw_eta = classic.group(3) or ""
+        eta = _clock_value_seconds(
+            raw_eta if raw_eta.count(":") == 2 else f"00:{raw_eta}"
+        )
+        metrics["item_eta_seconds"][index] = (
+            int(math.ceil(eta)) if eta is not None and eta > 0 else None
+        )
+        metrics["item_updated_at"][index] = float(self._clock())
 
     def update_job(self, job_id: str, **changes: Any) -> bool:
         """Apply a generic state transition under the registry lock."""
@@ -234,6 +411,16 @@ class JobManager:
             if not isinstance(statuses, list) or index < 0 or index >= len(statuses):
                 return False
             statuses[index] = status
+            metrics = self._download_metric_lists(job)
+            for key in (
+                "item_progress",
+                "item_processed_seconds",
+                "item_speed_multiplier",
+                "item_eta_seconds",
+                "item_updated_at",
+            ):
+                metrics[key][index] = None
+            metrics["item_speed_label"][index] = ""
         return True
 
     def fail_unfinished_download_items(self, job_id: str) -> None:
@@ -245,9 +432,19 @@ class JobManager:
             statuses = job.get("item_statuses")
             if not isinstance(statuses, list):
                 return
+            metrics = self._download_metric_lists(job)
             for index, status in enumerate(statuses):
                 if status in {"wartet", "läuft"}:
                     statuses[index] = "fehler"
+                    for key in (
+                        "item_progress",
+                        "item_processed_seconds",
+                        "item_speed_multiplier",
+                        "item_eta_seconds",
+                        "item_updated_at",
+                    ):
+                        metrics[key][index] = None
+                    metrics["item_speed_label"][index] = ""
 
     def set_upload_item_status(
         self,

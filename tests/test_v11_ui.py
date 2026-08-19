@@ -59,7 +59,7 @@ process.stdout.write(JSON.stringify(result));
         [NODE, "-e", runner],
         cwd=ROOT,
         input=json.dumps({"jobs": jobs, "results": results or []}),
-        text=True,
+        encoding="utf-8",
         capture_output=True,
         check=False,
     )
@@ -89,6 +89,8 @@ const items = queueItemsFromJobs(input.jobs || [], input.nowMs);
 process.stdout.write(JSON.stringify({
   items: items.map(item => ({
     state: item.state,
+    progress: item.progress ?? null,
+    processedSeconds: item.processedSeconds ?? null,
     extra: item.extra,
     etaSeconds: item.etaSeconds ?? null,
   })),
@@ -102,7 +104,7 @@ process.stdout.write(JSON.stringify({
         input=json.dumps(
             {"jobs": jobs, "results": [], "nowMs": now_ms}
         ),
-        text=True,
+        encoding="utf-8",
         capture_output=True,
         check=False,
     )
@@ -594,6 +596,55 @@ class V12QueueEtaRegressionTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["etaSeconds"], 18 * 60)
         self.assertIn("7.8 MB/s", result["items"][0]["extra"])
         self.assertIn("18 min remaining", result["items"][0]["extra"])
+
+    def test_ffmpeg_download_hides_processing_speed_but_keeps_percent_and_eta(self) -> None:
+        job = _download_job(["l\u00e4uft"], ["--- VOD 1/1 ---"])
+        job.update(
+            {
+                "item_progress": [72.0],
+                "item_processed_seconds": [720.0],
+                "item_speed_multiplier": [4.0],
+                "item_speed_label": ["4x"],
+                "item_eta_seconds": [70],
+                "item_updated_at": [1_787_082_600.0],
+                "item_total_duration_seconds": [1000.0],
+            }
+        )
+
+        result = _evaluate_queue_eta([job])
+
+        self.assertEqual(result["items"][0]["progress"], 72)
+        self.assertEqual(result["items"][0]["etaSeconds"], 70)
+        self.assertEqual(
+            result["items"][0]["extra"], "2 min remaining"
+        )
+        self.assertNotIn("4x", result["items"][0]["extra"])
+        self.assertEqual(result["estimate"]["etaSeconds"], 70)
+
+    def test_ffmpeg_download_without_duration_shows_only_truthful_metrics(self) -> None:
+        job = _download_job(["l\u00e4uft"], ["--- VOD 1/1 ---"])
+        job.update(
+            {
+                "item_progress": [None],
+                "item_processed_seconds": [26436.46],
+                "item_speed_multiplier": [61.0],
+                "item_speed_label": ["61x"],
+                "item_eta_seconds": [None],
+                "item_updated_at": [1_787_082_600.0],
+                "item_total_duration_seconds": [None],
+            }
+        )
+
+        result = _evaluate_queue_eta([job])
+
+        self.assertIsNone(result["items"][0]["progress"])
+        self.assertIsNone(result["items"][0]["etaSeconds"])
+        self.assertEqual(
+            result["items"][0]["extra"],
+            "7 hrs 20 min processed",
+        )
+        self.assertNotIn("61x", result["items"][0]["extra"])
+        self.assertIsNone(result["estimate"])
 
     def test_zero_speed_and_insufficient_samples_have_no_eta(self) -> None:
         zero = _evaluate_queue_eta(

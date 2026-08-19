@@ -843,6 +843,17 @@ function formatRemainingDuration(value) {
   return `${hours} hr${hours === 1 ? '' : 's'}${minutes ? ` ${minutes} min` : ''} remaining`;
 }
 
+function formatProcessedDuration(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return '';
+  if (seconds < 60) return `${Math.floor(seconds)} sec processed`;
+  const totalMinutes = Math.floor(seconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes} min processed`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours} hr${hours === 1 ? '' : 's'}${minutes ? ` ${minutes} min` : ''} processed`;
+}
+
 function formatTransferSpeed(value) {
   if (value === null || value === undefined || value === '') return '';
   const bytesPerSecond = Number(value);
@@ -947,14 +958,17 @@ function updateQueueSummary(jobs) {
     return;
   }
   const info = parseProgress(activeJob.log || []);
+  const activeItem = queueItemsFromJobs([activeJob]).find(item => item.state === 'running');
   const current = [activeJob.label, info.currentItem].filter(Boolean).join(' · ');
   if ($('queueCurrent')) $('queueCurrent').textContent = current || activeJob.label;
   if ($('queueEta')) {
-    $('queueEta').textContent = [
-      info.downloadProgress !== null ? `${info.downloadProgress}%` : '',
-      info.downloadSpeed,
-      formatRemainingDuration(parseEtaSeconds(info.eta))
-    ].filter(Boolean).join(' · ');
+    $('queueEta').textContent = activeItem
+      ? [activeItem.progress !== null ? `${activeItem.progress}%` : '', activeItem.extra].filter(Boolean).join(' · ')
+      : [
+        info.downloadProgress !== null ? `${info.downloadProgress}%` : '',
+        info.downloadSpeed,
+        formatRemainingDuration(parseEtaSeconds(info.eta))
+      ].filter(Boolean).join(' · ');
   }
 }
 
@@ -1060,6 +1074,11 @@ function queueItemsFromJobs(jobs, nowMs=Date.now()) {
       const failed = segment.some(line => /ended with error code/i.test(String(line)));
       const completed = segment.some(line => new RegExp(`VOD\\s+${index}\\/\\d+ download completed`, 'i').test(String(line)));
       const trackedStatus = Array.isArray(job.item_statuses) ? job.item_statuses[zeroIndex] : '';
+      const trackedProgress = Array.isArray(job.item_progress) ? job.item_progress[zeroIndex] : null;
+      const trackedProcessedSeconds = Array.isArray(job.item_processed_seconds) ? job.item_processed_seconds[zeroIndex] : null;
+      const trackedSpeedLabel = Array.isArray(job.item_speed_label) ? job.item_speed_label[zeroIndex] : '';
+      const trackedEtaSeconds = Array.isArray(job.item_eta_seconds) ? job.item_eta_seconds[zeroIndex] : null;
+      const trackedUpdatedAt = Array.isArray(job.item_updated_at) ? job.item_updated_at[zeroIndex] : null;
       const resolved = !!(Array.isArray(job.item_resolved) && job.item_resolved[zeroIndex]);
       let stateName = 'waiting';
       if (trackedStatus === 'fehler') stateName = 'error';
@@ -1075,14 +1094,36 @@ function queueItemsFromJobs(jobs, nowMs=Date.now()) {
       else if (job.status === 'fehler') stateName = 'error';
       const vodId = queueVodId(url);
       const operation = stateName === 'running' ? 'Downloading' : stateName === 'completed' ? 'Download completed' : stateName === 'error' ? 'Download failed' : 'Waiting to download';
-      const etaSeconds = stateName === 'running' ? parseEtaSeconds(progress.eta) : null;
+      const hasStructuredDownloadState = Array.isArray(job.item_progress) && Array.isArray(job.item_eta_seconds);
+      const structuredProgress = Number(trackedProgress);
+      const hasStructuredProgress = trackedProgress !== null && trackedProgress !== '' && Number.isFinite(structuredProgress);
+      const displayedProgress = stateName === 'running'
+        ? (hasStructuredProgress ? structuredProgress : (hasStructuredDownloadState ? null : progress.downloadProgress))
+        : null;
+      const hasStructuredEta = trackedEtaSeconds !== null && trackedEtaSeconds !== '' && Number.isFinite(Number(trackedEtaSeconds));
+      const structuredEta = stateName === 'running' && hasStructuredEta
+        ? currentEtaSeconds(trackedEtaSeconds, trackedUpdatedAt, nowMs)
+        : null;
+      const etaSeconds = stateName === 'running'
+        ? (hasStructuredEta ? structuredEta : (hasStructuredDownloadState ? null : parseEtaSeconds(progress.eta)))
+        : null;
+      const speedLabel = stateName === 'running'
+        ? (/^\d+(?:\.\d+)?x$/i.test(String(trackedSpeedLabel || '').trim())
+          ? ''
+          : (trackedSpeedLabel || (hasStructuredDownloadState ? '' : progress.downloadSpeed)))
+        : '';
+      const processedLabel = stateName === 'running' && displayedProgress === null
+        ? formatProcessedDuration(trackedProcessedSeconds)
+        : '';
       items.push({
         job, state: stateName, operation, resolved,
         streamer: meta.streamer || '', date: meta.date || '', title: meta.title || (vodId ? `Twitch VOD ${vodId}` : job.label),
         vodId, filename: '', sizeBytes: null, sizeGb: null,
-        progress: stateName === 'running' ? progress.downloadProgress : null,
+        progress: displayedProgress,
+        processedSeconds: stateName === 'running' ? trackedProcessedSeconds : null,
         etaSeconds,
-        extra: stateName === 'running' ? [progress.downloadSpeed, formatRemainingDuration(etaSeconds)].filter(Boolean).join(' · ') : '',
+        updatedAt: stateName === 'running' ? trackedUpdatedAt : null,
+        extra: stateName === 'running' ? [processedLabel, speedLabel, formatRemainingDuration(etaSeconds)].filter(Boolean).join(' · ') : '',
         error: stateName === 'error' ? queueErrorFromLines(segment.length ? segment : logs) : '', index: zeroIndex
       });
     });
@@ -1160,6 +1201,9 @@ function renderQueueVodItem(item, compact=false) {
   const status = item.state === 'running' ? item.operation : niceStatus(item.state === 'waiting' ? 'wartet' : item.state === 'completed' ? 'fertig' : 'fehler');
   const logText = (item.job.log || []).slice(-120).join('\n');
   const progress = item.state === 'running' ? renderProgressBar(item.operation, item.progress, item.extra) : '';
+  const progressDetails = item.state === 'running' && !progress && item.extra
+    ? `<div class="queue-progress-text muted">${escapeHtml(item.extra)}</div>`
+    : '';
   const detailId = queueItemKey(item);
   const detailOpen = queueDetailOpenState[detailId] ? ' open' : '';
   const error = item.error ? `<div class="queue-item-error">${escapeHtml(queueErrorSummary(item.error, item.operation))}</div>` : '';
@@ -1175,7 +1219,7 @@ function renderQueueVodItem(item, compact=false) {
   }
   return `<article class="queue-vod-item ${compact ? 'compact' : ''} ${item.state === 'error' ? 'has-error' : ''}">
     <div class="queue-vod-main"><div class="queue-vod-copy">${identity ? `<div class="queue-vod-identity">${escapeHtml(identity)}</div>` : ''}<strong>${escapeHtml(item.title || item.job.label)}</strong></div><span class="pill ${item.state === 'error' ? 'bad' : item.state === 'completed' ? 'good' : item.state === 'running' ? 'accent' : 'muted'}">${escapeHtml(status)}</span></div>
-    ${error}${progress}
+    ${error}${progress}${progressDetails}
     <details class="technical-details" data-queue-detail-id="${escapeHtml(detailId)}"${detailOpen}><summary>Technical details</summary><div class="job-detail-grid"><div><span class="muted">Job ID</span><strong>${escapeHtml(item.job.id)}</strong></div><div><span class="muted">Operation</span><strong>${escapeHtml(item.operation)}</strong></div></div><pre>${escapeHtml(logText)}</pre></details>
   </article>`;
 }
