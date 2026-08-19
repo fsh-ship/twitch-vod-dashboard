@@ -4,6 +4,7 @@ import os
 import stat
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -1320,7 +1321,7 @@ class YouTubeUploadHelperTests(unittest.TestCase):
         move.assert_not_called()
         service.playlistItems.assert_not_called()
 
-    def test_uploaded_history_persistence_deduplication_and_limit(self):
+    def test_uploaded_history_persistence_deduplication_and_no_truncation(self):
         settings_file = self.base / "settings.json"
         existing = ["older.mp4", str(self.video.resolve())]
         youtube.remember_youtube_uploaded_file(
@@ -1329,9 +1330,19 @@ class YouTubeUploadHelperTests(unittest.TestCase):
                 "youtube_uploaded_files": existing.copy()
             },
             settings_file=settings_file,
+            now=lambda: datetime(2026, 8, 19, 12, 0, 0),
         )
         persisted = json.loads(settings_file.read_text(encoding="utf-8"))
         self.assertEqual(persisted["youtube_uploaded_files"], existing)
+        self.assertEqual(
+            persisted["youtube_upload_history"],
+            [
+                {
+                    "path": str(self.video.resolve()),
+                    "uploaded_at": "2026-08-19T12:00:00",
+                }
+            ],
+        )
 
         long_history = [f"video-{index}.mp4" for index in range(1001)]
         youtube.remember_youtube_uploaded_file(
@@ -1340,15 +1351,16 @@ class YouTubeUploadHelperTests(unittest.TestCase):
                 "youtube_uploaded_files": long_history.copy()
             },
             settings_file=settings_file,
+            now=lambda: datetime(2026, 8, 19, 12, 1, 0),
         )
         persisted = json.loads(settings_file.read_text(encoding="utf-8"))
-        self.assertEqual(len(persisted["youtube_uploaded_files"]), 1000)
+        self.assertEqual(len(persisted["youtube_uploaded_files"]), 1002)
         self.assertEqual(
             persisted["youtube_uploaded_files"][-1],
             str(self.video.resolve()),
         )
-        self.assertNotIn("video-0.mp4", persisted["youtube_uploaded_files"])
-        self.assertNotIn("video-1.mp4", persisted["youtube_uploaded_files"])
+        self.assertIn("video-0.mp4", persisted["youtube_uploaded_files"])
+        self.assertIn("video-1.mp4", persisted["youtube_uploaded_files"])
 
     def test_move_after_upload_disabled_and_enabled_contracts(self):
         move_bundle = mock.Mock()

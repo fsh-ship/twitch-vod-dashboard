@@ -89,6 +89,7 @@ DEFAULT_SETTINGS_KEYS = {
     "youtube_title_template",
     "youtube_token_file",
     "youtube_upload_mode",
+    "youtube_upload_history",
     "youtube_uploaded_files",
 }
 

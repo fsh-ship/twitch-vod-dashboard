@@ -7,6 +7,34 @@ from typing import Any, Callable, Dict, List, Mapping, Set
 from vod_dashboard.media import MediaPathPolicy, is_complete_video_file
 
 
+def _path_identity(value: Any) -> str:
+    return str(value or "").strip().replace("\\", "/").casefold()
+
+
+def _valid_uploaded_at(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+    return text
+
+
+def _history_uploaded_at(
+    settings: Mapping[str, Any], path: Path
+) -> str:
+    identity = _path_identity(path)
+    for item in reversed(list(settings.get("youtube_upload_history") or [])):
+        if not isinstance(item, Mapping):
+            continue
+        if _path_identity(item.get("path")) != identity:
+            continue
+        return _valid_uploaded_at(item.get("uploaded_at"))
+    return ""
+
+
 def local_video_metadata_payload(
     path: Path,
     settings: Mapping[str, Any],
@@ -53,6 +81,10 @@ def local_video_metadata_payload(
     else:
         status = "Ready"
 
+    uploaded_at = _valid_uploaded_at(marker.get("uploaded_at"))
+    if not uploaded_at:
+        uploaded_at = _history_uploaded_at(settings, path)
+
     return {
         "path": str(path),
         "name": path.name,
@@ -86,12 +118,14 @@ def local_video_metadata_payload(
         "already_uploaded": uploaded,
         "in_uploaded_folder": in_uploaded_folder,
         "status": status,
-        "uploaded_at": marker.get("uploaded_at") or "",
+        "uploaded_at": uploaded_at,
         "local_file_exists": True,
     }
 
 
-def _missing_uploaded_payload(path: Path) -> Dict[str, Any]:
+def _missing_uploaded_payload(
+    path: Path, uploaded_at: str = ""
+) -> Dict[str, Any]:
     return {
         "path": str(path),
         "name": path.name,
@@ -117,7 +151,7 @@ def _missing_uploaded_payload(path: Path) -> Dict[str, Any]:
         "already_uploaded": True,
         "in_uploaded_folder": False,
         "status": "Local file removed",
-        "uploaded_at": "",
+        "uploaded_at": _valid_uploaded_at(uploaded_at),
         "local_file_exists": False,
     }
 
@@ -177,35 +211,71 @@ def enumerate_local_vods(
                     )
 
     if include_uploaded:
-        existing_names = {str(item.get("name") or "").casefold() for item in items}
-        missing_names: Set[str] = set()
+        def archive_identity(path: Path) -> str:
+            for base in (uploaded_root, root):
+                if media_policy.is_path_inside(path, base):
+                    try:
+                        return _path_identity(path.relative_to(base))
+                    except ValueError:
+                        pass
+            return _path_identity(path)
+
+        existing_history_ids = {
+            archive_identity(Path(str(item.get("path") or "")))
+            for item in items
+            if item.get("path")
+        }
+        missing_history_ids: Set[str] = set()
         for raw in reversed(list(settings.get("youtube_uploaded_files") or [])):
             try:
                 path = media_policy.safe_local_video_path(
                     raw, settings, must_exist=False
                 )
-                name_key = path.name.casefold()
-                if path.exists() or name_key in existing_names or name_key in missing_names:
+                history_id = archive_identity(path)
+                if (
+                    path.exists()
+                    or history_id in existing_history_ids
+                    or history_id in missing_history_ids
+                ):
                     continue
-                items.append(_missing_uploaded_payload(path))
-                missing_names.add(name_key)
+                items.append(
+                    _missing_uploaded_payload(
+                        path, _history_uploaded_at(settings, path)
+                    )
+                )
+                missing_history_ids.add(history_id)
             except Exception as exc:
                 if log_callback:
                     log_callback(
                         f"Could not read uploaded VOD history entry {raw}: {exc}"
                     )
 
-    items.sort(
-        key=lambda item: (
-            item.get("already_uploaded", False),
-            item.get("mtime", ""),
-        ),
-        reverse=False,
-    )
     pending = [
         item for item in items if not item.get("already_uploaded")
     ]
     marked = [item for item in items if item.get("already_uploaded")]
+    pending.sort(key=lambda item: str(item.get("mtime") or ""))
+    timestamped = [item for item in marked if item.get("uploaded_at")]
+    legacy = [item for item in marked if not item.get("uploaded_at")]
+    timestamped.sort(
+        key=lambda item: datetime.fromisoformat(
+            str(item["uploaded_at"]).replace("Z", "+00:00")
+        ).timestamp(),
+        reverse=True,
+    )
+    history_order = {
+        _path_identity(raw): index
+        for index, raw in enumerate(
+            list(settings.get("youtube_uploaded_files") or [])
+        )
+    }
+    legacy.sort(
+        key=lambda item: history_order.get(
+            _path_identity(item.get("path")), -1
+        ),
+        reverse=True,
+    )
+    items = pending + timestamped + legacy
     total_bytes = sum(
         int(item.get("size_bytes") or 0) for item in items
     )

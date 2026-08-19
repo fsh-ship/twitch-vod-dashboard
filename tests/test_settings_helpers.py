@@ -50,6 +50,7 @@ DEFAULT_SETTINGS_KEYS = {
     "youtube_title_template",
     "youtube_token_file",
     "youtube_upload_mode",
+    "youtube_upload_history",
     "youtube_uploaded_files",
 }
 
@@ -124,6 +125,7 @@ class SettingsRepositoryTests(unittest.TestCase):
             "youtube_tags": "twitch,vod",
             "youtube_category_id": "20",
             "youtube_chunk_size_mb": 64,
+            "youtube_upload_history": [],
             "youtube_uploaded_files": [],
             "move_uploaded_vods": True,
             "uploaded_vods_folder": str(runtime_paths.uploaded_vods_folder),
@@ -137,7 +139,7 @@ class SettingsRepositoryTests(unittest.TestCase):
             "manual_upload_write_metadata_json": True,
         }
         self.assertEqual(set(settings.DEFAULT_SETTINGS), DEFAULT_SETTINGS_KEYS)
-        self.assertEqual(len(settings.DEFAULT_SETTINGS), 38)
+        self.assertEqual(len(settings.DEFAULT_SETTINGS), 39)
         self.assertEqual(settings.DEFAULT_SETTINGS, expected)
 
     def test_bool_normalization_including_legacy_values(self):

@@ -729,6 +729,8 @@ main { width:100%; max-width:1320px; }
 .video-workspace-grid { grid-template-columns:repeat(auto-fill,minmax(min(100%,360px),1fr)); }
 .video-file-block strong, .video-file-block small { white-space:normal; text-overflow:clip; overflow-wrap:anywhere; }
 .video-primary-actions { margin-top:auto; }
+.video-workspace-card.is-local-removed { border-style:dashed; background:rgba(18,25,38,.72); }
+.show-more-upload-history { grid-column:1 / -1; width:100%; min-height:42px; }
 .secondary-actions { margin-top:0; }
 .secondary-actions .video-copy-actions { margin-top:12px; }
 

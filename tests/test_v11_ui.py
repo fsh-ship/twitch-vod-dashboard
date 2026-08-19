@@ -51,6 +51,8 @@ const result = queue.map(item => ({
   resolved: item.resolved,
   title: item.title,
   vodId: item.vodId,
+  key: queueItemKey(item),
+  detailLogs: item.detailLogs || [],
   distinguishingLabel: labels.get(queueItemKey(item)) || '',
 }));
 process.stdout.write(JSON.stringify(result));
@@ -201,6 +203,40 @@ process.stdout.write(JSON.stringify({first, second}));
     return json.loads(completed.stdout)["second"]
 
 
+def _evaluate_local_history_ui(card: dict, videos: list[dict]) -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for local-history UI tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function workspaceStatusClass');
+const end = source.indexOf('async function loadLocalVideos');
+if (start < 0 || end < 0 || end <= start) throw new Error('Local-history renderer source not found');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const UPLOADED_HISTORY_PAGE_SIZE = 20;
+const localVideoCache = new Map();
+function escapeHtml(value) { return String(value || ''); }
+eval(source.slice(start, end));
+const visible = visibleLocalVideoRows(input.videos || [], true, 20);
+process.stdout.write(JSON.stringify({
+  card: renderLocalVideoCard(input.card),
+  visiblePaths: visible.map(video => video.path),
+  sourceCount: (input.videos || []).length,
+}));
+"""
+    completed = subprocess.run(
+        [NODE, "-e", runner],
+        cwd=ROOT,
+        input=json.dumps({"card": card, "videos": videos}),
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
 class _IdParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -288,6 +324,63 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("Upload history retained; local actions are unavailable.", JAVASCRIPT)
         self.assertIn("v.local_file_exists !== false", JAVASCRIPT)
         self.assertIn("Size unavailable", JAVASCRIPT)
+
+    def test_removed_uploaded_file_has_truthful_state_and_no_actions(self) -> None:
+        removed = {
+            "path": "C:/media/Example/removed.mp4",
+            "name": "removed.mp4",
+            "streamer": "Example",
+            "date_de": "18.08.2026",
+            "title": "Removed upload",
+            "size_gb": None,
+            "prepared": False,
+            "dashboard_uploaded": True,
+            "manually_uploaded": False,
+            "already_uploaded": True,
+            "local_file_exists": False,
+            "status": "Local file removed",
+        }
+
+        result = _evaluate_local_history_ui(removed, [removed])
+        html = result["card"]
+
+        self.assertIn("Uploaded to YouTube", html)
+        self.assertIn("Local file removed", html)
+        self.assertIn("Upload history retained", html)
+        self.assertIn("is-local-removed", html)
+        self.assertIn(">History<", html)
+        self.assertNotIn("localvideocheck", html)
+        self.assertNotIn("data-action=", html)
+        self.assertNotIn(">Ready<", html)
+
+    def test_uploaded_history_initially_limits_rendering_without_deleting_data(self) -> None:
+        pending = [
+            {"path": f"pending-{index}", "already_uploaded": False}
+            for index in range(2)
+        ]
+        uploaded = [
+            {"path": f"uploaded-{index}", "already_uploaded": True}
+            for index in range(35)
+        ]
+
+        result = _evaluate_local_history_ui(
+            {
+                "path": "removed",
+                "name": "removed.mp4",
+                "already_uploaded": True,
+                "dashboard_uploaded": True,
+                "local_file_exists": False,
+                "status": "Local file removed",
+            },
+            pending + uploaded,
+        )
+
+        self.assertEqual(result["sourceCount"], 37)
+        self.assertEqual(len(result["visiblePaths"]), 22)
+        self.assertEqual(result["visiblePaths"][:2], ["pending-0", "pending-1"])
+        self.assertEqual(result["visiblePaths"][-1], "uploaded-19")
+        self.assertIn("Show more", JAVASCRIPT)
+        self.assertIn("grid-column:1 / -1", STYLESHEET)
 
     def test_streamer_editor_preserves_text_storage_contract(self) -> None:
         self.assertIn('id="streamerAddInput"', TEMPLATE)
@@ -411,6 +504,82 @@ class V11QueueStateRegressionTests(unittest.TestCase):
 
         self.assertIn('data-queue-detail-id="youtube_upload:upload-1:0" open', html)
         self.assertIn("Mark as resolved", html)
+
+    def test_completed_upload_details_exclude_another_active_vod(self) -> None:
+        job = _upload_job(["fertig", "l\u00e4uft"], [100, 12])
+        job["item_metadata"][0].update(
+            {"streamer": "XERAX_TTV", "title": "( Peak ) G? was nun"}
+        )
+        job["item_metadata"][1].update(
+            {
+                "streamer": "XERAX_TTV",
+                "title": "( Peak ) Neuer Tag neues Gl\u00fcck",
+            }
+        )
+        job["log"] = [
+            "Uploading local VOD file: C:/media/vod-1.mp4",
+            "YouTube Upload starting: vod-1.mp4 (private)",
+            "YouTube Upload vod-1.mp4: 100%",
+            "YouTube Upload completed: https://www.youtube.com/watch?v=old",
+            "Uploading local VOD file: C:/media/vod-2.mp4",
+            "YouTube Upload starting: vod-2.mp4 (private)",
+            "YouTube Upload vod-2.mp4: 12%",
+        ]
+
+        completed, active = _classify_download_jobs([job])
+
+        self.assertIn("watch?v=old", "\n".join(completed["detailLogs"]))
+        self.assertNotIn("vod-2.mp4", "\n".join(completed["detailLogs"]))
+        self.assertIn("vod-2.mp4: 12%", "\n".join(active["detailLogs"]))
+
+        html = _render_queue_item_with_saved_open_state(
+            {
+                "job": {
+                    "id": "upload-1",
+                    "type": "youtube_upload",
+                    "label": "Upload",
+                    "log": job["log"],
+                },
+                "index": 0,
+                "state": "completed",
+                "operation": "YouTube upload completed",
+                "streamer": "XERAX_TTV",
+                "date": "18.08.2026",
+                "title": "( Peak ) G? was nun",
+                "detailLogs": completed["detailLogs"],
+                "error": "",
+                "resolved": False,
+                "progress": None,
+                "extra": "",
+            }
+        )
+        self.assertIn("watch?v=old", html)
+        self.assertNotIn("vod-2.mp4: 12%", html)
+        self.assertIn('data-queue-detail-id="youtube_upload:upload-1:0" open', html)
+
+    def test_same_streamer_vods_have_independent_polling_stable_keys(self) -> None:
+        job = _upload_job(["fertig", "l\u00e4uft"], [100, 12])
+        for metadata in job["item_metadata"]:
+            metadata.update(
+                {
+                    "streamer": "XERAX_TTV",
+                    "date": "18.08.2026",
+                    "title": "Overlapping metadata",
+                }
+            )
+        first_poll = _classify_download_jobs([job])
+        job["log"].append("YouTube Upload vod-2.mp4: 13%")
+        second_poll = _classify_download_jobs([job])
+
+        self.assertEqual(
+            [item["key"] for item in first_poll],
+            ["youtube_upload:upload-1:0", "youtube_upload:upload-1:1"],
+        )
+        self.assertEqual(
+            [item["key"] for item in second_poll],
+            [item["key"] for item in first_poll],
+        )
+        self.assertEqual(len(set(item["key"] for item in second_poll)), 2)
 
     def test_completed_metadata_collisions_remain_distinct_by_vod_id(self) -> None:
         job = _download_job(

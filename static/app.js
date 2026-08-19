@@ -994,6 +994,31 @@ function downloadLogSegment(logs, index) {
   return logs.slice(start, next < 0 ? logs.length : next);
 }
 
+function normalizeQueueFileIdentity(value) {
+  return String(value || '').trim().replace(/\\/g, '/').replace(/\/+$/g, '').toLocaleLowerCase();
+}
+
+function uploadLogSegment(logs, path) {
+  const markers = [];
+  (logs || []).forEach((line, position) => {
+    const match = String(line || '').match(/^Uploading local VOD file:\s*(.+)$/i);
+    if (match) markers.push({position, identity: normalizeQueueFileIdentity(match[1])});
+  });
+  const identity = normalizeQueueFileIdentity(path);
+  let markerIndex = markers.findIndex(marker => marker.identity === identity);
+  if (markerIndex < 0) {
+    const name = normalizeQueueFileIdentity(queuePathName(path));
+    const matchingNames = markers
+      .map((marker, index) => ({marker, index}))
+      .filter(value => normalizeQueueFileIdentity(queuePathName(value.marker.identity)) === name);
+    if (matchingNames.length === 1) markerIndex = matchingNames[0].index;
+  }
+  if (markerIndex < 0) return [];
+  const start = markers[markerIndex].position;
+  const next = markers[markerIndex + 1];
+  return logs.slice(start, next ? next.position : logs.length);
+}
+
 function queueErrorFromLines(lines) {
   return [...(lines || [])].reverse().find(line => /(?:failed|error|ended with error|did not start)/i.test(String(line))) || '';
 }
@@ -1022,6 +1047,7 @@ function queueItemsFromJobs(jobs, nowMs=Date.now()) {
     if (job.type === 'youtube_upload') {
       sources.forEach((path, zeroIndex) => {
         const name = queuePathName(path);
+        const segment = uploadLogSegment(logs, path);
         const local = localVideoCache.get(path) || [...localVideoCache.values()].find(v => v.name === name) || {};
         const metadata = (Array.isArray(job.item_metadata) && job.item_metadata[zeroIndex]) || {};
         const trackedStatus = Array.isArray(job.item_statuses) ? job.item_statuses[zeroIndex] : '';
@@ -1033,9 +1059,9 @@ function queueItemsFromJobs(jobs, nowMs=Date.now()) {
         const trackedUpdatedAt = Array.isArray(job.item_updated_at) ? job.item_updated_at[zeroIndex] : null;
         const trackedError = Array.isArray(job.item_errors) ? job.item_errors[zeroIndex] : '';
         const resolved = !!(Array.isArray(job.item_resolved) && job.item_resolved[zeroIndex]);
-        const failure = [...logs].reverse().find(line => String(line).includes(name) && /(?:failed|error|without a video ID)/i.test(String(line))) || '';
-        const completion = logs.some(line => String(line).includes(name) && /YouTube Upload completed:/i.test(String(line)));
-        const started = logs.some(line => String(line).includes(name) && /(?:Uploading local VOD file:|YouTube Upload starting:)/i.test(String(line)));
+        const failure = [...segment].reverse().find(line => /(?:failed|error|without a video ID)/i.test(String(line))) || '';
+        const completion = segment.some(line => /YouTube Upload completed:/i.test(String(line)));
+        const started = segment.some(line => /(?:Uploading local VOD file:|YouTube Upload starting:)/i.test(String(line)));
         let stateName = 'waiting';
         if (trackedStatus === 'fehler') stateName = 'error';
         else if (trackedStatus === 'fertig') stateName = 'completed';
@@ -1061,7 +1087,8 @@ function queueItemsFromJobs(jobs, nowMs=Date.now()) {
           etaSeconds,
           updatedAt: stateName === 'running' ? trackedUpdatedAt : null,
           extra: [speedLabel, formatRemainingDuration(etaSeconds)].filter(Boolean).join(' · '),
-          error: trackedError || failure || (stateName === 'error' ? queueErrorFromLines(logs) : ''), index: zeroIndex
+          detailLogs: segment,
+          error: trackedError || failure || (stateName === 'error' ? queueErrorFromLines(segment) : ''), index: zeroIndex
         });
       });
       return;
@@ -1124,6 +1151,7 @@ function queueItemsFromJobs(jobs, nowMs=Date.now()) {
         etaSeconds,
         updatedAt: stateName === 'running' ? trackedUpdatedAt : null,
         extra: stateName === 'running' ? [processedLabel, speedLabel, formatRemainingDuration(etaSeconds)].filter(Boolean).join(' · ') : '',
+        detailLogs: segment,
         error: stateName === 'error' ? queueErrorFromLines(segment.length ? segment : logs) : '', index: zeroIndex
       });
     });
@@ -1199,7 +1227,10 @@ function distinguishQueueItems(items) {
 function renderQueueVodItem(item, compact=false) {
   const identity = [item.streamer, item.date].filter(Boolean).join(' · ');
   const status = item.state === 'running' ? item.operation : niceStatus(item.state === 'waiting' ? 'wartet' : item.state === 'completed' ? 'fertig' : 'fehler');
-  const logText = (item.job.log || []).slice(-120).join('\n');
+  const itemLogs = Array.isArray(item.detailLogs) ? item.detailLogs : [];
+  const logText = itemLogs.length
+    ? itemLogs.slice(-120).join('\n')
+    : 'No item-specific technical log is available.';
   const progress = item.state === 'running' ? renderProgressBar(item.operation, item.progress, item.extra) : '';
   const progressDetails = item.state === 'running' && !progress && item.extra
     ? `<div class="queue-progress-text muted">${escapeHtml(item.extra)}</div>`
@@ -1354,6 +1385,8 @@ async function refreshDashboard() {
   }
 }
 
+const UPLOADED_HISTORY_PAGE_SIZE = 20;
+let uploadedHistoryVisibleCount = UPLOADED_HISTORY_PAGE_SIZE;
 let localVideoCache = new Map();
 
 function selectedLocalVideoPaths() {
@@ -1368,6 +1401,7 @@ function updateLocalUploadButton() {
 
 function workspaceStatusClass(video) {
   if (video.local_file_exists === false) return 'warn';
+  if (video.already_uploaded) return 'good';
   if (video.in_uploaded_folder) return 'accent';
   if (video.manually_uploaded || video.dashboard_uploaded) return 'good';
   if (video.prepared) return 'warn';
@@ -1383,20 +1417,30 @@ function localVideoByPath(path) {
 }
 
 function renderLocalVideoCard(v) {
-  const marked = v.manually_uploaded || v.dashboard_uploaded;
+  const uploaded = !!v.already_uploaded;
   const hasLocalFile = v.local_file_exists !== false;
   const uploadable = !v.already_uploaded && hasLocalFile;
   const statusClassName = workspaceStatusClass(v);
-  return `<article class="video-workspace-card ${marked ? 'is-uploaded' : ''}" data-video-path="${escapeHtml(v.path)}">
-    <label class="video-select"><input class="localvideocheck" type="checkbox" data-path="${escapeHtml(v.path)}" ${uploadable ? 'checked' : 'disabled'}><span>Select</span></label>
+  const secondaryStatus = uploaded
+    ? 'Uploaded to YouTube'
+    : (v.prepared ? 'Metadata ready' : 'Metadata needed');
+  return `<article class="video-workspace-card ${uploaded ? 'is-uploaded' : ''} ${hasLocalFile ? '' : 'is-local-removed'}" data-video-path="${escapeHtml(v.path)}">
+    ${uploadable ? `<label class="video-select"><input class="localvideocheck" type="checkbox" data-path="${escapeHtml(v.path)}" checked><span>Select</span></label>` : '<span class="video-select muted">History</span>'}
     <div class="video-person"><strong>${escapeHtml(v.streamer || 'Unknown streamer')}</strong><span>${escapeHtml(v.date_de || 'Unknown date')}</span></div>
     <strong class="video-display-title">${escapeHtml(v.title || v.youtube_title || v.name)}</strong>
     <span class="video-size">${hasLocalFile ? `${escapeHtml(v.size_gb)} GB` : 'Size unavailable'}</span>
-    <span class="metadata-status ${v.prepared ? 'good' : 'muted'}">${v.prepared ? 'Metadata ready' : 'Metadata needed'}</span>
+    <span class="metadata-status ${uploaded || v.prepared ? 'good' : 'muted'}">${secondaryStatus}</span>
     <span class="pill ${statusClassName}">${escapeHtml(workspaceStatusLabel(v))}</span>
     <div class="video-primary-actions">${uploadable ? `<button type="button" class="primary video-action" data-action="upload" data-path="${escapeHtml(v.path)}">Upload</button>` : ''}</div>
     ${hasLocalFile ? `<details class="technical-details secondary-actions"><summary>Actions</summary><div class="video-copy-actions"><button type="button" class="video-action" data-action="copy-title" data-path="${escapeHtml(v.path)}">Copy Title</button><button type="button" class="video-action" data-action="copy-description" data-path="${escapeHtml(v.path)}">Copy Description</button>${uploadable && !v.prepared ? `<button type="button" class="video-action" data-action="prepare" data-path="${escapeHtml(v.path)}">Prepare metadata</button>` : ''}${uploadable ? `<button type="button" class="video-action" data-action="mark" data-path="${escapeHtml(v.path)}">Mark as Uploaded</button>` : ''}</div><div class="danger-zone"><strong>Delete the local VOD file and its sidecars</strong><button type="button" class="danger-outline video-action" data-action="delete" data-path="${escapeHtml(v.path)}">Delete Permanently</button></div></details>` : '<span class="muted">Upload history retained; local actions are unavailable.</span>'}
   </article>`;
+}
+
+function visibleLocalVideoRows(videos, includeUploaded, historyLimit=UPLOADED_HISTORY_PAGE_SIZE) {
+  const pending = (videos || []).filter(video => !video.already_uploaded);
+  if (!includeUploaded) return pending;
+  const uploaded = (videos || []).filter(video => video.already_uploaded);
+  return [...pending, ...uploaded.slice(0, Math.max(0, historyLimit))];
 }
 
 async function loadLocalVideos() {
@@ -1409,6 +1453,13 @@ async function loadLocalVideos() {
   const videos = data.videos || [];
   localVideoCache = new Map(videos.map(v => [v.path, v]));
   const counts = data.counts || {};
+  const visibleVideos = visibleLocalVideoRows(
+    videos, includeUploaded, uploadedHistoryVisibleCount
+  );
+  const uploadedCount = videos.filter(video => video.already_uploaded).length;
+  const hiddenUploadedCount = includeUploaded
+    ? Math.max(0, uploadedCount - uploadedHistoryVisibleCount)
+    : 0;
 
   if ($('workspacePending')) $('workspacePending').textContent = String(counts.pending || 0);
   if (info) {
@@ -1422,9 +1473,18 @@ async function loadLocalVideos() {
     return;
   }
 
-  box.innerHTML = videos.map(renderLocalVideoCard).join('');
+  box.innerHTML = visibleVideos.map(renderLocalVideoCard).join('') + (
+    hiddenUploadedCount
+      ? `<button type="button" id="showMoreUploadedHistory" class="quiet-button show-more-upload-history">Show more · ${hiddenUploadedCount} older upload${hiddenUploadedCount === 1 ? '' : 's'}</button>`
+      : ''
+  );
   document.querySelectorAll('.localvideocheck').forEach(cb => cb.addEventListener('change', updateLocalUploadButton));
   document.querySelectorAll('.video-action').forEach(btn => btn.addEventListener('click', () => handleLocalVideoAction(btn.dataset.action, btn.dataset.path)));
+  const showMore = $('showMoreUploadedHistory');
+  if (showMore) showMore.addEventListener('click', () => {
+    uploadedHistoryVisibleCount += UPLOADED_HISTORY_PAGE_SIZE;
+    loadLocalVideos().catch(error => alert(error.message));
+  });
   updateLocalUploadButton();
 }
 
@@ -1768,6 +1828,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
   const includeUploaded = document.getElementById('includeUploadedLocalVideos');
   if (includeUploaded) includeUploaded.onchange = function() {
+    uploadedHistoryVisibleCount = UPLOADED_HISTORY_PAGE_SIZE;
     loadLocalVideos().catch(e => alert(e.message));
   };
 });

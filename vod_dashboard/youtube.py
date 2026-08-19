@@ -520,6 +520,7 @@ def remember_youtube_uploaded_file(
     settings_loader: Callable[[], Dict[str, Any]],
     settings_file: Path,
     log_callback: Optional[Callable[[str], None]] = None,
+    now: Callable[[], datetime] = datetime.now,
 ) -> None:
     try:
         settings = settings_loader()
@@ -527,8 +528,24 @@ def remember_youtube_uploaded_file(
         value = str(path)
         if value not in current:
             current.append(value)
-        current = current[-1000:]
         settings["youtube_uploaded_files"] = current
+        history = [
+            dict(item)
+            for item in settings.get("youtube_upload_history") or []
+            if isinstance(item, Mapping)
+            and str(item.get("path") or "").strip()
+            and str(item.get("uploaded_at") or "").strip()
+        ]
+        history = [
+            item for item in history if str(item.get("path")) != value
+        ]
+        history.append(
+            {
+                "path": value,
+                "uploaded_at": now().isoformat(timespec="seconds"),
+            }
+        )
+        settings["youtube_upload_history"] = history
         settings_file.write_text(
             json.dumps(settings, indent=2, ensure_ascii=False),
             encoding="utf-8",

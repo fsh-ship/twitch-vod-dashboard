@@ -962,6 +962,7 @@ def api_local_video_mark_uploaded():
     settings = load_settings()
     path = safe_local_video_path(data.get("path"), settings)
     marker = write_local_upload_marker(path, method="manual")
+    remember_youtube_uploaded_file(path)
     return jsonify({"ok": True, "path": str(path), "marker": marker})
 
 

@@ -54,6 +54,7 @@ def _default_settings(runtime_paths: RuntimePaths) -> Dict[str, Any]:
         "youtube_category_id": "20",
         "youtube_chunk_size_mb": 64,
         "youtube_uploaded_files": [],
+        "youtube_upload_history": [],
         "move_uploaded_vods": True,
         "uploaded_vods_folder": str(runtime_paths.uploaded_vods_folder),
         "youtube_title_template": "{streamer} VOD - {date_de} - {title}",
