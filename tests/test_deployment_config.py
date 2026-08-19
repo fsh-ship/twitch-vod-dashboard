@@ -277,6 +277,15 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("pytest>=9.0,<10", development)
         self.assertIn('"gunicorn>=23,<24"', dockerfile)
 
+    def test_production_image_installs_ffmpeg_once(self):
+        dockerfile = read_text("Dockerfile")
+
+        self.assertIn(
+            "apt-get install -y --no-install-recommends ffmpeg",
+            dockerfile,
+        )
+        self.assertEqual(dockerfile.split().count("ffmpeg"), 1)
+
     def test_linux_ci_runs_supported_python_matrix_and_offline_checks(self):
         workflow = read_text(".github/workflows/ci.yml")
 

@@ -247,6 +247,8 @@ def build_download_command(
     )
     command = base_command + cookie_arguments + [
         "--ignore-errors",
+        "--downloader",
+        "m3u8:ffmpeg",
         "-a",
         str(list_path),
         "-N",

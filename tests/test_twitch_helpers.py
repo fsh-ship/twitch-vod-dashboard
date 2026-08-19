@@ -305,6 +305,8 @@ class YtDlpIntegrationHelperTests(unittest.TestCase):
                     "-m",
                     "yt_dlp",
                     "--ignore-errors",
+                    "--downloader",
+                    "m3u8:ffmpeg",
                     "-a",
                     str(url_file),
                     "-N",
@@ -328,6 +330,11 @@ class YtDlpIntegrationHelperTests(unittest.TestCase):
                     "--limit-rate",
                     "5M",
                 ],
+            )
+            self.assertEqual(command.count("--downloader"), 1)
+            self.assertEqual(
+                command[command.index("--downloader") + 1],
+                "m3u8:ffmpeg",
             )
             self.assertEqual(
                 url_file.read_text(encoding="utf-8"),

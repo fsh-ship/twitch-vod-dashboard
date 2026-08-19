@@ -931,6 +931,11 @@ class TwitchContractTests(IsolatedDashboardTestCase):
         )
         try:
             self.assertEqual(command[:3], [sys.executable, "-m", "yt_dlp"])
+            self.assertEqual(command.count("--downloader"), 1)
+            self.assertEqual(
+                command[command.index("--downloader") + 1],
+                "m3u8:ffmpeg",
+            )
             self.assertIn("--cookies", command)
             self.assertEqual(command[command.index("--cookies") + 1], str(cookie_file))
             self.assertNotIn("--cookies-from-browser", command)
