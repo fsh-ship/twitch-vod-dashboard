@@ -421,6 +421,189 @@ class YtDlpIntegrationHelperTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "detail failed"):
                 twitch.run_ytdlp_vod_detail("vod", self.settings)
 
+    def test_live_status_command_cookies_and_safe_metadata_normalization(self):
+        cookie_file = self.base / "cookies.txt"
+        cookie_file.write_text(
+            "# Netscape HTTP Cookie File\n", encoding="utf-8"
+        )
+        metadata = {
+            "id": "987654321",
+            "title": "Nika (live)",
+            "description": "Mein echter Streamtitel",
+            "uploader": "Nika LiveTV",
+            "uploader_id": "Nika_LiveTV",
+            "timestamp": 1_700_000_000,
+            "is_live": True,
+            "live_status": "is_live",
+            "formats": [
+                {
+                    "format_id": "Source",
+                    "format_note": "Source",
+                    "height": 1080,
+                    "fps": 60,
+                    "url": "https://signed.invalid/master.m3u8?token=SECRET",
+                    "http_headers": {"Authorization": "SECRET"},
+                },
+                {"format_id": "1080p60", "height": 1080, "fps": 60},
+                {"format_id": "1080p60 duplicate", "height": 1080, "fps": 60},
+                {"format_id": "720p60", "height": 720, "fps": 60},
+                {"format_id": "720p", "height": 720, "fps": 30},
+                {"format_id": "480p", "height": 480, "fps": 60},
+                {"format_id": "audio_only", "vcodec": "none"},
+                {"format_id": "hls-technical"},
+            ],
+            "manifest_url": "https://signed.invalid/SECRET",
+            "token": "SECRET",
+        }
+        success = SimpleNamespace(
+            returncode=0, stdout=json.dumps(metadata), stderr=""
+        )
+        settings = {**self.settings, "cookie_file": str(cookie_file)}
+
+        with mock.patch(
+            "vod_dashboard.twitch.subprocess.run", return_value=success
+        ) as run:
+            result = twitch.run_ytdlp_live_status(
+                "@Nika_LiveTV",
+                settings,
+                command_factory=lambda: ["python", "-m", "yt_dlp"],
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "streamer": "nika_livetv",
+                "state": "live",
+                "display_name": "Nika LiveTV",
+                "stream_id": "987654321",
+                "title": "Mein echter Streamtitel",
+                "started_at": "2023-11-14T22:13:20Z",
+                "qualities": [
+                    "Source",
+                    "1080p60",
+                    "720p60",
+                    "720p",
+                    "480p60",
+                ],
+            },
+        )
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command,
+            [
+                "python",
+                "-m",
+                "yt_dlp",
+                "--dump-single-json",
+                "--skip-download",
+                "--no-playlist",
+                "--cookies",
+                str(cookie_file),
+                "https://www.twitch.tv/nika_livetv",
+            ],
+        )
+        self.assertEqual(
+            run.call_args.kwargs,
+            {"capture_output": True, "text": True, "timeout": 180},
+        )
+        for forbidden in (
+            "--download-archive",
+            "--write-info-json",
+            "--downloader",
+            "-P",
+            "-o",
+        ):
+            self.assertNotIn(forbidden, command)
+        serialized = json.dumps(result)
+        for secret in (
+            "url",
+            "manifest_url",
+            "http_headers",
+            "cookies",
+            "token",
+            "SECRET",
+        ):
+            self.assertNotIn(secret, serialized)
+
+    def test_live_status_offline_is_narrow_and_other_failures_remain_errors(self):
+        offline = SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr=(
+                "ERROR: [twitch:stream] nika_livetv: "
+                "The channel is not currently live"
+            ),
+        )
+        with mock.patch(
+            "vod_dashboard.twitch.subprocess.run", return_value=offline
+        ):
+            self.assertEqual(
+                twitch.run_ytdlp_live_status("Nika_LiveTV", self.settings),
+                {"streamer": "nika_livetv", "state": "offline"},
+            )
+
+        network_failure = SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="ERROR: unable to download Twitch GraphQL metadata",
+        )
+        with mock.patch(
+            "vod_dashboard.twitch.subprocess.run", return_value=network_failure
+        ):
+            with self.assertRaisesRegex(RuntimeError, "failed with code 1"):
+                twitch.run_ytdlp_live_status("nika_livetv", self.settings)
+
+    def test_live_status_start_time_fallback_missing_and_title_fallback(self):
+        cases = (
+            (
+                {
+                    "id": "1",
+                    "title": "Fallback title",
+                    "description": "",
+                    "upload_date": "20260823",
+                    "is_live": True,
+                },
+                "2026-08-23",
+                "Fallback title",
+            ),
+            (
+                {
+                    "id": "2",
+                    "title": "No date",
+                    "timestamp": "invalid",
+                    "upload_date": "invalid",
+                    "is_live": True,
+                },
+                None,
+                "No date",
+            ),
+        )
+        for metadata, expected_start, expected_title in cases:
+            with self.subTest(metadata=metadata), mock.patch(
+                "vod_dashboard.twitch.subprocess.run",
+                return_value=SimpleNamespace(
+                    returncode=0, stdout=json.dumps(metadata), stderr=""
+                ),
+            ):
+                result = twitch.run_ytdlp_live_status(
+                    "nika_livetv", self.settings
+                )
+            self.assertEqual(result["started_at"], expected_start)
+            self.assertEqual(result["title"], expected_title)
+
+    def test_live_status_rejects_invalid_login_and_indefinite_metadata(self):
+        with self.assertRaisesRegex(ValueError, "valid Twitch streamer"):
+            twitch.run_ytdlp_live_status("bad-name!", self.settings)
+
+        ambiguous = SimpleNamespace(
+            returncode=0, stdout=json.dumps({"id": "1"}), stderr=""
+        )
+        with mock.patch(
+            "vod_dashboard.twitch.subprocess.run", return_value=ambiguous
+        ):
+            with self.assertRaisesRegex(RuntimeError, "definitive live state"):
+                twitch.run_ytdlp_live_status("nika_livetv", self.settings)
+
     def test_source_fallback_deduplication_and_malformed_output(self):
         first = SimpleNamespace(
             returncode=1, stdout="", stderr="first source failed"

@@ -1346,6 +1346,17 @@ def run_ytdlp_vod_detail(url: str, settings: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+def run_ytdlp_live_status(
+    streamer: str, settings: Dict[str, Any]
+) -> Dict[str, Any]:
+    return dashboard_twitch.run_ytdlp_live_status(
+        streamer,
+        settings,
+        command_factory=ytdlp_base_command,
+        cookie_args_factory=ytdlp_cookie_args,
+    )
+
+
 def run_ytdlp_json_sources(streamer: str, limit: Any = None, settings: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     return dashboard_twitch.run_ytdlp_json_sources(
         streamer,
@@ -1389,6 +1400,38 @@ def api_search():
     )
     return jsonify(payload)
 
+
+
+@app.get("/api/live/status")
+def api_live_status():
+    raw_streamer = request.args.get("streamer")
+    canonical_login = dashboard_settings.canonical_streamer_login(raw_streamer)
+    if not canonical_login:
+        return jsonify({"error": "A valid Twitch streamer is required."}), 400
+
+    settings = load_settings()
+    configured_logins = {
+        dashboard_settings.canonical_streamer_login(streamer)
+        for streamer in read_streamers(settings)
+    }
+    if canonical_login not in configured_logins:
+        return jsonify(
+            {
+                "error": "The Twitch streamer is not configured.",
+                "streamer": canonical_login,
+            }
+        ), 404
+
+    try:
+        return jsonify(run_ytdlp_live_status(canonical_login, settings))
+    except Exception as exc:
+        log_line(f"Live status query failed for {canonical_login}: {exc}")
+        return jsonify(
+            {
+                "error": "The Twitch live status could not be retrieved.",
+                "streamer": canonical_login,
+            }
+        ), 502
 
 
 @app.post("/api/vod/validate")

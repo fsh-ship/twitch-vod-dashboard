@@ -223,6 +223,186 @@ def _command_parts(
     return command, cookie_arguments
 
 
+_TWITCH_LOGIN_RE = re.compile(r"[A-Za-z0-9_]{1,25}")
+_TWITCH_NOT_LIVE_RE = re.compile(
+    r"\b(?:the\s+)?(?:channel|user)\s+is\s+not\s+currently\s+live\b",
+    re.IGNORECASE,
+)
+_TWITCH_QUALITY_RE = re.compile(
+    r"(?<!\d)(\d{3,4})p(?:([1-9]\d{1,2}))?\b", re.IGNORECASE
+)
+
+
+def _canonical_live_streamer_login(value: Any) -> str:
+    login = str(value or "").strip().lstrip("@").lower()
+    return login if _TWITCH_LOGIN_RE.fullmatch(login) else ""
+
+
+def _live_started_at(metadata: Dict[str, Any]) -> Optional[str]:
+    timestamp = metadata.get("timestamp")
+    if timestamp is not None and timestamp != "":
+        try:
+            numeric = float(timestamp)
+            if numeric >= 0:
+                return datetime.fromtimestamp(
+                    numeric, tz=timezone.utc
+                ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+
+    upload_date = parse_date(str(metadata.get("upload_date") or ""))
+    return upload_date.strftime("%Y-%m-%d") if upload_date else None
+
+
+def _live_quality_labels(formats: Any) -> List[str]:
+    labels: set[str] = set()
+    for raw_format in formats if isinstance(formats, list) else []:
+        if not isinstance(raw_format, dict):
+            continue
+        format_id = str(raw_format.get("format_id") or "").strip()
+        format_note = str(raw_format.get("format_note") or "").strip()
+        if (
+            str(raw_format.get("vcodec") or "").lower() == "none"
+            or "audio only" in format_note.lower()
+            or format_id.lower() in {"audio", "audio_only", "storyboard"}
+        ):
+            continue
+
+        descriptive = " ".join(
+            filter(
+                None,
+                (
+                    format_id,
+                    format_note,
+                    str(raw_format.get("resolution") or "").strip(),
+                ),
+            )
+        )
+        if "source" in descriptive.lower() or format_id.lower() == "chunked":
+            labels.add("Source")
+            continue
+
+        match = _TWITCH_QUALITY_RE.search(descriptive)
+        if match:
+            height = int(match.group(1))
+            try:
+                frame_rate = int(
+                    match.group(2) or round(float(raw_format.get("fps") or 0))
+                )
+            except (TypeError, ValueError, OverflowError):
+                frame_rate = 0
+        else:
+            try:
+                height = int(float(raw_format.get("height")))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            try:
+                frame_rate = int(round(float(raw_format.get("fps") or 0)))
+            except (TypeError, ValueError, OverflowError):
+                frame_rate = 0
+
+        if height <= 0:
+            continue
+        suffix = str(frame_rate) if frame_rate >= 50 else ""
+        labels.add(f"{height}p{suffix}")
+
+    def sort_key(label: str) -> tuple[int, int, int]:
+        if label == "Source":
+            return (0, 0, 0)
+        match = _TWITCH_QUALITY_RE.fullmatch(label)
+        return (
+            1,
+            -int(match.group(1)) if match else 0,
+            -int(match.group(2) or 0) if match else 0,
+        )
+
+    return sorted(labels, key=sort_key)
+
+
+def run_ytdlp_live_status(
+    streamer: str,
+    settings: Dict[str, Any],
+    *,
+    command_factory: Optional[Callable[[], List[str]]] = None,
+    cookie_args_factory: Optional[
+        Callable[[Dict[str, Any]], List[str]]
+    ] = None,
+) -> Dict[str, Any]:
+    """Return a safe, read-only status payload for one Twitch channel."""
+    canonical_login = _canonical_live_streamer_login(streamer)
+    if not canonical_login:
+        raise ValueError("A valid Twitch streamer login is required.")
+
+    base_command, cookie_arguments = _command_parts(
+        settings, command_factory, cookie_args_factory
+    )
+    channel_url = f"https://www.twitch.tv/{canonical_login}"
+    command = base_command + [
+        "--dump-single-json",
+        "--skip-download",
+        "--no-playlist",
+    ]
+    command.extend(cookie_arguments)
+    command.append(channel_url)
+
+    try:
+        process = subprocess.run(
+            command, capture_output=True, text=True, timeout=180
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("The Twitch live-status query timed out.") from exc
+
+    combined_output = "\n".join(
+        filter(None, (process.stderr or "", process.stdout or ""))
+    )
+    if process.returncode != 0:
+        if _TWITCH_NOT_LIVE_RE.search(combined_output):
+            return {"streamer": canonical_login, "state": "offline"}
+        raise RuntimeError(
+            f"The Twitch live-status query failed with code {process.returncode}."
+        )
+
+    if not (process.stdout or "").strip():
+        raise RuntimeError("The Twitch live-status query returned no metadata.")
+    try:
+        metadata = json.loads(process.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "The Twitch live-status query returned invalid metadata."
+        ) from exc
+    if not isinstance(metadata, dict):
+        raise RuntimeError("The Twitch live-status query returned invalid metadata.")
+
+    live_status = str(metadata.get("live_status") or "").strip().lower()
+    if metadata.get("is_live") is not True and live_status != "is_live":
+        if metadata.get("is_live") is False or live_status in {
+            "not_live",
+            "post_live",
+            "was_live",
+        }:
+            return {"streamer": canonical_login, "state": "offline"}
+        raise RuntimeError(
+            "The Twitch live-status query did not return a definitive live state."
+        )
+
+    broadcast_title = str(metadata.get("description") or "").strip()
+    if not broadcast_title:
+        broadcast_title = str(metadata.get("title") or "").strip()
+    display_name = str(
+        metadata.get("uploader") or metadata.get("channel") or canonical_login
+    ).strip()
+
+    return {
+        "streamer": canonical_login,
+        "state": "live",
+        "display_name": display_name,
+        "stream_id": str(metadata.get("id") or "").strip(),
+        "title": broadcast_title,
+        "started_at": _live_started_at(metadata),
+        "qualities": _live_quality_labels(metadata.get("formats")),
+    }
+
+
 def build_download_command(
     urls: List[str],
     settings: Dict[str, Any],

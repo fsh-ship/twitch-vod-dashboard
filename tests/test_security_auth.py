@@ -122,6 +122,12 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertIn("Authentication", response.get_json()["error"])
 
+        live_response = self.client.get(
+            "/api/live/status?streamer=nika_livetv"
+        )
+        self.assertEqual(live_response.status_code, 401)
+        self.assertIn("Authentication", live_response.get_json()["error"])
+
     def test_successful_login_rotates_session_state_and_sets_secure_cookie_flags(self):
         response, pre_login_token = self.login()
         self.assertEqual(response.status_code, 302)

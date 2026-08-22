@@ -224,6 +224,7 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
             ),
             ("/api/streamers", "POST", "api_streamers"),
             ("/api/search", "POST", "api_search"),
+            ("/api/live/status", "GET", "api_live_status"),
             ("/api/vod/validate", "POST", "api_vod_validate"),
             ("/api/download", "POST", "api_download"),
             ("/api/jobs", "GET", "api_jobs"),
@@ -945,6 +946,24 @@ class TwitchContractTests(IsolatedDashboardTestCase):
         )
 
         with mock.patch.object(
+            twitch_helpers,
+            "run_ytdlp_live_status",
+            return_value={"streamer": "streamer", "state": "offline"},
+        ) as moved_live_status:
+            self.assertEqual(
+                dashboard.run_ytdlp_live_status("streamer", configured),
+                {"streamer": "streamer", "state": "offline"},
+            )
+        self.assertIs(
+            moved_live_status.call_args.kwargs["command_factory"],
+            dashboard.ytdlp_base_command,
+        )
+        self.assertIs(
+            moved_live_status.call_args.kwargs["cookie_args_factory"],
+            dashboard.ytdlp_cookie_args,
+        )
+
+        with mock.patch.object(
             twitch_helpers, "run_ytdlp_json_sources", return_value=[]
         ) as moved_sources:
             self.assertEqual(
@@ -1006,6 +1025,83 @@ class TwitchContractTests(IsolatedDashboardTestCase):
                 }
             )
         )
+
+    def test_live_status_api_validates_configured_streamer_case_insensitively(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "Nika_LiveTV\n", encoding="utf-8"
+        )
+        live_payload = {
+            "streamer": "nika_livetv",
+            "state": "live",
+            "display_name": "Nika LiveTV",
+            "stream_id": "987654321",
+            "title": "Real broadcast title",
+            "started_at": "2026-08-23T18:00:00Z",
+            "qualities": ["Source", "1080p60"],
+        }
+        with mock.patch.object(
+            dashboard, "run_ytdlp_live_status", return_value=live_payload
+        ) as status_query:
+            response = self.client.get(
+                "/api/live/status?streamer=nika_livetv"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), live_payload)
+        self.assertEqual(status_query.call_args.args[0], "nika_livetv")
+        self.assertEqual(
+            status_query.call_args.args[1]["streamer_file"],
+            str(self.runtime_dir / "streamer.txt"),
+        )
+
+    def test_live_status_api_offline_is_success(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "nika_livetv\n", encoding="utf-8"
+        )
+        with mock.patch.object(
+            dashboard,
+            "run_ytdlp_live_status",
+            return_value={"streamer": "nika_livetv", "state": "offline"},
+        ):
+            response = self.client.get(
+                "/api/live/status?streamer=@Nika_LiveTV"
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json(),
+            {"streamer": "nika_livetv", "state": "offline"},
+        )
+
+    def test_live_status_api_rejects_invalid_and_unconfigured_streamers(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "nika_livetv\n", encoding="utf-8"
+        )
+        invalid = self.client.get("/api/live/status?streamer=bad-name!")
+        missing = self.client.get("/api/live/status?streamer=other_streamer")
+
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.get_json()["streamer"], "other_streamer")
+
+    def test_live_status_api_unexpected_failure_is_generic_502(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "nika_livetv\n", encoding="utf-8"
+        )
+        with mock.patch.object(
+            dashboard,
+            "run_ytdlp_live_status",
+            side_effect=RuntimeError(
+                "signed URL https://secret.invalid/?token=DO-NOT-LEAK"
+            ),
+        ), mock.patch.object(dashboard, "log_line"):
+            response = self.client.get(
+                "/api/live/status?streamer=nika_livetv"
+            )
+
+        self.assertEqual(response.status_code, 502)
+        serialized = json.dumps(response.get_json())
+        self.assertNotIn("secret.invalid", serialized)
+        self.assertNotIn("DO-NOT-LEAK", serialized)
 
     def test_ytdlp_download_arguments_and_cookie_precedence_are_frozen(self):
         cookie_file = self.runtime_dir / "twitch-cookies.txt"
