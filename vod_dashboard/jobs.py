@@ -1544,6 +1544,19 @@ def run_upload_job(
             initial_job.get("playlist_id") or ""
         ).strip()
     paths = list(initial_job.get("urls") or [])
+    item_metadata = initial_job.get("item_metadata")
+    if not isinstance(item_metadata, list):
+        item_metadata = []
+    has_item_playlists = any(
+        isinstance(metadata, dict)
+        and "youtube_playlist_id" in metadata
+        for metadata in item_metadata
+    )
+    playlist_summary = (
+        "per-item"
+        if has_item_playlists
+        else settings.get("youtube_playlist_id") or "none"
+    )
     dependencies.append_log(
         job_id, f"Starting local YouTube upload: {len(paths)} file(s)"
     )
@@ -1552,7 +1565,7 @@ def run_upload_job(
         "YouTube Settings: "
         f"enabled={bool(settings.get('youtube_enabled'))}, "
         f"privacy={settings.get('youtube_privacy_status')}, "
-        f"playlist={settings.get('youtube_playlist_id') or 'none'}",
+        f"playlist={playlist_summary}",
     )
     if not settings.get("youtube_enabled"):
         dependencies.append_log(
@@ -1574,10 +1587,24 @@ def run_upload_job(
                 job_id, item_number, "running", progress=0
             )
             try:
-                path = dependencies.safe_local_video_path(raw, settings)
+                item_settings = dict(settings)
+                item_index = int(claimed["index"])
+                metadata = (
+                    item_metadata[item_index]
+                    if item_index < len(item_metadata)
+                    else {}
+                )
+                if (
+                    isinstance(metadata, dict)
+                    and "youtube_playlist_id" in metadata
+                ):
+                    item_settings["youtube_playlist_id"] = str(
+                        metadata.get("youtube_playlist_id") or ""
+                    ).strip()
+                path = dependencies.safe_local_video_path(raw, item_settings)
                 dependencies.append_log(job_id, f"Uploading local VOD file: {path}")
                 video_id = dependencies.upload_to_youtube(
-                    path, settings, job_id=job_id, item_id=item_id
+                    path, item_settings, job_id=job_id, item_id=item_id
                 )
                 if manager.is_cancel_requested(job_id, item_id):
                     manager.finish_claimed_item(

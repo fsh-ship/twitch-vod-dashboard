@@ -236,6 +236,32 @@ class LocalYouTubeHelperTests(unittest.TestCase):
         self.assertEqual(metadata["duration"], "")
         self.assertEqual(metadata["filepath"], str(video))
 
+    def test_metadata_streamer_identity_uses_stable_fallback_order(self):
+        video = self.make_video(folder="FolderFallback")
+        cases = (
+            (
+                {
+                    "uploader_id": "canonical_login",
+                    "uploader": "Display Name",
+                    "channel": "Channel Name",
+                },
+                "canonical_login",
+            ),
+            (
+                {"uploader": "Display Name", "channel": "Channel Name"},
+                "Display Name",
+            ),
+            ({"channel": "Channel Name"}, "Channel Name"),
+            ({}, "FolderFallback"),
+        )
+
+        for info, expected in cases:
+            with self.subTest(info=info, expected=expected):
+                metadata = self.metadata(
+                    video, info_loader=lambda _path, value=info: value
+                )
+                self.assertEqual(metadata["streamer"], expected)
+
     def test_metadata_and_templates_preserve_date_de_compatibility(self):
         video = self.make_video()
         self.write_info(video)

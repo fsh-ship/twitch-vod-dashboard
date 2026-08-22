@@ -431,6 +431,25 @@ def streamer_profile_for(
     return dict(profile or {})
 
 
+def resolve_youtube_playlist_for_streamer(
+    settings: Mapping[str, Any],
+    streamer_login: Any,
+    *,
+    explicit_playlist: Optional[Any] = None,
+) -> str:
+    """Resolve one upload item's playlist without mutating settings."""
+    if explicit_playlist is not None:
+        return str(explicit_playlist or "").strip()
+
+    profile = streamer_profile_for(settings, streamer_login)
+    profile_playlist = str(
+        profile.get("youtube_playlist_id") or ""
+    ).strip()
+    if profile_playlist:
+        return profile_playlist
+    return str(settings.get("youtube_playlist_id") or "").strip()
+
+
 def read_streamers_from_path(path: Path) -> List[str]:
     if not path.exists():
         return []

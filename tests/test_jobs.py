@@ -1067,6 +1067,76 @@ class UploadWorkerTests(unittest.TestCase):
             upload.call_args.args[1]["youtube_playlist_id"], ""
         )
 
+    def test_mixed_batch_uses_each_frozen_item_playlist(self):
+        paths = [self.root / "one.mp4", self.root / "two.mp4"]
+        upload = mock.Mock(side_effect=["id-1", "id-2"])
+        job_id = self.manager.create_upload_job(
+            [str(path) for path in paths],
+            "Upload",
+            playlist_id="legacy-job-playlist",
+            item_metadata=[
+                {
+                    "streamer": "streamer_a",
+                    "youtube_playlist_id": "PLAYLIST_A",
+                },
+                {
+                    "streamer": "streamer_b",
+                    "youtube_playlist_id": "PLAYLIST_B",
+                },
+            ],
+        )
+        dependencies = UploadWorkerDependencies(
+            load_settings=lambda: {
+                **self.settings,
+                "youtube_playlist_id": "changed-global",
+            },
+            append_log=self.manager.append_job_log,
+            get_youtube_service=mock.Mock(),
+            safe_local_video_path=mock.Mock(
+                side_effect=lambda raw, _settings: Path(raw)
+            ),
+            upload_to_youtube=upload,
+        )
+
+        run_upload_job(job_id, self.manager, dependencies)
+
+        self.assertEqual(
+            [
+                call.args[1]["youtube_playlist_id"]
+                for call in upload.call_args_list
+            ],
+            ["PLAYLIST_A", "PLAYLIST_B"],
+        )
+        self.assertIn(
+            "YouTube Settings: enabled=True, privacy=private, playlist=per-item",
+            self.manager.jobs[job_id]["log"],
+        )
+
+    def test_frozen_empty_item_playlist_overrides_job_and_global(self):
+        video = self.root / "one.mp4"
+        upload = mock.Mock(return_value="id-1")
+        job_id = self.manager.create_upload_job(
+            [str(video)],
+            "Upload",
+            playlist_id="legacy-job-playlist",
+            item_metadata=[{"youtube_playlist_id": ""}],
+        )
+        dependencies = UploadWorkerDependencies(
+            load_settings=lambda: dict(self.settings),
+            append_log=self.manager.append_job_log,
+            get_youtube_service=mock.Mock(),
+            safe_local_video_path=mock.Mock(
+                side_effect=lambda raw, _settings: Path(raw)
+            ),
+            upload_to_youtube=upload,
+        )
+
+        run_upload_job(job_id, self.manager, dependencies)
+
+        self.assertEqual(
+            upload.call_args.args[1]["youtube_playlist_id"], ""
+        )
+
     def test_single_file_upload_success(self):
         video = self.root / "one.mp4"
         upload = mock.Mock(return_value="id-1")
@@ -1266,6 +1336,115 @@ class AppJobCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(
             dashboard.jobs[job_id]["playlist_id"], "playlist-default"
+        )
+        self.assertEqual(
+            dashboard.jobs[job_id]["item_metadata"][0][
+                "youtube_playlist_id"
+            ],
+            "playlist-default",
+        )
+
+    def test_create_upload_job_freezes_mixed_streamer_playlists_per_item(self):
+        configured = {
+            "youtube_playlist_id": "GLOBAL",
+            "streamer_profiles": {
+                "digitalgirluli": {"youtube_playlist_id": "PLAYLIST_A"},
+                "nika_livetv": {"youtube_playlist_id": "PLAYLIST_B"},
+            },
+            "youtube_uploaded_files": [],
+        }
+        metadata = [
+            {
+                "streamer": "DigitalGirlUli",
+                "date_de": "2026-08-22",
+                "title": "First VOD",
+                "vod_id": "123",
+                "size_bytes": 100,
+                "size_gb": 0.0,
+            },
+            {
+                "streamer": "nika_livetv",
+                "date_de": "2026-08-22",
+                "title": "Second VOD",
+                "vod_id": "456",
+                "size_bytes": 200,
+                "size_gb": 0.0,
+            },
+        ]
+        with mock.patch.object(
+            dashboard, "load_settings", return_value=configured
+        ), mock.patch.object(
+            dashboard,
+            "safe_local_video_path",
+            side_effect=lambda raw, _settings: Path(raw),
+        ), mock.patch.object(
+            dashboard,
+            "local_video_metadata_payload",
+            side_effect=metadata,
+        ), mock.patch.object(
+            dashboard.JOB_MANAGER, "start_worker"
+        ):
+            job_id = dashboard.create_upload_job(
+                ["C:/media/first.mp4", "C:/media/second.mp4"]
+            )
+
+        job = dashboard.jobs[job_id]
+        self.assertEqual(job["playlist_id"], "GLOBAL")
+        self.assertEqual(
+            [
+                item["youtube_playlist_id"]
+                for item in job["item_metadata"]
+            ],
+            ["PLAYLIST_A", "PLAYLIST_B"],
+        )
+
+        configured["youtube_playlist_id"] = "CHANGED_GLOBAL"
+        configured["streamer_profiles"]["digitalgirluli"][
+            "youtube_playlist_id"
+        ] = "CHANGED_A"
+        self.assertEqual(
+            [
+                item["youtube_playlist_id"]
+                for item in job["item_metadata"]
+            ],
+            ["PLAYLIST_A", "PLAYLIST_B"],
+        )
+
+    def test_create_upload_job_freezes_explicit_no_playlist_per_item(self):
+        configured = {
+            "youtube_playlist_id": "GLOBAL",
+            "streamer_profiles": {
+                "example": {"youtube_playlist_id": "STREAMER"}
+            },
+            "youtube_uploaded_files": [],
+        }
+        metadata = {
+            "streamer": "Example",
+            "date_de": "2026-08-22",
+            "title": "VOD",
+            "vod_id": "123",
+            "size_bytes": 100,
+            "size_gb": 0.0,
+        }
+        with mock.patch.object(
+            dashboard, "load_settings", return_value=configured
+        ), mock.patch.object(
+            dashboard,
+            "safe_local_video_path",
+            side_effect=lambda raw, _settings: Path(raw),
+        ), mock.patch.object(
+            dashboard, "local_video_metadata_payload", return_value=metadata
+        ), mock.patch.object(
+            dashboard.JOB_MANAGER, "start_worker"
+        ):
+            job_id = dashboard.create_upload_job(
+                ["C:/media/no-playlist.mp4"], playlist_id=""
+            )
+
+        job = dashboard.jobs[job_id]
+        self.assertEqual(job["playlist_id"], "")
+        self.assertEqual(
+            job["item_metadata"][0]["youtube_playlist_id"], ""
         )
 
     def test_patched_app_registry_lock_and_counter_are_honored(self):

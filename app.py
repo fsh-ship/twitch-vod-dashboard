@@ -828,14 +828,23 @@ def create_upload_job(
         if payload.get("already_uploaded"):
             raise RuntimeError("This VOD is already in uploaded history.")
         clean_paths.append(str(p))
+        streamer = payload.get("streamer") or ""
+        item_playlist_id = (
+            dashboard_settings.resolve_youtube_playlist_for_streamer(
+                settings,
+                streamer,
+                explicit_playlist=playlist_id,
+            )
+        )
         item_metadata.append({
-            "streamer": payload.get("streamer") or "",
+            "streamer": streamer,
             "date": payload.get("date_de") or "",
             "title": payload.get("title") or payload.get("youtube_title") or p.name,
             "vod_id": payload.get("vod_id") or "",
             "name": p.name,
             "size_bytes": payload.get("size_bytes"),
             "size_gb": payload.get("size_gb"),
+            "youtube_playlist_id": item_playlist_id,
         })
     if not clean_paths:
         raise RuntimeError("No valid VOD files were provided for upload.")

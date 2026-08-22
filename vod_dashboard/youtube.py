@@ -821,7 +821,12 @@ def metadata_from_path(
     url = str(info.get("webpage_url") or info.get("original_url") or "")
     if not url and vod_id:
         url = f"https://www.twitch.tv/videos/{vod_id}"
-    streamer = str(info.get("uploader") or info.get("channel") or "")
+    streamer = str(
+        info.get("uploader_id")
+        or info.get("uploader")
+        or info.get("channel")
+        or ""
+    )
     if not streamer:
         try:
             streamer = path.parent.name if path.parent.name else ""

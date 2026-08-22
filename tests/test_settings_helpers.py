@@ -256,6 +256,40 @@ class SettingsRepositoryTests(unittest.TestCase):
             {"youtube_playlist_id": "STREAMER-PLAYLIST"},
         )
 
+    def test_youtube_playlist_resolution_priority_and_fallbacks(self):
+        configured = {
+            "youtube_playlist_id": "GLOBAL",
+            "streamer_profiles": {
+                "digitalgirluli": {
+                    "youtube_playlist_id": "DIGI"
+                }
+            },
+        }
+
+        cases = (
+            ("DigitalGirlUli", None, "DIGI"),
+            ("unknown_streamer", None, "GLOBAL"),
+            ("", None, "GLOBAL"),
+            ("DigitalGirlUli", " SPECIAL ", "SPECIAL"),
+            ("DigitalGirlUli", "", ""),
+            ("DigitalGirlUli", "   ", ""),
+        )
+        for streamer, explicit, expected in cases:
+            with self.subTest(
+                streamer=streamer, explicit=explicit, expected=expected
+            ):
+                kwargs = (
+                    {}
+                    if explicit is None
+                    else {"explicit_playlist": explicit}
+                )
+                self.assertEqual(
+                    settings.resolve_youtube_playlist_for_streamer(
+                        configured, streamer, **kwargs
+                    ),
+                    expected,
+                )
+
     def test_bool_normalization_including_legacy_values(self):
         truthy = (True, 1, 2.5, "1", "true", "yes", "ja", "on", "an")
         falsy = (False, 0, 0.0, "0", "false", "no", "nein", "off", "aus", "")
