@@ -933,6 +933,32 @@ class TwitchContractTests(IsolatedDashboardTestCase):
         self.assertIs(kwargs["cookie_args_factory"], dashboard.ytdlp_cookie_args)
 
         with mock.patch.object(
+            twitch_helpers,
+            "build_live_recording_command",
+            return_value=["recording-command"],
+        ) as moved_recording_build:
+            self.assertEqual(
+                dashboard.build_live_recording_command(
+                    "streamer", configured
+                ),
+                ["recording-command"],
+            )
+        recording_args = moved_recording_build.call_args.args
+        recording_kwargs = moved_recording_build.call_args.kwargs
+        self.assertEqual(recording_args, ("streamer", configured))
+        self.assertEqual(
+            recording_kwargs["download_directory"],
+            (self.media_root / "active-downloads").resolve(),
+        )
+        self.assertIs(
+            recording_kwargs["command_factory"], dashboard.ytdlp_base_command
+        )
+        self.assertIs(
+            recording_kwargs["cookie_args_factory"],
+            dashboard.ytdlp_cookie_args,
+        )
+
+        with mock.patch.object(
             twitch_helpers, "run_ytdlp_vod_detail", return_value={"id": "1"}
         ) as moved_detail:
             self.assertEqual(dashboard.run_ytdlp_vod_detail("vod", configured), {"id": "1"})
@@ -1102,6 +1128,83 @@ class TwitchContractTests(IsolatedDashboardTestCase):
         serialized = json.dumps(response.get_json())
         self.assertNotIn("secret.invalid", serialized)
         self.assertNotIn("DO-NOT-LEAK", serialized)
+
+    def test_internal_recording_creation_uses_allowlist_and_starts_worker(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "Nika_LiveTV\n", encoding="utf-8"
+        )
+        manager = mock.Mock()
+        manager.create_recording_job.return_value = "recording-7"
+        configured = self.settings(quality="1080p60/source/best")
+        live_metadata = {
+            "state": "live",
+            "stream_id": "987654321",
+            "title": "Actual stream title",
+            "started_at": "2026-08-23T18:00:00Z",
+            "manifest_url": "https://signed.invalid/SECRET",
+        }
+
+        with mock.patch.object(
+            dashboard, "load_settings", return_value=configured
+        ), mock.patch.object(
+            dashboard,
+            "_job_manager_for_compatibility",
+            return_value=manager,
+        ):
+            job_id = dashboard.create_recording_job(
+                "@NIKA_LIVETV", live_metadata
+            )
+
+        self.assertEqual(job_id, "recording-7")
+        kwargs = manager.create_recording_job.call_args.kwargs
+        self.assertEqual(
+            manager.create_recording_job.call_args.args, ("nika_livetv",)
+        )
+        self.assertEqual(kwargs["stream_id"], "987654321")
+        self.assertEqual(kwargs["title"], "Actual stream title")
+        self.assertEqual(kwargs["quality"], "1080p60/source/best")
+        self.assertNotIn("manifest_url", kwargs)
+        self.assertNotIn("signed.invalid", json.dumps(kwargs, default=str))
+        manager.start_worker.assert_called_once_with(
+            dashboard.run_recording_job, "recording-7"
+        )
+
+    def test_internal_recording_creation_rejects_unconfigured_or_offline(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "nika_livetv\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(RuntimeError, "not configured"):
+            dashboard.create_recording_job(
+                "other_streamer", {"state": "live"}
+            )
+        with self.assertRaisesRegex(RuntimeError, "not currently live"):
+            dashboard.create_recording_job(
+                "nika_livetv", {"state": "offline"}
+            )
+
+    def test_recording_output_resolution_is_relative_complete_and_contained(self):
+        recording = self.media_root / "nika_livetv" / "recording.mp4"
+        recording.parent.mkdir(parents=True, exist_ok=True)
+        recording.write_bytes(b"video")
+        partial = recording.with_suffix(".mp4.part")
+        partial.write_bytes(b"partial")
+        outside = self.base / "outside-recording.mp4"
+        outside.write_bytes(b"video")
+
+        self.assertEqual(
+            dashboard.resolve_completed_recording_output(
+                recording, self.settings()
+            ),
+            "nika_livetv/recording.mp4",
+        )
+        with self.assertRaises(RuntimeError):
+            dashboard.resolve_completed_recording_output(
+                partial, self.settings()
+            )
+        with self.assertRaises(RuntimeError):
+            dashboard.resolve_completed_recording_output(
+                outside, self.settings()
+            )
 
     def test_ytdlp_download_arguments_and_cookie_precedence_are_frozen(self):
         cookie_file = self.runtime_dir / "twitch-cookies.txt"

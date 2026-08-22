@@ -26,6 +26,7 @@ MIN_UPLOAD_ETA_SPEED_BPS = 1024.0
 ITEM_STATES = {
     "queued",
     "running",
+    "stopping",
     "cancelling",
     "completed",
     "failed",
@@ -42,6 +43,7 @@ LEGACY_TO_ITEM_STATE = {
 ITEM_STATE_TO_LEGACY = {
     "queued": "wartet",
     "running": "läuft",
+    "stopping": "läuft",
     "cancelling": "läuft",
     "completed": "fertig",
     "failed": "fehler",
@@ -210,6 +212,17 @@ class DownloadWorkerDependencies:
 
 
 @dataclass(frozen=True)
+class RecordingWorkerDependencies:
+    load_settings: Callable[[], Dict[str, Any]]
+    append_log: Callable[[str, str], None]
+    build_recording_command: Callable[[str, Dict[str, Any]], list[str]]
+    download_directory: Callable[[Dict[str, Any]], Path]
+    resolve_completed_output: Callable[[Any, Dict[str, Any]], str]
+    output_marker: str
+    popen: Callable[..., Any] = subprocess.Popen
+
+
+@dataclass(frozen=True)
 class UploadWorkerDependencies:
     load_settings: Callable[[], Dict[str, Any]]
     append_log: Callable[[str, str], None]
@@ -246,9 +259,12 @@ class JobManager:
         self._lane_active: Dict[str, Optional[tuple[str, str]]] = {
             "download": None,
             "youtube_upload": None,
+            "recording": None,
         }
         self._cancel_events: Dict[tuple[str, str], threading.Event] = {}
         self._download_processes: Dict[tuple[str, str], Any] = {}
+        self._recording_processes: Dict[str, Any] = {}
+        self._recording_stop_events: Dict[str, threading.Event] = {}
 
     @classmethod
     def compatible_with(
@@ -280,6 +296,8 @@ class JobManager:
 
     @staticmethod
     def _lane_for_job(job: Job) -> str:
+        if job.get("type") == "recording":
+            return "recording"
         return (
             "youtube_upload"
             if job.get("type") == "youtube_upload"
@@ -324,6 +342,67 @@ class JobManager:
                 "item_failure_kinds": ["" for _ in urls],
                 "item_retry_job_ids": ["" for _ in urls],
                 "stop_after_current": False,
+                "log": [],
+                "returncode": None,
+            }
+        return job_id
+
+    def create_recording_job(
+        self,
+        streamer: str,
+        *,
+        stream_id: str = "",
+        title: str = "",
+        live_started_at: Optional[str] = None,
+        quality: str = "source/best",
+        output_name: str = "",
+        counter_getter: Optional[CounterGetter] = None,
+        counter_setter: Optional[CounterSetter] = None,
+    ) -> str:
+        """Create one exclusive process-local recording job."""
+        canonical_login = str(streamer or "").strip()
+        if not canonical_login:
+            raise ValueError("A Twitch streamer is required.")
+        with self.lock:
+            for existing in self.jobs.values():
+                if existing.get("type") != "recording":
+                    continue
+                if existing.get("state") in {"queued", "running", "stopping"}:
+                    raise RuntimeError(
+                        "A Twitch recording is already queued or active."
+                    )
+
+            job_id = self._next_job_id(counter_getter, counter_setter)
+            item_id = self._item_ids(job_id, 1)[0]
+            created_at = self._created_at()
+            self.jobs[job_id] = {
+                "id": job_id,
+                "label": f"Live recording: {canonical_login}",
+                "type": "recording",
+                "streamer": canonical_login,
+                "stream_id": str(stream_id or "").strip(),
+                "title": str(title or "").strip(),
+                "live_started_at": live_started_at,
+                "quality": str(quality or "source/best").strip(),
+                "output_name": str(output_name or "").strip(),
+                "output_path": None,
+                "output_complete": False,
+                "status": "wartet",
+                "state": "queued",
+                "created": created_at,
+                "created_at": created_at,
+                "updated_at": created_at,
+                "urls": [canonical_login],
+                "total_urls": 1,
+                "item_ids": [item_id],
+                "item_states": ["queued"],
+                "item_statuses": ["wartet"],
+                "item_resolved": [False],
+                "item_failure_kinds": [""],
+                "item_retry_job_ids": [""],
+                "recorded_seconds": 0.0,
+                "stop_requested": False,
+                "completion_reason": "",
                 "log": [],
                 "returncode": None,
             }
@@ -400,7 +479,7 @@ class JobManager:
                                     0, min(100, int(match.group(1)))
                                 )
                             break
-            else:
+            elif job.get("type") != "recording":
                 self._update_download_progress_from_log(job, text)
         if log_callback is not None:
             log_callback(f"Job {job_id}: {text.rstrip()}")
@@ -574,7 +653,10 @@ class JobManager:
     def _recompute_job_state_locked(self, job: Job) -> None:
         self._ensure_control_lists_locked(job)
         states = list(job.get("item_states") or [])
-        if any(state in {"running", "cancelling"} for state in states):
+        if any(state == "stopping" for state in states):
+            job["state"] = "stopping"
+            job["status"] = "läuft"
+        elif any(state in {"running", "cancelling"} for state in states):
             job["state"] = "running"
             job["status"] = "läuft"
         elif any(state == "queued" for state in states):
@@ -597,6 +679,17 @@ class JobManager:
         state = job["item_states"][index]
         failure_kind = job["item_failure_kinds"][index]
         retry_job_id = job["item_retry_job_ids"][index]
+        if job.get("type") == "recording":
+            return {
+                "can_cancel": False,
+                "can_remove": False,
+                "can_retry": False,
+                "can_resolve": False,
+                "can_stop_after_current": False,
+                "retry_pending": False,
+                "retry_job_id": "",
+                "retry_block_reason": "",
+            }
         uncertain = (
             job.get("type") == "youtube_upload"
             and failure_kind == "uncertain"
@@ -665,6 +758,8 @@ class JobManager:
             if index is None or job["item_states"][index] != "running":
                 return False
             lane = self._lane_for_job(job)
+            if lane not in self._lane_paused:
+                return False
             if self._lane_active.get(lane) != (str(job_id), str(item_id)):
                 return False
             self._lane_paused[lane] = True
@@ -757,7 +852,7 @@ class JobManager:
     def remove_queued_item(self, job_id: str, item_id: str) -> bool:
         with self._condition:
             job = self.jobs.get(job_id)
-            if job is None:
+            if job is None or job.get("type") == "recording":
                 return False
             index = self._item_index_locked(job, item_id)
             if index is None:
@@ -775,7 +870,7 @@ class JobManager:
     def request_cancel_item(self, job_id: str, item_id: str) -> Optional[str]:
         with self._condition:
             job = self.jobs.get(job_id)
-            if job is None:
+            if job is None or job.get("type") == "recording":
                 return None
             index = self._item_index_locked(job, item_id)
             if index is None:
@@ -806,6 +901,148 @@ class JobManager:
                 return None
             index = self._item_index_locked(job, item_id)
             return job["item_states"][index] if index is not None else None
+
+    def claim_recording_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Claim the sole item in the non-queuing recording lane."""
+        with self._condition:
+            job = self.jobs.get(job_id)
+            if job is None or job.get("type") != "recording":
+                return None
+            self._ensure_control_lists_locked(job)
+            if job["item_states"] != ["queued"]:
+                return None
+            if self._lane_active["recording"] is not None:
+                return None
+            item_id = str(job["item_ids"][0])
+            self._set_item_state_locked(job, 0, "running")
+            self._lane_active["recording"] = (str(job_id), item_id)
+            self._recording_stop_events[str(job_id)] = threading.Event()
+            self._recompute_job_state_locked(job)
+            job["updated_at"] = self._created_at()
+            return {
+                "job_id": str(job_id),
+                "item_id": item_id,
+                "index": 0,
+                "item_number": 1,
+                "value": job["streamer"],
+                "lane": "recording",
+            }
+
+    def is_recording_active(self) -> bool:
+        with self.lock:
+            return self._lane_active["recording"] is not None
+
+    def register_recording_process(
+        self, job_id: str, item_id: str, process: Any
+    ) -> Optional[bool]:
+        """Register the process owned by one active recording job."""
+        with self.lock:
+            key = (str(job_id), str(item_id))
+            job = self.jobs.get(str(job_id))
+            if (
+                job is None
+                or job.get("type") != "recording"
+                or self._lane_active["recording"] != key
+            ):
+                return None
+            self._recording_processes[str(job_id)] = process
+            event = self._recording_stop_events.get(str(job_id))
+            return bool(event and event.is_set())
+
+    def recording_process(self, job_id: str) -> Any:
+        with self.lock:
+            return self._recording_processes.get(str(job_id))
+
+    def clear_recording_process(self, job_id: str) -> None:
+        with self.lock:
+            self._recording_processes.pop(str(job_id), None)
+
+    def request_recording_stop(self, job_id: str) -> bool:
+        """Record an internal stop request; P3d will add process signalling."""
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if job is None or job.get("type") != "recording":
+                return False
+            self._ensure_control_lists_locked(job)
+            state = job["item_states"][0]
+            if state not in {"running", "stopping"}:
+                return False
+            event = self._recording_stop_events.setdefault(
+                str(job_id), threading.Event()
+            )
+            event.set()
+            job["stop_requested"] = True
+            self._set_item_state_locked(job, 0, "stopping")
+            self._recompute_job_state_locked(job)
+            job["updated_at"] = self._created_at()
+            self._condition.notify_all()
+            return True
+
+    def is_recording_stop_requested(self, job_id: str) -> bool:
+        with self.lock:
+            event = self._recording_stop_events.get(str(job_id))
+            return bool(event and event.is_set())
+
+    def update_recorded_seconds(self, job_id: str, seconds: Any) -> bool:
+        try:
+            value = float(seconds)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(value) or value < 0:
+            return False
+        with self.lock:
+            job = self.jobs.get(str(job_id))
+            if job is None or job.get("type") != "recording":
+                return False
+            self._ensure_control_lists_locked(job)
+            if job["item_states"][0] not in {"running", "stopping"}:
+                return False
+            previous = float(job.get("recorded_seconds") or 0.0)
+            job["recorded_seconds"] = round(max(previous, value), 3)
+            job["updated_at"] = self._created_at()
+            return True
+
+    def finalize_recording_job(
+        self,
+        job_id: str,
+        item_id: str,
+        *,
+        state: str,
+        returncode: int,
+        completion_reason: str,
+        output_path: Optional[str] = None,
+    ) -> bool:
+        """Finalize one recording and always release its lane/process state."""
+        if state not in {"completed", "failed"}:
+            raise ValueError("A recording must finish as completed or failed.")
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if job is None or job.get("type") != "recording":
+                return False
+            index = self._item_index_locked(job, item_id)
+            if index != 0:
+                return False
+            self._set_item_state_locked(
+                job,
+                index,
+                state,
+                failure_kind="known" if state == "failed" else "",
+            )
+            job["returncode"] = int(returncode)
+            job["completion_reason"] = str(completion_reason or "")
+            job["output_path"] = str(output_path) if output_path else None
+            job["output_complete"] = bool(output_path and state == "completed")
+            job["updated_at"] = self._created_at()
+            if self._lane_active["recording"] == (
+                str(job_id),
+                str(item_id),
+            ):
+                self._lane_active["recording"] = None
+            self._recording_processes.pop(str(job_id), None)
+            self._recording_stop_events.pop(str(job_id), None)
+            self._recompute_job_state_locked(job)
+            self._condition.notify_all()
+            return True
 
     def register_download_process(
         self, job_id: str, item_id: str, process: Any
@@ -838,7 +1075,7 @@ class JobManager:
     ) -> Optional[Dict[str, Any]]:
         with self.lock:
             job = self.jobs.get(job_id)
-            if job is None:
+            if job is None or job.get("type") == "recording":
                 return None
             index = self._item_index_locked(job, item_id)
             if index is None or job["item_states"][index] != "failed":
@@ -898,9 +1135,11 @@ class JobManager:
                 lane = self._lane_for_job(job)
                 snapshot = deepcopy(job)
                 snapshot["lane"] = lane
-                snapshot["queue_paused"] = bool(self._lane_paused[lane])
+                snapshot["queue_paused"] = bool(
+                    self._lane_paused.get(lane, False)
+                )
                 snapshot["stop_after_current"] = bool(
-                    self._lane_stop_after_current[lane]
+                    self._lane_stop_after_current.get(lane, False)
                 )
                 snapshot["item_capabilities"] = [
                     self._item_capabilities_locked(job, index)
@@ -1232,6 +1471,161 @@ class JobManager:
         thread = factory(target=target, args=(job_id,), daemon=True)
         thread.start()
         return thread
+
+
+def _safe_recording_log_line(text: Any) -> str:
+    line = str(text or "").rstrip()
+    lowered = line.lower()
+    if not line or parse_ffmpeg_time_seconds(line) is not None:
+        return ""
+    if any(
+        marker in lowered
+        for marker in (
+            "http://",
+            "https://",
+            "cookie",
+            "authorization",
+            "oauth",
+            "access_token",
+            "token=",
+        )
+    ):
+        return ""
+    return line
+
+
+def run_recording_job(
+    job_id: str,
+    manager: JobManager,
+    dependencies: RecordingWorkerDependencies,
+) -> None:
+    """Run one Twitch livestream in its dedicated process-local lane."""
+    claimed = manager.claim_recording_job(job_id)
+    if claimed is None:
+        return
+    item_id = str(claimed["item_id"])
+    output_path: Optional[str] = None
+    finalized = False
+
+    try:
+        job = manager.get_job(job_id) or {}
+        streamer = str(job.get("streamer") or "")
+        settings = dependencies.load_settings()
+        settings["quality"] = str(
+            job.get("quality") or settings.get("quality") or "source/best"
+        )
+        command = dependencies.build_recording_command(streamer, settings)
+        dependencies.append_log(job_id, f"Recording started for {streamer}.")
+        process = dependencies.popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(dependencies.download_directory(settings)),
+            **download_process_group_options(),
+        )
+        registration = manager.register_recording_process(
+            job_id, item_id, process
+        )
+        if registration is None:
+            raise RuntimeError("The recording process could not be registered.")
+
+        assert process.stdout is not None
+        for raw_line in process.stdout:
+            line = str(raw_line or "").rstrip()
+            marker_at = line.find(dependencies.output_marker)
+            if marker_at >= 0:
+                raw_output = line[
+                    marker_at + len(dependencies.output_marker) :
+                ].strip()
+                try:
+                    output_path = dependencies.resolve_completed_output(
+                        raw_output, settings
+                    )
+                except Exception:
+                    output_path = None
+                continue
+
+            recorded_seconds = parse_ffmpeg_time_seconds(line)
+            if recorded_seconds is not None:
+                manager.update_recorded_seconds(job_id, recorded_seconds)
+                continue
+
+            safe_line = _safe_recording_log_line(line)
+            if safe_line:
+                dependencies.append_log(job_id, safe_line)
+
+        returncode = int(process.wait())
+        stop_requested = manager.is_recording_stop_requested(job_id)
+        if stop_requested:
+            manager.finalize_recording_job(
+                job_id,
+                item_id,
+                state="completed",
+                returncode=returncode,
+                completion_reason="stopped_by_user",
+                output_path=output_path,
+            )
+            dependencies.append_log(job_id, "Recording stopped.")
+        elif returncode == 0:
+            manager.finalize_recording_job(
+                job_id,
+                item_id,
+                state="completed",
+                returncode=returncode,
+                completion_reason="natural_end",
+                output_path=output_path,
+            )
+            dependencies.append_log(job_id, "Recording completed naturally.")
+        else:
+            manager.finalize_recording_job(
+                job_id,
+                item_id,
+                state="failed",
+                returncode=returncode,
+                completion_reason="process_error",
+            )
+            dependencies.append_log(
+                job_id, f"Recording failed with process code {returncode}."
+            )
+        finalized = True
+    except FileNotFoundError:
+        manager.finalize_recording_job(
+            job_id,
+            item_id,
+            state="failed",
+            returncode=-1,
+            completion_reason="worker_error",
+        )
+        dependencies.append_log(
+            job_id,
+            "The yt-dlp Python module was not found. Install the dependencies from requirements.txt.",
+        )
+        finalized = True
+    except Exception as exc:
+        manager.finalize_recording_job(
+            job_id,
+            item_id,
+            state="failed",
+            returncode=-2,
+            completion_reason="worker_error",
+        )
+        dependencies.append_log(
+            job_id, f"Recording worker failed: {type(exc).__name__}."
+        )
+        finalized = True
+    finally:
+        if not finalized:
+            manager.finalize_recording_job(
+                job_id,
+                item_id,
+                state="failed",
+                returncode=-2,
+                completion_reason="worker_error",
+            )
+        manager.clear_recording_process(job_id)
 
 
 def run_download_job(

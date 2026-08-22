@@ -604,6 +604,80 @@ class YtDlpIntegrationHelperTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "definitive live state"):
                 twitch.run_ytdlp_live_status("nika_livetv", self.settings)
 
+    def test_live_recording_command_is_single_channel_safe_and_non_batch(self):
+        cookie_file = self.base / "recording-cookies.txt"
+        cookie_file.write_text(
+            "# Netscape HTTP Cookie File\nSECRET-COOKIE", encoding="utf-8"
+        )
+        configured = {
+            **self.settings,
+            "cookie_file": str(cookie_file),
+            "quality": "1080p60/source/best",
+            "merge_format": "mp4",
+        }
+
+        command = twitch.build_live_recording_command(
+            "nika_livetv",
+            configured,
+            download_directory=self.download_dir,
+            command_factory=lambda: ["python", "-m", "yt_dlp"],
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "python",
+                "-m",
+                "yt_dlp",
+                "--cookies",
+                str(cookie_file),
+                "--no-playlist",
+                "--downloader",
+                "m3u8:ffmpeg",
+                "-f",
+                "1080p60/source/best",
+                "--write-info-json",
+                "--print",
+                (
+                    "after_move:VOD-DASHBOARD-RECORDING-FILE="
+                    "%(filepath)s"
+                ),
+                "--no-quiet",
+                "-P",
+                str(self.download_dir.resolve()),
+                "-o",
+                (
+                    "nika_livetv/%(upload_date)s - %(uploader)s - LIVE - "
+                    "%(title)s [%(id)s].%(ext)s"
+                ),
+                "--merge-output-format",
+                "mp4",
+                "https://www.twitch.tv/nika_livetv",
+            ],
+        )
+        self.assertEqual(command.count("--downloader"), 1)
+        for forbidden in (
+            "--download-archive",
+            "-a",
+            "--ignore-errors",
+            "--retries",
+            "--fragment-retries",
+            "--continue",
+        ):
+            self.assertNotIn(forbidden, command)
+        self.assertNotIn("SECRET-COOKIE", " ".join(command))
+
+    def test_live_recording_command_requires_a_normalized_login(self):
+        for invalid in ("@nika_livetv", "Nika_LiveTV", "bad-name!"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "normalized Twitch streamer"
+            ):
+                twitch.build_live_recording_command(
+                    invalid,
+                    self.settings,
+                    download_directory=self.download_dir,
+                )
+
     def test_source_fallback_deduplication_and_malformed_output(self):
         first = SimpleNamespace(
             returncode=1, stdout="", stderr="first source failed"

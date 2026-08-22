@@ -12,12 +12,14 @@ from unittest import mock
 from vod_dashboard.jobs import (
     DownloadWorkerDependencies,
     JobManager,
+    RecordingWorkerDependencies,
     UploadWorkerDependencies,
     ffmpeg_download_metrics,
     download_process_group_options,
     parse_ffmpeg_speed_multiplier,
     parse_ffmpeg_time_seconds,
     run_download_job,
+    run_recording_job,
     run_upload_job,
     terminate_download_process_tree,
 )
@@ -122,6 +124,42 @@ class JobManagerTests(unittest.TestCase):
                 "type": "youtube_upload",
             },
         )
+
+    def test_recording_job_schema_has_exactly_one_item(self):
+        manager = self.manager()
+
+        job_id = manager.create_recording_job(
+            "nika_livetv",
+            stream_id="987654321",
+            title="Actual stream title",
+            live_started_at="2026-08-23T18:00:00Z",
+            quality="source/best",
+            output_name="nika_livetv/live-template.%(ext)s",
+        )
+        job = manager.jobs[job_id]
+
+        self.assertEqual(job["type"], "recording")
+        self.assertEqual(job["streamer"], "nika_livetv")
+        self.assertEqual(job["stream_id"], "987654321")
+        self.assertEqual(job["title"], "Actual stream title")
+        self.assertEqual(job["live_started_at"], "2026-08-23T18:00:00Z")
+        self.assertEqual(job["quality"], "source/best")
+        self.assertEqual(job["urls"], ["nika_livetv"])
+        self.assertEqual(job["total_urls"], 1)
+        self.assertEqual(job["item_ids"], ["1-item-1"])
+        self.assertEqual(job["item_states"], ["queued"])
+        self.assertEqual(job["recorded_seconds"], 0.0)
+        self.assertEqual(job["completion_reason"], "")
+        self.assertEqual(job["state"], "queued")
+        self.assertEqual(job["created_at"], "2026-08-11 12:34:56")
+        self.assertEqual(job["updated_at"], "2026-08-11 12:34:56")
+
+    def test_second_pending_recording_is_rejected(self):
+        manager = self.manager()
+        manager.create_recording_job("nika_livetv")
+
+        with self.assertRaisesRegex(RuntimeError, "already queued or active"):
+            manager.create_recording_job("another_streamer")
 
     def test_upload_jobs_store_their_explicit_playlist_independently(self):
         manager = self.manager()
@@ -485,6 +523,52 @@ class QueueControlManagerTests(unittest.TestCase):
         self.assertEqual(second["value"], "two")
         self.assertNotEqual(first["item_id"], second["item_id"])
 
+    def test_recording_lane_does_not_block_download_lane(self):
+        download_id = self.manager.create_download_job(["vod"], "Download")
+        recording_id = self.manager.create_recording_job("nika_livetv")
+
+        download = self.manager.claim_next_item(download_id)
+        recording = self.manager.claim_recording_job(recording_id)
+
+        self.assertEqual(download["lane"], "download")
+        self.assertEqual(recording["lane"], "recording")
+        self.assertTrue(self.manager.is_recording_active())
+        self.assertEqual(
+            self.manager.snapshot_jobs()[1]["lane"], "recording"
+        )
+        self.assertTrue(
+            self.manager.queue_controls_snapshot()["download"][
+                "has_active_item"
+            ]
+        )
+
+    def test_internal_recording_stop_flag_uses_stopping_state(self):
+        job_id = self.manager.create_recording_job("nika_livetv")
+        claimed = self.manager.claim_recording_job(job_id)
+
+        self.assertTrue(self.manager.request_recording_stop(job_id))
+        self.assertTrue(self.manager.is_recording_stop_requested(job_id))
+        self.assertEqual(
+            self.manager.item_state(job_id, claimed["item_id"]), "stopping"
+        )
+        self.assertEqual(self.manager.jobs[job_id]["state"], "stopping")
+        self.assertTrue(self.manager.jobs[job_id]["stop_requested"])
+
+    def test_public_queue_controls_do_not_operate_on_recording_items(self):
+        job_id = self.manager.create_recording_job("nika_livetv")
+        item_id = self.manager.jobs[job_id]["item_ids"][0]
+
+        self.assertFalse(self.manager.remove_queued_item(job_id, item_id))
+        claimed = self.manager.claim_recording_job(job_id)
+        self.assertIsNone(
+            self.manager.request_cancel_item(job_id, claimed["item_id"])
+        )
+        self.assertFalse(
+            self.manager.request_stop_after_current(job_id, claimed["item_id"])
+        )
+        capabilities = self.manager.snapshot_jobs()[0]["item_capabilities"][0]
+        self.assertFalse(any(capabilities.values()))
+
     def test_backend_exposes_only_legal_item_capabilities(self):
         job_id = self.manager.create_download_job(["one"], "Queue")
         queued = self.manager.snapshot_jobs()[0]["item_capabilities"][0]
@@ -664,6 +748,177 @@ class QueueControlManagerTests(unittest.TestCase):
             self.manager.resume_queue("youtube_upload")
             self.assertTrue(upload_started.wait(1))
             worker.join(1)
+
+
+class RecordingWorkerTests(unittest.TestCase):
+    OUTPUT_MARKER = "VOD-DASHBOARD-RECORDING-FILE="
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name).resolve()
+        self.manager = JobManager(
+            now=lambda: datetime(2026, 8, 23, 20, 0, 0)
+        )
+        self.settings = {
+            "quality": "source/best",
+            "merge_format": "mp4",
+        }
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def create_job(self):
+        return self.manager.create_recording_job(
+            "nika_livetv",
+            stream_id="987654321",
+            title="Live title",
+            live_started_at="2026-08-23T18:00:00Z",
+            quality="1080p60/source/best",
+            output_name="nika_livetv/live-template.%(ext)s",
+        )
+
+    def dependencies(self, job_id, lines, returncode=0):
+        process_calls = []
+
+        def build_command(streamer, settings):
+            self.assertEqual(streamer, "nika_livetv")
+            self.assertEqual(settings["quality"], "1080p60/source/best")
+            return ["python", "-m", "yt_dlp", streamer]
+
+        def resolve_output(raw, _settings):
+            path = Path(raw).resolve()
+            path.relative_to(self.root)
+            if not path.is_file() or path.suffix.lower() != ".mp4":
+                raise RuntimeError("Incomplete recording output.")
+            return path.relative_to(self.root).as_posix()
+
+        def popen(command, **kwargs):
+            self.assertEqual(self.manager.jobs[job_id]["state"], "running")
+            process = mock.Mock(pid=4321)
+
+            def output():
+                self.assertIs(
+                    self.manager.recording_process(job_id), process
+                )
+                yield from lines
+
+            process.stdout = output()
+            process.wait.return_value = returncode
+            process_calls.append((command, kwargs, process))
+            return process
+
+        return RecordingWorkerDependencies(
+            load_settings=lambda: dict(self.settings),
+            append_log=self.manager.append_job_log,
+            build_recording_command=build_command,
+            download_directory=lambda _settings: self.root,
+            resolve_completed_output=resolve_output,
+            output_marker=self.OUTPUT_MARKER,
+            popen=popen,
+        ), process_calls
+
+    def test_success_tracks_duration_process_and_safe_final_output(self):
+        job_id = self.create_job()
+        video = self.root / "nika_livetv" / "recording.mp4"
+        video.parent.mkdir()
+        video.write_bytes(b"video")
+        lines = [
+            "Opening https://signed.invalid/segment.ts?token=SECRET\n",
+            "frame=1 time=00:12:34.50 speed=1x\n",
+            "Useful recorder message\n",
+            f"{self.OUTPUT_MARKER}{video}\n",
+        ]
+        dependencies, process_calls = self.dependencies(job_id, lines)
+
+        run_recording_job(job_id, self.manager, dependencies)
+
+        job = self.manager.jobs[job_id]
+        self.assertEqual(job["state"], "completed")
+        self.assertEqual(job["item_states"], ["completed"])
+        self.assertEqual(job["returncode"], 0)
+        self.assertEqual(job["completion_reason"], "natural_end")
+        self.assertEqual(job["recorded_seconds"], 754.5)
+        self.assertEqual(
+            job["output_path"], "nika_livetv/recording.mp4"
+        )
+        self.assertTrue(job["output_complete"])
+        self.assertIsNone(self.manager.recording_process(job_id))
+        self.assertFalse(self.manager.is_recording_active())
+        self.assertIn("Useful recorder message", job["log"])
+        serialized_log = "\n".join(job["log"])
+        self.assertNotIn("signed.invalid", serialized_log)
+        self.assertNotIn("SECRET", serialized_log)
+        self.assertNotIn("time=", serialized_log)
+
+        command, kwargs, _process = process_calls[0]
+        self.assertEqual(command, ["python", "-m", "yt_dlp", "nika_livetv"])
+        self.assertEqual(kwargs["cwd"], str(self.root))
+        self.assertNotIn("shell", kwargs)
+        for key, value in download_process_group_options().items():
+            self.assertEqual(kwargs[key], value)
+
+    def test_nonzero_returncode_fails_and_releases_process_reference(self):
+        job_id = self.create_job()
+        dependencies, _ = self.dependencies(
+            job_id, ["ordinary diagnostic\n"], returncode=9
+        )
+
+        run_recording_job(job_id, self.manager, dependencies)
+
+        job = self.manager.jobs[job_id]
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(job["returncode"], 9)
+        self.assertEqual(job["completion_reason"], "process_error")
+        self.assertFalse(job["output_complete"])
+        self.assertIsNone(self.manager.recording_process(job_id))
+        self.assertFalse(self.manager.is_recording_active())
+
+    def test_part_file_marker_is_never_reported_as_completed_output(self):
+        job_id = self.create_job()
+        partial = self.root / "nika_livetv" / "recording.mp4.part"
+        partial.parent.mkdir()
+        partial.write_bytes(b"partial")
+        dependencies, _ = self.dependencies(
+            job_id, [f"{self.OUTPUT_MARKER}{partial}\n"]
+        )
+
+        run_recording_job(job_id, self.manager, dependencies)
+
+        job = self.manager.jobs[job_id]
+        self.assertEqual(job["state"], "completed")
+        self.assertIsNone(job["output_path"])
+        self.assertFalse(job["output_complete"])
+
+    def test_recording_logs_remain_capped_at_500(self):
+        job_id = self.create_job()
+        dependencies, _ = self.dependencies(
+            job_id, [f"diagnostic-{index}\n" for index in range(550)]
+        )
+
+        run_recording_job(job_id, self.manager, dependencies)
+
+        logs = self.manager.jobs[job_id]["log"]
+        self.assertEqual(len(logs), 500)
+        self.assertEqual(logs[-1], "Recording completed naturally.")
+
+    def test_internal_stop_request_finishes_without_failed_state(self):
+        job_id = self.create_job()
+
+        def request_stop():
+            self.assertTrue(self.manager.request_recording_stop(job_id))
+            yield "frame=1 time=00:00:12.00 speed=1x\n"
+
+        dependencies, _ = self.dependencies(
+            job_id, request_stop(), returncode=130
+        )
+
+        run_recording_job(job_id, self.manager, dependencies)
+
+        job = self.manager.jobs[job_id]
+        self.assertEqual(job["state"], "completed")
+        self.assertEqual(job["completion_reason"], "stopped_by_user")
+        self.assertEqual(job["returncode"], 130)
+        self.assertEqual(job["recorded_seconds"], 12.0)
 
 
 class DownloadProcessControlTests(unittest.TestCase):

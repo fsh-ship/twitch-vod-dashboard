@@ -474,6 +474,18 @@ def build_download_command(urls: List[str], settings: Dict[str, Any]) -> tuple[L
     )
 
 
+def build_live_recording_command(
+    streamer: str, settings: Dict[str, Any]
+) -> List[str]:
+    return dashboard_twitch.build_live_recording_command(
+        streamer,
+        settings,
+        download_directory=download_path(settings),
+        command_factory=ytdlp_base_command,
+        cookie_args_factory=ytdlp_cookie_args,
+    )
+
+
 
 
 def youtube_client_secret_file(settings: Optional[Dict[str, Any]] = None) -> Path:
@@ -793,6 +805,65 @@ def run_download_job(job_id: str) -> None:
         enqueue_upload_job=lambda paths, label: create_upload_job(paths, label),
     )
     dashboard_jobs.run_download_job(
+        job_id, _job_manager_for_compatibility(), dependencies
+    )
+
+
+def resolve_completed_recording_output(
+    raw_path: Any, settings: Dict[str, Any]
+) -> str:
+    policy = dashboard_media.MediaPathPolicy(MEDIA_ROOT)
+    path = policy.safe_local_video_path(raw_path, settings, must_exist=True)
+    return path.relative_to(policy.media_root).as_posix()
+
+
+def create_recording_job(
+    streamer: str, live_metadata: Dict[str, Any]
+) -> str:
+    """Create and start one internal recording; no HTTP route exposes this."""
+    if not isinstance(live_metadata, dict):
+        raise RuntimeError("Live Twitch metadata is required.")
+    canonical_login = dashboard_settings.canonical_streamer_login(streamer)
+    if not canonical_login:
+        raise RuntimeError("A valid Twitch streamer is required.")
+    settings = load_settings()
+    configured_logins = {
+        dashboard_settings.canonical_streamer_login(name)
+        for name in read_streamers(settings)
+    }
+    if canonical_login not in configured_logins:
+        raise RuntimeError("The Twitch streamer is not configured.")
+    if str(live_metadata.get("state") or "") != "live":
+        raise RuntimeError("The Twitch streamer is not currently live.")
+
+    manager = _job_manager_for_compatibility()
+    job_id = manager.create_recording_job(
+        canonical_login,
+        stream_id=str(live_metadata.get("stream_id") or ""),
+        title=str(live_metadata.get("title") or ""),
+        live_started_at=live_metadata.get("started_at"),
+        quality=str(settings.get("quality") or "source/best"),
+        output_name=dashboard_twitch.live_recording_output_template(
+            canonical_login
+        ),
+        counter_getter=lambda: job_counter,
+        counter_setter=_set_job_counter,
+    )
+    manager.start_worker(run_recording_job, job_id)
+    return job_id
+
+
+def run_recording_job(job_id: str) -> None:
+    dependencies = dashboard_jobs.RecordingWorkerDependencies(
+        load_settings=load_settings,
+        append_log=append_job_log,
+        build_recording_command=build_live_recording_command,
+        download_directory=download_path,
+        resolve_completed_output=resolve_completed_recording_output,
+        output_marker=dashboard_twitch.LIVE_RECORDING_OUTPUT_MARKER,
+        popen=subprocess.Popen,
+    )
+    dashboard_jobs.run_recording_job(
         job_id, _job_manager_for_compatibility(), dependencies
     )
 

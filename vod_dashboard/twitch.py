@@ -231,6 +231,10 @@ _TWITCH_NOT_LIVE_RE = re.compile(
 _TWITCH_QUALITY_RE = re.compile(
     r"(?<!\d)(\d{3,4})p(?:([1-9]\d{1,2}))?\b", re.IGNORECASE
 )
+LIVE_RECORDING_OUTPUT_MARKER = "VOD-DASHBOARD-RECORDING-FILE="
+LIVE_RECORDING_FILENAME_TEMPLATE = (
+    "%(upload_date)s - %(uploader)s - LIVE - %(title)s [%(id)s].%(ext)s"
+)
 
 
 def _canonical_live_streamer_login(value: Any) -> str:
@@ -401,6 +405,52 @@ def run_ytdlp_live_status(
         "started_at": _live_started_at(metadata),
         "qualities": _live_quality_labels(metadata.get("formats")),
     }
+
+
+def live_recording_output_template(streamer: str) -> str:
+    """Return the fixed, server-controlled relative output template."""
+    canonical_login = _canonical_live_streamer_login(streamer)
+    if canonical_login != str(streamer or "").strip():
+        raise ValueError("A normalized Twitch streamer login is required.")
+    return f"{canonical_login}/{LIVE_RECORDING_FILENAME_TEMPLATE}"
+
+
+def build_live_recording_command(
+    streamer: str,
+    settings: Dict[str, Any],
+    *,
+    download_directory: Path,
+    command_factory: Optional[Callable[[], List[str]]] = None,
+    cookie_args_factory: Optional[
+        Callable[[Dict[str, Any]], List[str]]
+    ] = None,
+) -> List[str]:
+    """Build one read-only-input Twitch live-recording command."""
+    output_template = live_recording_output_template(streamer)
+    base_command, cookie_arguments = _command_parts(
+        settings, command_factory, cookie_args_factory
+    )
+    quality = str(settings.get("quality") or "source/best").strip()
+    merge_format = str(settings.get("merge_format") or "mp4").strip()
+    channel_url = f"https://www.twitch.tv/{streamer}"
+    return base_command + cookie_arguments + [
+        "--no-playlist",
+        "--downloader",
+        "m3u8:ffmpeg",
+        "-f",
+        quality,
+        "--write-info-json",
+        "--print",
+        f"after_move:{LIVE_RECORDING_OUTPUT_MARKER}%(filepath)s",
+        "--no-quiet",
+        "-P",
+        str(Path(download_directory).resolve()),
+        "-o",
+        output_template,
+        "--merge-output-format",
+        merge_format,
+        channel_url,
+    ]
 
 
 def build_download_command(
