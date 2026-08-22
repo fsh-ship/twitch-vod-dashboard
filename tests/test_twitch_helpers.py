@@ -1,5 +1,6 @@
 import ast
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -504,7 +505,11 @@ class YtDlpIntegrationHelperTests(unittest.TestCase):
         )
         self.assertEqual(
             run.call_args.kwargs,
-            {"capture_output": True, "text": True, "timeout": 180},
+            {
+                "capture_output": True,
+                "text": True,
+                "timeout": twitch.LIVE_STATUS_TIMEOUT_SECONDS,
+            },
         )
         for forbidden in (
             "--download-archive",
@@ -551,6 +556,17 @@ class YtDlpIntegrationHelperTests(unittest.TestCase):
             "vod_dashboard.twitch.subprocess.run", return_value=network_failure
         ):
             with self.assertRaisesRegex(RuntimeError, "failed with code 1"):
+                twitch.run_ytdlp_live_status("nika_livetv", self.settings)
+
+    def test_live_status_timeout_is_short_and_remains_an_error(self):
+        self.assertEqual(twitch.LIVE_STATUS_TIMEOUT_SECONDS, 30)
+        self.assertLess(twitch.LIVE_STATUS_TIMEOUT_SECONDS, 180)
+
+        with mock.patch(
+            "vod_dashboard.twitch.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["yt-dlp"], 30),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
                 twitch.run_ytdlp_live_status("nika_livetv", self.settings)
 
     def test_live_status_start_time_fallback_missing_and_title_fallback(self):

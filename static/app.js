@@ -266,6 +266,16 @@ let queueDetailOpenState = {};
 let autoExpandJobDetails = localStorage.getItem('vodJobAutoExpand') === '1';
 let youtubePlaylistChoices = [];
 let streamerProfileDraft = {};
+let liveStreamers = [];
+let liveStreamStatuses = new Map();
+let liveStatusRequests = new Map();
+let liveStatusRefreshPromise = null;
+let liveStatusInitialRefreshStarted = false;
+let liveRecordingJobs = [];
+let liveRecordingActions = new Map();
+
+const LIVE_STATUS_CONCURRENCY = 2;
+const ACTIVE_RECORDING_STATES = new Set(['queued', 'running', 'stopping']);
 
 const $ = (id) => document.getElementById(id);
 
@@ -364,6 +374,7 @@ function renderState() {
   renderLocalUploadPlaylistSelect();
   $('singleStreamer').innerHTML = state.streamers.map(s => `<option>${escapeHtml(s)}</option>`).join('');
   renderSearchStreamerCheckboxes();
+  syncLiveStreamers(state.streamers);
 }
 
 function escapeHtml(s) {
@@ -373,6 +384,7 @@ function escapeHtml(s) {
 async function loadState() {
   state = await api('/api/state');
   renderState();
+  initializeLiveStatuses();
 }
 window.loadState = loadState;
 
@@ -610,6 +622,263 @@ function localUploadRequestPayload(paths) {
     selected?.dataset.playlistMode || 'streamer-default',
     selected?.value || ''
   );
+}
+
+function formatRecordingDuration(value) {
+  const seconds = Number(value);
+  const total = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 0;
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remainder = total % 60;
+  return [hours, minutes, remainder].map(part => String(part).padStart(2, '0')).join(':');
+}
+
+function formatLiveStartedAt(value) {
+  if (!value) return '';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return parsed.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+
+function recordingJobForStreamer(streamer, jobs=liveRecordingJobs) {
+  const login = canonicalStreamerLoginClient(streamer);
+  const matching = (jobs || []).filter(job => (
+    job?.type === 'recording'
+    && canonicalStreamerLoginClient(job.streamer) === login
+  ));
+  return matching.find(job => ACTIVE_RECORDING_STATES.has(job.state))
+    || matching.find(job => job.state === 'completed' || job.state === 'failed')
+    || null;
+}
+
+function activeRecordingJob(jobs=liveRecordingJobs) {
+  return (jobs || []).find(job => (
+    job?.type === 'recording' && ACTIVE_RECORDING_STATES.has(job.state)
+  )) || null;
+}
+
+function recordingStatusText(job) {
+  if (!job) return '';
+  if (job.state === 'queued') return 'Recording is starting…';
+  if (job.state === 'running') return `Recording running · ${formatRecordingDuration(job.recorded_seconds)}`;
+  if (job.state === 'stopping') return 'Recording is stopping…';
+  if (job.state === 'completed' && job.completion_reason === 'natural_end') return 'Stream ended · recording completed';
+  if (job.state === 'completed' && job.completion_reason === 'stopped_by_user') return 'Recording stopped';
+  if (job.state === 'failed' && job.completion_reason === 'stop_incomplete') return 'Recording could not be saved completely';
+  if (job.state === 'failed' && job.completion_reason === 'stop_failed') return 'Recording could not be stopped cleanly';
+  if (job.state === 'failed') return 'Recording failed';
+  return '';
+}
+
+function liveStatusText(status) {
+  if (!status || status.state === 'unknown') return 'Not checked yet';
+  if (status.state === 'checking') return 'Checking live status…';
+  if (status.state === 'live') return 'LIVE';
+  if (status.state === 'offline') return 'Offline';
+  return 'Status could not be loaded';
+}
+
+function liveStatusClass(status, recordingJob) {
+  if (recordingJob && ACTIVE_RECORDING_STATES.has(recordingJob.state)) return 'recording';
+  if (status?.state === 'live') return 'live';
+  if (status?.state === 'error') return 'error';
+  return status?.state === 'checking' ? 'checking' : 'offline';
+}
+
+function renderLiveStreamCard(streamer) {
+  const login = canonicalStreamerLoginClient(streamer);
+  const status = liveStreamStatuses.get(login) || {state:'unknown', streamer:login};
+  const job = recordingJobForStreamer(login);
+  const activeJob = activeRecordingJob();
+  const action = liveRecordingActions.get(login) || null;
+  const activeHere = !!job && ACTIVE_RECORDING_STATES.has(job.state);
+  const terminalHere = !!job && (job.state === 'completed' || job.state === 'failed');
+  const stateClass = liveStatusClass(status, job);
+  const statusLabel = action?.phase === 'starting'
+    ? 'Recording is starting…'
+    : action?.phase === 'stopping'
+      ? 'Recording is stopping…'
+      : (activeHere || (terminalHere && status.state !== 'live'))
+        ? recordingStatusText(job)
+        : liveStatusText(status);
+  const title = status.state === 'live'
+    ? String(status.title || job?.title || '').trim()
+    : (activeHere ? String(job?.title || '').trim() : '');
+  const started = status.state === 'live' ? formatLiveStartedAt(status.started_at) : '';
+  const saved = !!job?.output_complete && (job.state === 'completed' || job.state === 'failed');
+  const canStart = status.state === 'live' && !activeJob && (!action || action.phase === 'error');
+  const startDisabledReason = status.state === 'live' && activeJob && !activeHere
+    ? 'Another recording is already active.'
+    : '';
+  let actionHtml = '';
+  if (activeHere && job.state === 'running') {
+    actionHtml = `<button type="button" class="danger-outline live-recording-stop" data-job-id="${escapeHtml(job.id)}" data-streamer="${escapeHtml(login)}" ${action?.phase === 'stopping' ? 'disabled' : ''}>Stop Recording</button>`;
+  } else if (status.state === 'live' && !activeHere) {
+    actionHtml = `<button type="button" class="primary live-recording-start" data-streamer="${escapeHtml(login)}" ${canStart ? '' : 'disabled'} title="${escapeHtml(startDisabledReason)}">Start Recording</button>`;
+  }
+  const secondary = [
+    title ? `<span class="live-stream-title">${escapeHtml(title)}</span>` : '',
+    started && !activeHere ? `<span class="live-stream-time">Live since ${escapeHtml(started)}</span>` : '',
+    terminalHere && status.state === 'live' ? `<span class="live-recording-note muted">${escapeHtml(recordingStatusText(job))}</span>` : '',
+    saved ? '<span class="live-recording-saved">Recording saved</span>' : '',
+    action?.message ? `<span class="live-recording-message bad">${escapeHtml(action.message)}</span>` : '',
+    startDisabledReason ? `<span class="live-recording-note muted">${escapeHtml(startDisabledReason)}</span>` : ''
+  ].filter(Boolean).join('');
+  return `<article class="live-stream-card is-${stateClass}" data-live-streamer="${escapeHtml(login)}">
+    <div class="live-stream-indicator" aria-hidden="true"></div>
+    <div class="live-stream-copy">
+      <strong>${escapeHtml(streamer)}</strong>
+      <span class="live-stream-state">${escapeHtml(statusLabel)}</span>
+      ${secondary}
+    </div>
+    <div class="live-stream-actions">${actionHtml}</div>
+  </article>`;
+}
+
+function renderLiveStreams() {
+  const box = $('liveStreamsList');
+  if (!box) return;
+  if (!liveStreamers.length) {
+    box.innerHTML = '<div class="live-stream-empty muted">No streamers are configured. Add streamers in Settings.</div>';
+    return;
+  }
+  box.innerHTML = liveStreamers.map(streamer => renderLiveStreamCard(streamer)).join('');
+  box.querySelectorAll('.live-recording-start').forEach(button => button.addEventListener('click', () => {
+    startLiveRecording(button.dataset.streamer).catch(() => {});
+  }));
+  box.querySelectorAll('.live-recording-stop').forEach(button => button.addEventListener('click', () => {
+    stopLiveRecording(button.dataset.jobId, button.dataset.streamer).catch(() => {});
+  }));
+}
+
+function syncLiveStreamers(streamers) {
+  const seen = new Set();
+  liveStreamers = (streamers || []).filter(streamer => {
+    const login = canonicalStreamerLoginClient(streamer);
+    if (!login || seen.has(login)) return false;
+    seen.add(login);
+    if (!liveStreamStatuses.has(login)) liveStreamStatuses.set(login, {state:'unknown', streamer:login});
+    return true;
+  });
+  const configured = new Set(liveStreamers.map(canonicalStreamerLoginClient));
+  [...liveStreamStatuses.keys()].forEach(login => {
+    if (!configured.has(login)) liveStreamStatuses.delete(login);
+  });
+  renderLiveStreams();
+}
+
+function updateLiveRecordingJobs(jobs) {
+  liveRecordingJobs = (jobs || []).filter(job => job?.type === 'recording');
+  liveStreamers.forEach(streamer => {
+    const login = canonicalStreamerLoginClient(streamer);
+    const action = liveRecordingActions.get(login);
+    const job = recordingJobForStreamer(login);
+    if (action?.phase === 'starting' && job && ACTIVE_RECORDING_STATES.has(job.state)) liveRecordingActions.delete(login);
+    if (action?.phase === 'stopping' && job && !ACTIVE_RECORDING_STATES.has(job.state)) liveRecordingActions.delete(login);
+    if (action?.phase === 'error' && job && ACTIVE_RECORDING_STATES.has(job.state)) liveRecordingActions.delete(login);
+  });
+  renderLiveStreams();
+}
+
+async function requestLiveStatus(streamer) {
+  const login = canonicalStreamerLoginClient(streamer);
+  if (!login) return null;
+  if (liveStatusRequests.has(login)) return liveStatusRequests.get(login);
+  liveStreamStatuses.set(login, {state:'checking', streamer:login});
+  renderLiveStreams();
+  const request = api(`/api/live/status?streamer=${encodeURIComponent(login)}`)
+    .then(payload => {
+      const nextState = payload?.state === 'live' || payload?.state === 'offline'
+        ? payload.state
+        : 'error';
+      liveStreamStatuses.set(login, {...payload, streamer:login, state:nextState});
+      return liveStreamStatuses.get(login);
+    })
+    .catch(() => {
+      const failed = {state:'error', streamer:login};
+      liveStreamStatuses.set(login, failed);
+      return failed;
+    })
+    .finally(() => {
+      liveStatusRequests.delete(login);
+      renderLiveStreams();
+    });
+  liveStatusRequests.set(login, request);
+  return request;
+}
+
+async function refreshLiveStatuses() {
+  if (liveStatusRefreshPromise) return liveStatusRefreshPromise;
+  const button = $('refreshLiveStatuses');
+  const message = $('liveStreamsRefreshStatus');
+  if (button) button.disabled = true;
+  if (message) message.textContent = liveStreamers.length ? 'Live status is being refreshed…' : 'No configured streamers to check.';
+  const queue = [...liveStreamers];
+  liveStatusRefreshPromise = (async () => {
+    let index = 0;
+    const worker = async () => {
+      while (index < queue.length) {
+        const streamer = queue[index++];
+        await requestLiveStatus(streamer);
+      }
+    };
+    const workerCount = Math.min(LIVE_STATUS_CONCURRENCY, queue.length);
+    await Promise.all(Array.from({length:workerCount}, worker));
+  })();
+  try {
+    await liveStatusRefreshPromise;
+  } finally {
+    liveStatusRefreshPromise = null;
+    if (button) button.disabled = false;
+    if (message) message.textContent = liveStreamers.length ? 'Live status updated.' : 'No configured streamers to check.';
+  }
+}
+
+function initializeLiveStatuses() {
+  if (liveStatusInitialRefreshStarted) return;
+  liveStatusInitialRefreshStarted = true;
+  refreshLiveStatuses().catch(() => {});
+}
+
+function friendlyRecordingActionError(error, action) {
+  const code = String(error?.message || '').split(/\n/)[0];
+  if (code === 'recording_conflict') return 'Another recording is already active.';
+  if (code === 'streamer_not_live') return 'The streamer is no longer live.';
+  if (code === 'live_status_unavailable') return 'Live status could not be confirmed.';
+  if (code === 'recording_not_stoppable') return 'This recording can no longer be stopped.';
+  return action === 'stop' ? 'Recording could not be stopped.' : 'Recording could not be started.';
+}
+
+async function startLiveRecording(streamer) {
+  const login = canonicalStreamerLoginClient(streamer);
+  if (!login) return;
+  liveRecordingActions.set(login, {phase:'starting'});
+  renderLiveStreams();
+  try {
+    await api('/api/live/record', {method:'POST', body:JSON.stringify({streamer:login})});
+  } catch (error) {
+    liveRecordingActions.set(login, {phase:'error', message:friendlyRecordingActionError(error, 'start')});
+    renderLiveStreams();
+    showToast(friendlyRecordingActionError(error, 'start'), 'bad');
+    throw error;
+  }
+  pollJobs().catch(() => {});
+}
+
+async function stopLiveRecording(jobId, streamer) {
+  const login = canonicalStreamerLoginClient(streamer);
+  if (!login || !jobId) return;
+  liveRecordingActions.set(login, {phase:'stopping'});
+  renderLiveStreams();
+  try {
+    await api(`/api/live/record/${encodeURIComponent(jobId)}/stop`, {method:'POST', body:JSON.stringify({})});
+    pollJobs().catch(() => {});
+  } catch (error) {
+    liveRecordingActions.set(login, {phase:'error', message:friendlyRecordingActionError(error, 'stop')});
+    renderLiveStreams();
+    showToast(friendlyRecordingActionError(error, 'stop'), 'bad');
+    throw error;
+  }
 }
 
 function streamerEditorNames() {
@@ -1159,6 +1428,7 @@ function explicitQueueItemState(job, index) {
 function queueItemsFromJobs(jobs, nowMs=Date.now()) {
   const items = [];
   (jobs || []).slice().reverse().forEach(job => {
+    if (job?.type === 'recording') return;
     const logs = job.log || [];
     const progress = parseProgress(logs);
     const sources = job.urls || [];
@@ -1494,6 +1764,7 @@ async function pollJobs() {
   const box = $('jobs');
   updateQueueSummary(data.jobs || []);
   renderVodQueue(data.jobs || [], data.queue_controls || {});
+  updateLiveRecordingJobs(data.jobs || []);
   if (!data.jobs.length) {
     box.textContent = 'No downloads in this session yet.';
     updateQueueSummary([]);
@@ -1556,6 +1827,7 @@ async function refreshDashboard() {
     const yt = data.youtube || {};
     const disk = data.disk || {};
     const queue = queueItemsFromJobs(jobsData.jobs || []);
+    updateLiveRecordingJobs(jobsData.jobs || []);
     const running = queue.filter(item => item.state === 'running' || item.state === 'cancelling');
     const waiting = queue.filter(item => item.state === 'waiting');
     const errors = queue.filter(item => item.state === 'error' && !item.resolved);
@@ -1917,6 +2189,7 @@ $('youtubeConnect').addEventListener('click', async () => {
 $('youtubeLoadPlaylists').addEventListener('click', () => loadYoutubePlaylists().then(() => alert('Playlists loaded.')).catch(e => alert(e.message)));
 $('saveYoutubeSettings').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'youtube'));
 $('saveYoutubeSettingsBottom').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'youtube'));
+$('refreshLiveStatuses').addEventListener('click', () => refreshLiveStatuses().catch(() => {}));
 
 setInterval(() => pollJobs().catch(() => {}), 5000);
 loadState().then(() => {

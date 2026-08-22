@@ -677,6 +677,22 @@ main { width:100%; max-width:1320px; }
 
 .dashboard-alerts { display:grid; gap:12px; }
 .dashboard-alerts:empty { display:none; }
+.live-stream-list { display:grid; gap:9px; }
+.live-stream-empty { padding:13px; border:1px dashed var(--line); border-radius:13px; text-align:center; }
+.live-stream-card { display:grid; grid-template-columns:12px minmax(0,1fr) auto; gap:12px; align-items:center; padding:12px 13px; border:1px solid var(--line); border-radius:15px; background:#0e1522; }
+.live-stream-indicator { width:10px; height:10px; border-radius:999px; background:#718096; box-shadow:0 0 0 4px rgba(113,128,150,.12); }
+.live-stream-card.is-live .live-stream-indicator { background:#ff525d; box-shadow:0 0 0 4px rgba(255,82,93,.14); }
+.live-stream-card.is-recording .live-stream-indicator { background:var(--good); box-shadow:0 0 0 4px rgba(87,214,141,.14); }
+.live-stream-card.is-error .live-stream-indicator { background:#ffb85c; box-shadow:0 0 0 4px rgba(255,184,92,.14); }
+.live-stream-card.is-checking .live-stream-indicator { background:var(--accent); }
+.live-stream-copy { min-width:0; display:grid; gap:3px; }
+.live-stream-copy strong, .live-stream-title { overflow-wrap:anywhere; }
+.live-stream-state { color:#dbe7ff; font-size:13px; font-weight:700; }
+.live-stream-title, .live-stream-time, .live-recording-saved, .live-recording-message, .live-recording-note { font-size:12px; line-height:1.4; }
+.live-stream-title, .live-stream-time { color:var(--muted); }
+.live-recording-saved { color:var(--good); }
+.live-stream-actions { display:flex; align-items:center; justify-content:flex-end; }
+.live-stream-actions button { min-width:132px; }
 .action-alert { display:flex; justify-content:space-between; align-items:center; gap:16px; padding:16px 18px; border:1px solid var(--line); border-radius:18px; background:rgba(19,26,38,.94); }
 .action-alert > div { display:grid; gap:5px; }
 .action-alert span { color:var(--muted); font-size:13px; }
@@ -882,6 +898,9 @@ main { width:100%; max-width:1320px; }
 
 @media (max-width:430px) {
   .dashboard-idle { align-items:stretch; }
+  .live-stream-card { grid-template-columns:12px minmax(0,1fr); align-items:start; }
+  .live-stream-actions { grid-column:1 / -1; }
+  .live-stream-actions button { width:100%; min-height:44px; }
   .streamer-add-row { grid-template-columns:1fr; }
   .streamer-add-row button { width:100%; }
   .queue-vod-item.compact { grid-template-columns:minmax(0,1fr) auto; }

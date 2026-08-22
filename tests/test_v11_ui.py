@@ -302,6 +302,165 @@ process.stdout.write(JSON.stringify({
     return json.loads(completed.stdout)
 
 
+def _evaluate_live_stream_ui() -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for Live Streams UI tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function formatRecordingDuration');
+const end = source.indexOf('function streamerEditorNames');
+if (start < 0 || end < 0 || end <= start) throw new Error('Live Streams UI helpers not found');
+const ACTIVE_RECORDING_STATES = new Set(['queued', 'running', 'stopping']);
+const LIVE_STATUS_CONCURRENCY = 2;
+let liveStreamers = [];
+let liveStreamStatuses = new Map();
+let liveStatusRequests = new Map();
+let liveStatusRefreshPromise = null;
+let liveStatusInitialRefreshStarted = false;
+let liveRecordingJobs = [];
+let liveRecordingActions = new Map();
+const elements = {
+  liveStreamsList: {innerHTML:'', querySelectorAll:() => []},
+  liveStreamsRefreshStatus: {textContent:''},
+  refreshLiveStatuses: {disabled:false}
+};
+const $ = id => elements[id] || null;
+function canonicalStreamerLoginClient(value) {
+  const login = String(value || '').trim().replace(/^@+/, '').toLowerCase();
+  return /^[a-z0-9_]{1,25}$/.test(login) ? login : '';
+}
+function escapeHtml(value) {
+  return String(value || '').replace(/[&<>'"]/g, character => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;'
+  })[character]);
+}
+let calls = [];
+let apiHandler = async () => ({});
+async function api(path, options={}) {
+  calls.push({path, options});
+  return apiHandler(path, options);
+}
+let pollMode = 'resolved';
+let pollCalls = 0;
+function pollJobs() {
+  pollCalls += 1;
+  return pollMode === 'never' ? new Promise(() => {}) : Promise.resolve();
+}
+function showToast() {}
+eval(source.slice(start, end));
+
+(async () => {
+  syncLiveStreamers(['Nika_LiveTV', 'DigitalGirlUli']);
+  const configuredHtml = elements.liveStreamsList.innerHTML;
+
+  liveStreamStatuses.set('nika_livetv', {
+    state:'live', streamer:'nika_livetv', title:'Synthetic stream title',
+    started_at:'2026-08-23T20:14:00Z'
+  });
+  liveRecordingJobs = [];
+  const liveHtml = renderLiveStreamCard('Nika_LiveTV');
+  liveStreamStatuses.set('nika_livetv', {state:'offline', streamer:'nika_livetv'});
+  const offlineHtml = renderLiveStreamCard('Nika_LiveTV');
+  liveStreamStatuses.set('nika_livetv', {state:'error', streamer:'nika_livetv'});
+  const errorHtml = renderLiveStreamCard('Nika_LiveTV');
+
+  const statuses = {
+    queued: recordingStatusText({state:'queued'}),
+    running: recordingStatusText({state:'running', recorded_seconds:5077}),
+    stopping: recordingStatusText({state:'stopping'}),
+    natural: recordingStatusText({state:'completed', completion_reason:'natural_end'}),
+    stopped: recordingStatusText({state:'completed', completion_reason:'stopped_by_user'}),
+    processError: recordingStatusText({state:'failed', completion_reason:'process_error'}),
+    incomplete: recordingStatusText({state:'failed', completion_reason:'stop_incomplete'}),
+    stopFailed: recordingStatusText({state:'failed', completion_reason:'stop_failed'})
+  };
+
+  liveStreamStatuses.set('nika_livetv', {state:'error', streamer:'nika_livetv'});
+  liveRecordingJobs = [{
+    id:'recording-7', type:'recording', streamer:'nika_livetv', state:'running',
+    recorded_seconds:5077, title:'Recording title'
+  }];
+  const recordingOverridesErrorHtml = renderLiveStreamCard('Nika_LiveTV');
+  liveStreamStatuses.set('digitalgirluli', {
+    state:'live', streamer:'digitalgirluli', title:'Another live stream'
+  });
+  const otherStreamerHtml = renderLiveStreamCard('DigitalGirlUli');
+
+  calls = [];
+  liveRecordingJobs = [];
+  liveRecordingActions = new Map();
+  liveStreamers = ['Nika_LiveTV', 'DigitalGirlUli'];
+  liveStreamStatuses = new Map();
+  apiHandler = async path => ({
+    streamer:path.includes('nika_livetv') ? 'nika_livetv' : 'digitalgirluli',
+    state:path.includes('nika_livetv') ? 'live' : 'offline',
+    title:'Refreshed title'
+  });
+  await refreshLiveStatuses();
+  const refreshCalls = calls.filter(call => call.path.startsWith('/api/live/status'));
+
+  calls = [];
+  liveStreamStatuses = new Map();
+  apiHandler = path => new Promise(resolve => setTimeout(() => resolve({
+    streamer:'nika_livetv', state:'live', title:'Deduplicated'
+  }), 5));
+  await Promise.all([
+    requestLiveStatus('Nika_LiveTV'),
+    requestLiveStatus('@nika_livetv')
+  ]);
+  const duplicateCalls = calls.filter(call => call.path.startsWith('/api/live/status'));
+
+  calls = [];
+  pollMode = 'resolved';
+  pollCalls = 0;
+  liveRecordingJobs = [];
+  liveRecordingActions = new Map();
+  liveStreamStatuses.set('nika_livetv', {state:'live', streamer:'nika_livetv'});
+  apiHandler = async () => ({job_id:'recording-9', state:'queued'});
+  await startLiveRecording('@Nika_LiveTV');
+  const startCall = calls.find(call => call.path === '/api/live/record');
+
+  calls = [];
+  pollMode = 'never';
+  let stopResolved = false;
+  apiHandler = async () => ({job_id:'recording-7', state:'stopping'});
+  await stopLiveRecording('recording-7', 'Nika_LiveTV');
+  stopResolved = true;
+  const stopCall = calls.find(call => call.path.includes('/stop'));
+
+  process.stdout.write(JSON.stringify({
+    configuredHtml, liveHtml, offlineHtml, errorHtml, statuses,
+    duration:formatRecordingDuration(5077),
+    invalidDuration:formatRecordingDuration('invalid'),
+    recordingOverridesErrorHtml, otherStreamerHtml,
+    refreshPaths:refreshCalls.map(call => call.path),
+    duplicateCount:duplicateCalls.length,
+    refreshMessage:elements.liveStreamsRefreshStatus.textContent,
+    startPath:startCall.path,
+    startBody:JSON.parse(startCall.options.body),
+    stopPath:stopCall.path,
+    stopMethod:stopCall.options.method,
+    stopResolved,
+    conflict:friendlyRecordingActionError(new Error('recording_conflict'), 'start')
+  }));
+})().catch(error => {
+  process.stderr.write(String(error.stack || error));
+  process.exitCode = 1;
+});
+"""
+    completed = subprocess.run(
+        [NODE, "-e", runner],
+        cwd=ROOT,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
 class _IdParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -312,6 +471,92 @@ class _IdParser(HTMLParser):
 
 
 class V11UiContractTests(unittest.TestCase):
+    def test_live_streams_section_uses_configured_streamers_and_safe_states(self) -> None:
+        result = _evaluate_live_stream_ui()
+
+        self.assertIn('id="liveStreamsSection"', TEMPLATE)
+        self.assertIn('id="refreshLiveStatuses"', TEMPLATE)
+        self.assertIn("Nika_LiveTV", result["configuredHtml"])
+        self.assertIn("DigitalGirlUli", result["configuredHtml"])
+        self.assertIn("Synthetic stream title", result["liveHtml"])
+        self.assertIn("LIVE", result["liveHtml"])
+        self.assertIn("Start Recording", result["liveHtml"])
+        self.assertIn("Offline", result["offlineHtml"])
+        self.assertNotIn("Start Recording", result["offlineHtml"])
+        self.assertIn("Status could not be loaded", result["errorHtml"])
+        self.assertNotIn("yt-dlp", result["errorHtml"])
+
+    def test_live_status_refresh_is_bounded_deduplicated_and_manual(self) -> None:
+        result = _evaluate_live_stream_ui()
+
+        self.assertEqual(
+            sorted(result["refreshPaths"]),
+            [
+                "/api/live/status?streamer=digitalgirluli",
+                "/api/live/status?streamer=nika_livetv",
+            ],
+        )
+        self.assertEqual(result["duplicateCount"], 1)
+        self.assertEqual(result["refreshMessage"], "Live status updated.")
+        self.assertIn("const LIVE_STATUS_CONCURRENCY = 2", JAVASCRIPT)
+        self.assertEqual(JAVASCRIPT.count("setInterval(() => pollJobs()"), 1)
+        self.assertNotIn("setInterval(() => refreshLiveStatuses", JAVASCRIPT)
+
+    def test_recording_jobs_drive_lifecycle_duration_and_failure_copy(self) -> None:
+        result = _evaluate_live_stream_ui()
+        statuses = result["statuses"]
+
+        self.assertEqual(result["duration"], "01:24:37")
+        self.assertEqual(result["invalidDuration"], "00:00:00")
+        self.assertEqual(statuses["queued"], "Recording is starting…")
+        self.assertEqual(statuses["running"], "Recording running · 01:24:37")
+        self.assertEqual(statuses["stopping"], "Recording is stopping…")
+        self.assertEqual(statuses["natural"], "Stream ended · recording completed")
+        self.assertEqual(statuses["stopped"], "Recording stopped")
+        self.assertEqual(statuses["processError"], "Recording failed")
+        self.assertEqual(statuses["incomplete"], "Recording could not be saved completely")
+        self.assertEqual(statuses["stopFailed"], "Recording could not be stopped cleanly")
+        self.assertIn("Recording running", result["recordingOverridesErrorHtml"])
+        self.assertIn('data-job-id="recording-7"', result["recordingOverridesErrorHtml"])
+        self.assertIn("if (job?.type === 'recording') return;", JAVASCRIPT)
+
+        queue_items = _classify_download_jobs(
+            [
+                {
+                    "id": "recording-7",
+                    "type": "recording",
+                    "label": "Live recording: nika_livetv",
+                    "streamer": "nika_livetv",
+                    "state": "running",
+                    "urls": ["nika_livetv"],
+                    "item_ids": ["recording-7-item-1"],
+                    "item_states": ["running"],
+                    "log": [],
+                }
+            ]
+        )
+        self.assertEqual(queue_items, [])
+
+    def test_recording_actions_are_minimal_fast_and_globally_exclusive(self) -> None:
+        result = _evaluate_live_stream_ui()
+
+        self.assertEqual(result["startPath"], "/api/live/record")
+        self.assertEqual(result["startBody"], {"streamer": "nika_livetv"})
+        self.assertEqual(result["stopPath"], "/api/live/record/recording-7/stop")
+        self.assertEqual(result["stopMethod"], "POST")
+        self.assertTrue(result["stopResolved"])
+        self.assertEqual(result["conflict"], "Another recording is already active.")
+        self.assertIn("Start Recording", result["otherStreamerHtml"])
+        self.assertIn("disabled", result["otherStreamerHtml"])
+        self.assertIn("Another recording is already active.", result["otherStreamerHtml"])
+        self.assertIn("pollJobs().catch(() => {})", JAVASCRIPT)
+
+    def test_live_streams_mobile_and_accessibility_contract(self) -> None:
+        self.assertIn('role="status" aria-live="polite"', TEMPLATE)
+        self.assertIn('id="liveStreamsList" class="live-stream-list" aria-live="polite"', TEMPLATE)
+        self.assertIn(".live-stream-card { grid-template-columns:12px minmax(0,1fr);", STYLESHEET)
+        self.assertIn(".live-stream-actions button { width:100%; min-height:44px; }", STYLESHEET)
+
     def test_primary_navigation_is_task_oriented(self) -> None:
         buttons = re.findall(
             r'class="nav-btn(?: active)?" data-page="([^"]+)">([^<]+)</button>',

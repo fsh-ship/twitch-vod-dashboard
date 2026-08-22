@@ -40,6 +40,16 @@
       <main>
         <section class="page active" id="page-dashboard">
           <section id="dashboardAlerts" class="dashboard-alerts" aria-live="polite"></section>
+          <section class="card live-streams-section" id="liveStreamsSection">
+            <div class="section-heading">
+              <div><p class="eyebrow">Manual recorder</p><h2>Live Streams</h2><p class="muted">Check configured Twitch channels and start one recording at a time.</p></div>
+              <button type="button" class="quiet-button" id="refreshLiveStatuses">Refresh Status</button>
+            </div>
+            <div id="liveStreamsRefreshStatus" class="field-message muted" role="status" aria-live="polite"></div>
+            <div id="liveStreamsList" class="live-stream-list" aria-live="polite">
+              <div class="live-stream-empty muted">Configured streamers have not been loaded yet.</div>
+            </div>
+          </section>
           <section class="card" id="dashboardRunningSection">
             <div class="section-heading"><div><p class="eyebrow">Current activity</p><h2>Running</h2></div><button type="button" class="goto-page quiet-button" data-page="queue">View Queue</button></div>
             <div id="dashboardRunning" class="activity-list muted">No downloads or uploads are currently running.</div>

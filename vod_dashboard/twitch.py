@@ -228,6 +228,7 @@ _TWITCH_NOT_LIVE_RE = re.compile(
     r"\b(?:the\s+)?(?:channel|user)\s+is\s+not\s+currently\s+live\b",
     re.IGNORECASE,
 )
+LIVE_STATUS_TIMEOUT_SECONDS = 30
 _TWITCH_QUALITY_RE = re.compile(
     r"(?<!\d)(\d{3,4})p(?:([1-9]\d{1,2}))?\b", re.IGNORECASE
 )
@@ -351,7 +352,10 @@ def run_ytdlp_live_status(
 
     try:
         process = subprocess.run(
-            command, capture_output=True, text=True, timeout=180
+            command,
+            capture_output=True,
+            text=True,
+            timeout=LIVE_STATUS_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("The Twitch live-status query timed out.") from exc
