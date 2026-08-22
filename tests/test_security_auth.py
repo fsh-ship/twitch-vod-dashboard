@@ -128,6 +128,15 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
         self.assertEqual(live_response.status_code, 401)
         self.assertIn("Authentication", live_response.get_json()["error"])
 
+        recording_start = self.client.post(
+            "/api/live/record", json={"streamer": "nika_livetv"}
+        )
+        recording_stop = self.client.post(
+            "/api/live/record/1/stop"
+        )
+        self.assertEqual(recording_start.status_code, 401)
+        self.assertEqual(recording_stop.status_code, 401)
+
     def test_successful_login_rotates_session_state_and_sets_secure_cookie_flags(self):
         response, pre_login_token = self.login()
         self.assertEqual(response.status_code, 302)
@@ -206,6 +215,18 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertIn("CSRF", response.get_json()["error"])
 
+        recording_start = self.client.post(
+            "/api/live/record",
+            json={"streamer": "nika_livetv"},
+            headers={"Origin": self.ORIGIN},
+        )
+        recording_stop = self.client.post(
+            "/api/live/record/1/stop",
+            headers={"Origin": self.ORIGIN},
+        )
+        self.assertEqual(recording_start.status_code, 403)
+        self.assertEqual(recording_stop.status_code, 403)
+
     def test_invalid_csrf_token_is_rejected(self):
         self.assertEqual(self.login()[0].status_code, 302)
         response = self.client.post(
@@ -226,6 +247,17 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 403)
         self.assertIn("origin", response.get_json()["error"])
+
+        recording = self.client.post(
+            "/api/live/record",
+            json={"streamer": "nika_livetv"},
+            headers={
+                "Origin": "https://attacker.invalid",
+                "X-CSRF-Token": csrf_token,
+            },
+        )
+        self.assertEqual(recording.status_code, 403)
+        self.assertIn("origin", recording.get_json()["error"])
 
     def test_login_requires_pre_authentication_csrf_token(self):
         response = self.client.post(

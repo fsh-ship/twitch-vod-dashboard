@@ -1505,6 +1505,112 @@ def api_live_status():
         ), 502
 
 
+def _recording_api_payload(job: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "job_id": str(job.get("id") or ""),
+        "state": str(job.get("state") or ""),
+        "streamer": str(job.get("streamer") or ""),
+        "completion_reason": str(job.get("completion_reason") or ""),
+        "output_complete": bool(job.get("output_complete")),
+        "output_path": job.get("output_path"),
+    }
+
+
+@app.post("/api/live/record")
+def api_start_live_recording():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "invalid_request"}), 400
+    if set(data) - {"streamer"}:
+        return jsonify({"error": "unsupported_recording_parameters"}), 400
+
+    canonical_login = dashboard_settings.canonical_streamer_login(
+        data.get("streamer")
+    )
+    if not canonical_login:
+        return jsonify({"error": "invalid_streamer"}), 400
+    settings = load_settings()
+    configured_logins = {
+        dashboard_settings.canonical_streamer_login(streamer)
+        for streamer in read_streamers(settings)
+    }
+    if canonical_login not in configured_logins:
+        return jsonify(
+            {"error": "streamer_not_configured", "streamer": canonical_login}
+        ), 404
+
+    manager = _job_manager_for_compatibility()
+    if manager.has_pending_or_active_recording():
+        return jsonify({"error": "recording_conflict"}), 409
+
+    try:
+        live_metadata = run_ytdlp_live_status(canonical_login, settings)
+    except Exception as exc:
+        log_line(f"Recording live check failed for {canonical_login}: {exc}")
+        return jsonify(
+            {"error": "live_status_unavailable", "streamer": canonical_login}
+        ), 502
+    if live_metadata.get("state") != "live":
+        return jsonify(
+            {"error": "streamer_not_live", "streamer": canonical_login}
+        ), 409
+
+    try:
+        job_id = create_recording_job(canonical_login, live_metadata)
+    except RuntimeError as exc:
+        if "already queued or active" in str(exc):
+            return jsonify({"error": "recording_conflict"}), 409
+        log_line(f"Recording job creation failed for {canonical_login}: {exc}")
+        return jsonify({"error": "recording_start_failed"}), 500
+
+    job = manager.get_job(job_id) or {
+        "id": job_id,
+        "state": "queued",
+        "streamer": canonical_login,
+    }
+    return jsonify(_recording_api_payload(job)), 201
+
+
+@app.post("/api/live/record/<job_id>/stop")
+def api_stop_live_recording(job_id: str):
+    manager = _job_manager_for_compatibility()
+    job = manager.get_job(job_id)
+    if job is None:
+        return jsonify({"error": "recording_job_not_found"}), 404
+    if job.get("type") != "recording":
+        return jsonify({"error": "not_a_recording_job"}), 409
+    if (
+        job.get("state") == "completed"
+        and job.get("completion_reason") == "stopped_by_user"
+    ):
+        return jsonify(_recording_api_payload(job)), 200
+    if job.get("state") in {"completed", "failed"}:
+        return jsonify(
+            {
+                "error": "recording_not_stoppable",
+                **_recording_api_payload(job),
+            }
+        ), 409
+
+    if not manager.request_recording_stop(job_id):
+        current = manager.get_job(job_id) or job
+        if (
+            current.get("state") == "completed"
+            and current.get("completion_reason") == "stopped_by_user"
+        ):
+            return jsonify(_recording_api_payload(current)), 200
+        return jsonify(
+            {
+                "error": "recording_not_stoppable",
+                **_recording_api_payload(current),
+            }
+        ), 409
+
+    manager.start_recording_termination(job_id)
+    current = manager.get_job(job_id) or job
+    return jsonify(_recording_api_payload(current)), 202
+
+
 @app.post("/api/vod/validate")
 def api_vod_validate():
     data = request.json or {}

@@ -225,6 +225,12 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
             ("/api/streamers", "POST", "api_streamers"),
             ("/api/search", "POST", "api_search"),
             ("/api/live/status", "GET", "api_live_status"),
+            ("/api/live/record", "POST", "api_start_live_recording"),
+            (
+                "/api/live/record/<job_id>/stop",
+                "POST",
+                "api_stop_live_recording",
+            ),
             ("/api/vod/validate", "POST", "api_vod_validate"),
             ("/api/download", "POST", "api_download"),
             ("/api/jobs", "GET", "api_jobs"),
@@ -1205,6 +1211,270 @@ class TwitchContractTests(IsolatedDashboardTestCase):
             dashboard.resolve_completed_recording_output(
                 outside, self.settings()
             )
+
+    def test_start_recording_api_checks_live_once_and_forwards_safe_metadata(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "Nika_LiveTV\n", encoding="utf-8"
+        )
+        live_metadata = {
+            "streamer": "nika_livetv",
+            "state": "live",
+            "stream_id": "987654321",
+            "title": "Actual stream title",
+            "started_at": "2026-08-23T18:00:00Z",
+            "qualities": ["Source", "1080p60"],
+        }
+        manager = dashboard._job_manager_for_compatibility()
+        with mock.patch.object(
+            dashboard, "run_ytdlp_live_status", return_value=live_metadata
+        ) as live_check, mock.patch.object(manager, "start_worker") as start_worker:
+            response = self.client.post(
+                "/api/live/record",
+                json={"streamer": "@NIKA_LIVETV"},
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(
+            response.get_json(),
+            {
+                "job_id": "1",
+                "state": "queued",
+                "streamer": "nika_livetv",
+                "completion_reason": "",
+                "output_complete": False,
+                "output_path": None,
+            },
+        )
+        live_check.assert_called_once()
+        self.assertEqual(live_check.call_args.args[0], "nika_livetv")
+        job = manager.jobs["1"]
+        self.assertEqual(job["stream_id"], "987654321")
+        self.assertEqual(job["title"], "Actual stream title")
+        self.assertEqual(job["live_started_at"], "2026-08-23T18:00:00Z")
+        self.assertEqual(job["quality"], self.settings()["quality"])
+        start_worker.assert_called_once_with(
+            dashboard.run_recording_job, "1"
+        )
+
+    def test_start_recording_api_rejects_offline_without_creating_job(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "nika_livetv\n", encoding="utf-8"
+        )
+        with mock.patch.object(
+            dashboard,
+            "run_ytdlp_live_status",
+            return_value={"streamer": "nika_livetv", "state": "offline"},
+        ), mock.patch.object(dashboard, "create_recording_job") as create:
+            response = self.client.post(
+                "/api/live/record",
+                json={"streamer": "nika_livetv"},
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"], "streamer_not_live")
+        create.assert_not_called()
+        self.assertEqual(dashboard.jobs, {})
+
+    def test_start_recording_api_live_check_failure_is_generic(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "nika_livetv\n", encoding="utf-8"
+        )
+        with mock.patch.object(
+            dashboard,
+            "run_ytdlp_live_status",
+            side_effect=RuntimeError(
+                "https://signed.invalid/master.m3u8?token=DO-NOT-LEAK"
+            ),
+        ), mock.patch.object(dashboard, "log_line"):
+            response = self.client.post(
+                "/api/live/record",
+                json={"streamer": "nika_livetv"},
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 502)
+        serialized = json.dumps(response.get_json())
+        self.assertNotIn("signed.invalid", serialized)
+        self.assertNotIn("DO-NOT-LEAK", serialized)
+
+    def test_start_recording_api_validates_allowlist_and_input_surface(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "nika_livetv\n", encoding="utf-8"
+        )
+        invalid = self.client.post(
+            "/api/live/record",
+            json={"streamer": "bad-name!"},
+            headers=self.csrf_headers,
+        )
+        missing = self.client.post(
+            "/api/live/record",
+            json={"streamer": "other_streamer"},
+            headers=self.csrf_headers,
+        )
+        extra = self.client.post(
+            "/api/live/record",
+            json={
+                "streamer": "nika_livetv",
+                "url": "https://attacker.invalid/stream.m3u8",
+                "path": "C:/outside.mp4",
+                "arguments": ["--exec", "SECRET"],
+                "quality": "worst",
+            },
+            headers=self.csrf_headers,
+        )
+
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(extra.status_code, 400)
+        serialized = json.dumps(extra.get_json())
+        self.assertNotIn("attacker.invalid", serialized)
+        self.assertNotIn("SECRET", serialized)
+
+    def test_start_recording_api_rejects_second_recording_before_live_check(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "nika_livetv\n", encoding="utf-8"
+        )
+        manager = dashboard._job_manager_for_compatibility()
+        manager.create_recording_job("nika_livetv")
+        with mock.patch.object(dashboard, "run_ytdlp_live_status") as live_check:
+            response = self.client.post(
+                "/api/live/record",
+                json={"streamer": "nika_livetv"},
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"], "recording_conflict")
+        live_check.assert_not_called()
+
+    def test_stop_recording_api_is_fast_idempotent_and_recording_only(self):
+        manager = dashboard._job_manager_for_compatibility()
+        job_id = manager.create_recording_job("nika_livetv")
+        claimed = manager.claim_recording_job(job_id)
+        manager.register_recording_process(job_id, claimed["item_id"], mock.Mock())
+
+        with mock.patch.object(
+            manager, "start_recording_termination", return_value=True
+        ) as start_stop:
+            first = self.client.post(
+                f"/api/live/record/{job_id}/stop",
+                headers=self.csrf_headers,
+            )
+            second = self.client.post(
+                f"/api/live/record/{job_id}/stop",
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 202)
+        self.assertEqual(first.get_json()["state"], "stopping")
+        self.assertEqual(second.get_json()["state"], "stopping")
+        self.assertTrue(manager.jobs[job_id]["stop_requested"])
+        self.assertEqual(start_stop.call_count, 2)
+
+        download_id = manager.create_download_job(["vod"], "Download")
+        wrong_type = self.client.post(
+            f"/api/live/record/{download_id}/stop",
+            headers=self.csrf_headers,
+        )
+        unknown = self.client.post(
+            "/api/live/record/missing/stop", headers=self.csrf_headers
+        )
+        self.assertEqual(wrong_type.status_code, 409)
+        self.assertEqual(unknown.status_code, 404)
+        manager.finalize_recording_job(
+            job_id,
+            claimed["item_id"],
+            state="failed",
+            returncode=-2,
+            completion_reason="stop_incomplete",
+        )
+
+    def test_stop_recording_api_terminal_semantics_are_stable(self):
+        manager = dashboard._job_manager_for_compatibility()
+        stopped_id = manager.create_recording_job("nika_livetv")
+        stopped_claim = manager.claim_recording_job(stopped_id)
+        manager.finalize_recording_job(
+            stopped_id,
+            stopped_claim["item_id"],
+            state="completed",
+            returncode=130,
+            completion_reason="stopped_by_user",
+            output_path="nika_livetv/stopped.mp4",
+        )
+        stopped = self.client.post(
+            f"/api/live/record/{stopped_id}/stop",
+            headers=self.csrf_headers,
+        )
+
+        natural_id = manager.create_recording_job("nika_livetv")
+        natural_claim = manager.claim_recording_job(natural_id)
+        manager.finalize_recording_job(
+            natural_id,
+            natural_claim["item_id"],
+            state="completed",
+            returncode=0,
+            completion_reason="natural_end",
+        )
+        natural = self.client.post(
+            f"/api/live/record/{natural_id}/stop",
+            headers=self.csrf_headers,
+        )
+
+        failed_id = manager.create_recording_job("nika_livetv")
+        failed_claim = manager.claim_recording_job(failed_id)
+        manager.finalize_recording_job(
+            failed_id,
+            failed_claim["item_id"],
+            state="failed",
+            returncode=9,
+            completion_reason="process_error",
+        )
+        failed = self.client.post(
+            f"/api/live/record/{failed_id}/stop",
+            headers=self.csrf_headers,
+        )
+
+        self.assertEqual(stopped.status_code, 200)
+        self.assertEqual(stopped.get_json()["state"], "completed")
+        self.assertEqual(
+            stopped.get_json()["completion_reason"], "stopped_by_user"
+        )
+        self.assertEqual(natural.status_code, 409)
+        self.assertEqual(natural.get_json()["error"], "recording_not_stoppable")
+        self.assertEqual(failed.status_code, 409)
+        self.assertEqual(failed.get_json()["error"], "recording_not_stoppable")
+
+    def test_jobs_api_exposes_safe_recording_fields_not_process_state(self):
+        manager = dashboard._job_manager_for_compatibility()
+        job_id = manager.create_recording_job(
+            "nika_livetv",
+            title="Safe title",
+            stream_id="987654321",
+        )
+        response = self.client.get("/api/jobs")
+
+        self.assertEqual(response.status_code, 200)
+        recording = next(
+            job for job in response.get_json()["jobs"] if job["id"] == job_id
+        )
+        for key in (
+            "id",
+            "type",
+            "streamer",
+            "state",
+            "recorded_seconds",
+            "title",
+            "output_complete",
+            "output_path",
+            "completion_reason",
+        ):
+            self.assertIn(key, recording)
+        serialized = json.dumps(recording)
+        self.assertNotIn("_recording_process", serialized)
+        self.assertNotIn("signed", serialized)
 
     def test_ytdlp_download_arguments_and_cookie_precedence_are_frozen(self):
         cookie_file = self.runtime_dir / "twitch-cookies.txt"

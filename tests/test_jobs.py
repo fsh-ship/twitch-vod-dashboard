@@ -12,6 +12,10 @@ from unittest import mock
 from vod_dashboard.jobs import (
     DownloadWorkerDependencies,
     JobManager,
+    RECORDING_GRACEFUL_STOP_TIMEOUT_SECONDS,
+    RECORDING_STOP_RESULT_GRACEFUL,
+    RECORDING_STOP_RESULT_KILLED,
+    RECORDING_TERMINATE_TIMEOUT_SECONDS,
     RecordingWorkerDependencies,
     UploadWorkerDependencies,
     ffmpeg_download_metrics,
@@ -22,7 +26,22 @@ from vod_dashboard.jobs import (
     run_recording_job,
     run_upload_job,
     terminate_download_process_tree,
+    terminate_recording_process_tree,
 )
+
+
+class ImmediateThread:
+    def __init__(self, *, target, daemon):
+        self.target = target
+        self.daemon = daemon
+
+    def start(self):
+        self.target()
+
+
+class DeferredThread(ImmediateThread):
+    def start(self):
+        self.started = True
 
 
 class JobManagerTests(unittest.TestCase):
@@ -554,6 +573,75 @@ class QueueControlManagerTests(unittest.TestCase):
         self.assertEqual(self.manager.jobs[job_id]["state"], "stopping")
         self.assertTrue(self.manager.jobs[job_id]["stop_requested"])
 
+    def test_recording_stop_before_process_registration_is_not_lost(self):
+        job_id = self.manager.create_recording_job("nika_livetv")
+
+        self.assertTrue(self.manager.request_recording_stop(job_id))
+        claimed = self.manager.claim_recording_job(job_id)
+        process = mock.Mock()
+
+        self.assertEqual(claimed["lane"], "recording")
+        self.assertEqual(
+            self.manager.item_state(job_id, claimed["item_id"]), "stopping"
+        )
+        self.assertTrue(
+            self.manager.register_recording_process(
+                job_id, claimed["item_id"], process
+            )
+        )
+
+    def test_recording_termination_thread_is_deduplicated(self):
+        job_id = self.manager.create_recording_job("nika_livetv")
+        claimed = self.manager.claim_recording_job(job_id)
+        process = mock.Mock()
+        self.manager.register_recording_process(
+            job_id, claimed["item_id"], process
+        )
+        self.manager.request_recording_stop(job_id)
+        terminator = mock.Mock(return_value=RECORDING_STOP_RESULT_GRACEFUL)
+        thread_factory = mock.Mock(side_effect=ImmediateThread)
+
+        self.assertTrue(
+            self.manager.start_recording_termination(
+                job_id,
+                terminator=terminator,
+                thread_factory=thread_factory,
+            )
+        )
+        self.assertTrue(
+            self.manager.start_recording_termination(
+                job_id,
+                terminator=terminator,
+                thread_factory=thread_factory,
+            )
+        )
+
+        thread_factory.assert_called_once()
+        terminator.assert_called_once()
+        self.assertEqual(
+            self.manager.wait_recording_stop_result(job_id),
+            RECORDING_STOP_RESULT_GRACEFUL,
+        )
+
+    def test_recording_termination_scheduling_does_not_run_grace_wait_inline(self):
+        job_id = self.manager.create_recording_job("nika_livetv")
+        claimed = self.manager.claim_recording_job(job_id)
+        self.manager.register_recording_process(
+            job_id, claimed["item_id"], mock.Mock()
+        )
+        self.manager.request_recording_stop(job_id)
+        terminator = mock.Mock()
+
+        self.assertTrue(
+            self.manager.start_recording_termination(
+                job_id,
+                terminator=terminator,
+                thread_factory=DeferredThread,
+            )
+        )
+
+        terminator.assert_not_called()
+
     def test_public_queue_controls_do_not_operate_on_recording_items(self):
         job_id = self.manager.create_recording_job("nika_livetv")
         item_id = self.manager.jobs[job_id]["item_ids"][0]
@@ -777,7 +865,13 @@ class RecordingWorkerTests(unittest.TestCase):
             output_name="nika_livetv/live-template.%(ext)s",
         )
 
-    def dependencies(self, job_id, lines, returncode=0):
+    def dependencies(
+        self,
+        job_id,
+        lines,
+        returncode=0,
+        stop_result=RECORDING_STOP_RESULT_GRACEFUL,
+    ):
         process_calls = []
 
         def build_command(streamer, settings):
@@ -793,7 +887,9 @@ class RecordingWorkerTests(unittest.TestCase):
             return path.relative_to(self.root).as_posix()
 
         def popen(command, **kwargs):
-            self.assertEqual(self.manager.jobs[job_id]["state"], "running")
+            self.assertIn(
+                self.manager.jobs[job_id]["state"], {"running", "stopping"}
+            )
             process = mock.Mock(pid=4321)
 
             def output():
@@ -815,6 +911,8 @@ class RecordingWorkerTests(unittest.TestCase):
             resolve_completed_output=resolve_output,
             output_marker=self.OUTPUT_MARKER,
             popen=popen,
+            terminate_process=mock.Mock(return_value=stop_result),
+            thread_factory=ImmediateThread,
         ), process_calls
 
     def test_success_tracks_duration_process_and_safe_final_output(self):
@@ -901,12 +999,16 @@ class RecordingWorkerTests(unittest.TestCase):
         self.assertEqual(len(logs), 500)
         self.assertEqual(logs[-1], "Recording completed naturally.")
 
-    def test_internal_stop_request_finishes_without_failed_state(self):
+    def test_user_stop_with_final_output_completes_without_failed_state(self):
         job_id = self.create_job()
+        video = self.root / "nika_livetv" / "stopped.mp4"
+        video.parent.mkdir()
+        video.write_bytes(b"video")
 
         def request_stop():
             self.assertTrue(self.manager.request_recording_stop(job_id))
             yield "frame=1 time=00:00:12.00 speed=1x\n"
+            yield f"{self.OUTPUT_MARKER}{video}\n"
 
         dependencies, _ = self.dependencies(
             job_id, request_stop(), returncode=130
@@ -919,6 +1021,71 @@ class RecordingWorkerTests(unittest.TestCase):
         self.assertEqual(job["completion_reason"], "stopped_by_user")
         self.assertEqual(job["returncode"], 130)
         self.assertEqual(job["recorded_seconds"], 12.0)
+        self.assertTrue(job["output_complete"])
+        self.assertEqual(job["output_path"], "nika_livetv/stopped.mp4")
+
+    def test_stop_requested_before_registration_stops_new_process(self):
+        job_id = self.create_job()
+        video = self.root / "nika_livetv" / "early-stop.mp4"
+        video.parent.mkdir()
+        video.write_bytes(b"video")
+        self.assertTrue(self.manager.request_recording_stop(job_id))
+        dependencies, _ = self.dependencies(
+            job_id,
+            [f"{self.OUTPUT_MARKER}{video}\n"],
+            returncode=130,
+        )
+
+        run_recording_job(job_id, self.manager, dependencies)
+
+        dependencies.terminate_process.assert_called_once()
+        job = self.manager.jobs[job_id]
+        self.assertEqual(job["state"], "completed")
+        self.assertEqual(job["completion_reason"], "stopped_by_user")
+
+    def test_user_stop_without_final_output_is_conservatively_failed(self):
+        job_id = self.create_job()
+
+        def request_stop():
+            self.manager.request_recording_stop(job_id)
+            yield "frame=1 time=00:00:12.00 speed=1x\n"
+
+        dependencies, _ = self.dependencies(
+            job_id, request_stop(), returncode=130
+        )
+
+        run_recording_job(job_id, self.manager, dependencies)
+
+        job = self.manager.jobs[job_id]
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(job["completion_reason"], "stop_incomplete")
+        self.assertFalse(job["output_complete"])
+        self.assertIsNone(job["output_path"])
+
+    def test_hard_kill_is_never_reported_as_successful_user_stop(self):
+        job_id = self.create_job()
+        video = self.root / "nika_livetv" / "forced.mp4"
+        video.parent.mkdir()
+        video.write_bytes(b"video")
+
+        def request_stop():
+            self.manager.request_recording_stop(job_id)
+            yield f"{self.OUTPUT_MARKER}{video}\n"
+
+        dependencies, _ = self.dependencies(
+            job_id,
+            request_stop(),
+            returncode=-9,
+            stop_result=RECORDING_STOP_RESULT_KILLED,
+        )
+
+        run_recording_job(job_id, self.manager, dependencies)
+
+        job = self.manager.jobs[job_id]
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(job["completion_reason"], "stop_failed")
+        self.assertFalse(job["output_complete"])
+        self.assertIsNone(self.manager.recording_process(job_id))
 
 
 class DownloadProcessControlTests(unittest.TestCase):
@@ -975,6 +1142,118 @@ class DownloadProcessControlTests(unittest.TestCase):
             ],
         )
         self.assertEqual(process.wait.call_count, 3)
+
+
+class RecordingProcessControlTests(unittest.TestCase):
+    def test_recording_stop_uses_dedicated_generous_timeouts(self):
+        self.assertEqual(RECORDING_GRACEFUL_STOP_TIMEOUT_SECONDS, 30.0)
+        self.assertEqual(RECORDING_TERMINATE_TIMEOUT_SECONDS, 15.0)
+
+    def test_posix_recording_stop_sends_sigint_to_process_group(self):
+        process = mock.Mock(pid=4321)
+        process.poll.return_value = None
+        process.wait.return_value = 0
+
+        with mock.patch(
+            "vod_dashboard.jobs.os.getpgid", return_value=9876, create=True
+        ), mock.patch(
+            "vod_dashboard.jobs.os.killpg", create=True
+        ) as kill_group:
+            result = terminate_recording_process_tree(
+                process, platform_name="posix", graceful_timeout=0.01
+            )
+
+        self.assertEqual(result, RECORDING_STOP_RESULT_GRACEFUL)
+        kill_group.assert_called_once_with(9876, signal.SIGINT)
+        process.wait.assert_called_once_with(timeout=0.01)
+
+    def test_posix_recording_stop_escalates_to_sigkill(self):
+        process = mock.Mock(pid=4321)
+        process.poll.return_value = None
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired("yt-dlp", 0.01),
+            subprocess.TimeoutExpired("yt-dlp", 0.01),
+            0,
+        ]
+        messages = []
+
+        with mock.patch(
+            "vod_dashboard.jobs.os.getpgid", return_value=9876, create=True
+        ), mock.patch(
+            "vod_dashboard.jobs.os.killpg", create=True
+        ) as kill_group:
+            result = terminate_recording_process_tree(
+                process,
+                platform_name="posix",
+                graceful_timeout=0.01,
+                terminate_timeout=0.01,
+                log_callback=messages.append,
+            )
+
+        self.assertEqual(result, RECORDING_STOP_RESULT_KILLED)
+        self.assertEqual(
+            kill_group.call_args_list,
+            [
+                mock.call(9876, signal.SIGINT),
+                mock.call(9876, signal.SIGTERM),
+                mock.call(9876, getattr(signal, "SIGKILL", 9)),
+            ],
+        )
+        self.assertEqual(
+            messages,
+            [
+                "Recording stop escalated to SIGTERM.",
+                "Recording stop escalated to SIGKILL.",
+            ],
+        )
+
+    def test_windows_recording_stop_escalates_taskkill_then_force(self):
+        process = mock.Mock(pid=4321)
+        process.poll.return_value = None
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired("yt-dlp", 0.01),
+            subprocess.TimeoutExpired("yt-dlp", 0.01),
+            0,
+        ]
+        messages = []
+
+        with mock.patch.object(
+            signal, "CTRL_BREAK_EVENT", 987, create=True
+        ), mock.patch("vod_dashboard.jobs.subprocess.run") as taskkill:
+            result = terminate_recording_process_tree(
+                process,
+                platform_name="nt",
+                graceful_timeout=0.01,
+                terminate_timeout=0.01,
+                log_callback=messages.append,
+            )
+
+        self.assertEqual(result, RECORDING_STOP_RESULT_KILLED)
+        process.send_signal.assert_called_once_with(987)
+        self.assertEqual(
+            taskkill.call_args_list,
+            [
+                mock.call(
+                    ["taskkill", "/PID", "4321", "/T"],
+                    capture_output=True,
+                    timeout=0.01,
+                    check=False,
+                ),
+                mock.call(
+                    ["taskkill", "/PID", "4321", "/T", "/F"],
+                    capture_output=True,
+                    timeout=0.01,
+                    check=False,
+                ),
+            ],
+        )
+        self.assertEqual(
+            messages,
+            [
+                "Recording stop escalated to taskkill /T.",
+                "Recording stop escalated to taskkill /T /F.",
+            ],
+        )
 
 
 class DownloadWorkerTests(unittest.TestCase):

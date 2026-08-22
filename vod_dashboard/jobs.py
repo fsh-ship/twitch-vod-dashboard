@@ -23,6 +23,13 @@ CounterSetter = Callable[[int], None]
 
 UPLOAD_SPEED_EMA_ALPHA = 0.3
 MIN_UPLOAD_ETA_SPEED_BPS = 1024.0
+RECORDING_GRACEFUL_STOP_TIMEOUT_SECONDS = 30.0
+RECORDING_TERMINATE_TIMEOUT_SECONDS = 15.0
+RECORDING_STOP_RESULT_GRACEFUL = "graceful"
+RECORDING_STOP_RESULT_TERMINATED = "terminated"
+RECORDING_STOP_RESULT_KILLED = "killed"
+RECORDING_STOP_RESULT_ALREADY_EXITED = "already_exited"
+RECORDING_STOP_RESULT_FAILED = "failed"
 ITEM_STATES = {
     "queued",
     "running",
@@ -192,6 +199,73 @@ def terminate_download_process_tree(
         process.wait()
 
 
+def terminate_recording_process_tree(
+    process: Any,
+    *,
+    platform_name: Optional[str] = None,
+    graceful_timeout: float = RECORDING_GRACEFUL_STOP_TIMEOUT_SECONDS,
+    terminate_timeout: float = RECORDING_TERMINATE_TIMEOUT_SECONDS,
+    log_callback: Optional[LogCallback] = None,
+) -> str:
+    """Stop an owned live-recording tree with recording-specific timeouts."""
+    if process is None or process.poll() is not None:
+        if process is not None:
+            process.wait()
+        return RECORDING_STOP_RESULT_ALREADY_EXITED
+
+    def log(message: str) -> None:
+        if log_callback is not None:
+            log_callback(message)
+
+    platform = os.name if platform_name is None else platform_name
+    if platform == "posix":
+        process_group = os.getpgid(process.pid)
+        os.killpg(process_group, signal.SIGINT)
+        try:
+            process.wait(timeout=graceful_timeout)
+            return RECORDING_STOP_RESULT_GRACEFUL
+        except subprocess.TimeoutExpired:
+            log("Recording stop escalated to SIGTERM.")
+            os.killpg(process_group, signal.SIGTERM)
+        try:
+            process.wait(timeout=terminate_timeout)
+            return RECORDING_STOP_RESULT_TERMINATED
+        except subprocess.TimeoutExpired:
+            log("Recording stop escalated to SIGKILL.")
+            os.killpg(process_group, getattr(signal, "SIGKILL", 9))
+            process.wait(timeout=terminate_timeout)
+            return RECORDING_STOP_RESULT_KILLED
+
+    control_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+    if control_break is not None:
+        try:
+            process.send_signal(control_break)
+            process.wait(timeout=graceful_timeout)
+            return RECORDING_STOP_RESULT_GRACEFUL
+        except (OSError, subprocess.TimeoutExpired):
+            log("Recording stop escalated to taskkill /T.")
+
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T"],
+            capture_output=True,
+            timeout=terminate_timeout,
+            check=False,
+        )
+        process.wait(timeout=terminate_timeout)
+        return RECORDING_STOP_RESULT_TERMINATED
+    except (OSError, subprocess.TimeoutExpired):
+        log("Recording stop escalated to taskkill /T /F.")
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+            timeout=terminate_timeout,
+            check=False,
+        )
+        process.wait(timeout=terminate_timeout)
+        return RECORDING_STOP_RESULT_KILLED
+
+
 @dataclass(frozen=True)
 class DownloadWorkerDependencies:
     load_settings: Callable[[], Dict[str, Any]]
@@ -220,6 +294,8 @@ class RecordingWorkerDependencies:
     resolve_completed_output: Callable[[Any, Dict[str, Any]], str]
     output_marker: str
     popen: Callable[..., Any] = subprocess.Popen
+    terminate_process: Callable[..., str] = terminate_recording_process_tree
+    thread_factory: Callable[..., threading.Thread] = threading.Thread
 
 
 @dataclass(frozen=True)
@@ -265,6 +341,9 @@ class JobManager:
         self._download_processes: Dict[tuple[str, str], Any] = {}
         self._recording_processes: Dict[str, Any] = {}
         self._recording_stop_events: Dict[str, threading.Event] = {}
+        self._recording_termination_started: set[str] = set()
+        self._recording_stop_results: Dict[str, str] = {}
+        self._recording_termination_done: Dict[str, threading.Event] = {}
 
     @classmethod
     def compatible_with(
@@ -909,14 +988,19 @@ class JobManager:
             if job is None or job.get("type") != "recording":
                 return None
             self._ensure_control_lists_locked(job)
-            if job["item_states"] != ["queued"]:
+            item_state = job["item_states"][0]
+            if item_state not in {"queued", "stopping"}:
                 return None
             if self._lane_active["recording"] is not None:
                 return None
             item_id = str(job["item_ids"][0])
-            self._set_item_state_locked(job, 0, "running")
+            stop_event = self._recording_stop_events.setdefault(
+                str(job_id), threading.Event()
+            )
+            self._set_item_state_locked(
+                job, 0, "stopping" if stop_event.is_set() else "running"
+            )
             self._lane_active["recording"] = (str(job_id), item_id)
-            self._recording_stop_events[str(job_id)] = threading.Event()
             self._recompute_job_state_locked(job)
             job["updated_at"] = self._created_at()
             return {
@@ -931,6 +1015,14 @@ class JobManager:
     def is_recording_active(self) -> bool:
         with self.lock:
             return self._lane_active["recording"] is not None
+
+    def has_pending_or_active_recording(self) -> bool:
+        with self.lock:
+            return any(
+                job.get("type") == "recording"
+                and job.get("state") in {"queued", "running", "stopping"}
+                for job in self.jobs.values()
+            )
 
     def register_recording_process(
         self, job_id: str, item_id: str, process: Any
@@ -958,14 +1050,19 @@ class JobManager:
             self._recording_processes.pop(str(job_id), None)
 
     def request_recording_stop(self, job_id: str) -> bool:
-        """Record an internal stop request; P3d will add process signalling."""
+        """Record an idempotent internal stop request."""
         with self._condition:
             job = self.jobs.get(str(job_id))
             if job is None or job.get("type") != "recording":
                 return False
             self._ensure_control_lists_locked(job)
             state = job["item_states"][0]
-            if state not in {"running", "stopping"}:
+            if (
+                state == "completed"
+                and job.get("completion_reason") == "stopped_by_user"
+            ):
+                return True
+            if state not in {"queued", "running", "stopping"}:
                 return False
             event = self._recording_stop_events.setdefault(
                 str(job_id), threading.Event()
@@ -977,6 +1074,72 @@ class JobManager:
             job["updated_at"] = self._created_at()
             self._condition.notify_all()
             return True
+
+    def start_recording_termination(
+        self,
+        job_id: str,
+        *,
+        terminator: Callable[..., str] = terminate_recording_process_tree,
+        thread_factory: Callable[..., threading.Thread] = threading.Thread,
+    ) -> bool:
+        """Start at most one asynchronous process-tree stop for a recording."""
+        key = str(job_id)
+        with self.lock:
+            stop_event = self._recording_stop_events.get(key)
+            process = self._recording_processes.get(key)
+            if not stop_event or not stop_event.is_set() or process is None:
+                return False
+            if key in self._recording_termination_started:
+                return True
+            self._recording_termination_started.add(key)
+            done = self._recording_termination_done.setdefault(
+                key, threading.Event()
+            )
+
+        def terminate_owned_tree() -> None:
+            result = RECORDING_STOP_RESULT_FAILED
+            try:
+                result = terminator(
+                    process,
+                    log_callback=lambda message: self.append_job_log(
+                        key, message
+                    ),
+                )
+            except Exception:
+                self.append_job_log(
+                    key, "Recording process-tree stop failed."
+                )
+            finally:
+                with self._condition:
+                    self._recording_stop_results[key] = result
+                    done.set()
+                    self._condition.notify_all()
+
+        try:
+            thread = thread_factory(target=terminate_owned_tree, daemon=True)
+            thread.start()
+        except Exception:
+            with self._condition:
+                self._recording_stop_results[key] = RECORDING_STOP_RESULT_FAILED
+                done.set()
+                self._condition.notify_all()
+            return False
+        return True
+
+    def wait_recording_stop_result(
+        self, job_id: str, timeout: Optional[float] = None
+    ) -> Optional[str]:
+        key = str(job_id)
+        with self.lock:
+            done = self._recording_termination_done.get(key)
+        if done is not None:
+            done.wait(
+                timeout=(
+                    None if timeout is None else max(0.0, float(timeout))
+                )
+            )
+        with self.lock:
+            return self._recording_stop_results.get(key)
 
     def is_recording_stop_requested(self, job_id: str) -> bool:
         with self.lock:
@@ -1040,6 +1203,9 @@ class JobManager:
                 self._lane_active["recording"] = None
             self._recording_processes.pop(str(job_id), None)
             self._recording_stop_events.pop(str(job_id), None)
+            self._recording_termination_started.discard(str(job_id))
+            self._recording_stop_results.pop(str(job_id), None)
+            self._recording_termination_done.pop(str(job_id), None)
             self._recompute_job_state_locked(job)
             self._condition.notify_all()
             return True
@@ -1531,9 +1697,21 @@ def run_recording_job(
         )
         if registration is None:
             raise RuntimeError("The recording process could not be registered.")
+        if registration:
+            manager.start_recording_termination(
+                job_id,
+                terminator=dependencies.terminate_process,
+                thread_factory=dependencies.thread_factory,
+            )
 
         assert process.stdout is not None
         for raw_line in process.stdout:
+            if manager.is_recording_stop_requested(job_id):
+                manager.start_recording_termination(
+                    job_id,
+                    terminator=dependencies.terminate_process,
+                    thread_factory=dependencies.thread_factory,
+                )
             line = str(raw_line or "").rstrip()
             marker_at = line.find(dependencies.output_marker)
             if marker_at >= 0:
@@ -1560,15 +1738,43 @@ def run_recording_job(
         returncode = int(process.wait())
         stop_requested = manager.is_recording_stop_requested(job_id)
         if stop_requested:
-            manager.finalize_recording_job(
-                job_id,
-                item_id,
-                state="completed",
-                returncode=returncode,
-                completion_reason="stopped_by_user",
-                output_path=output_path,
-            )
-            dependencies.append_log(job_id, "Recording stopped.")
+            stop_result = manager.wait_recording_stop_result(job_id)
+            if stop_result in {
+                RECORDING_STOP_RESULT_KILLED,
+                RECORDING_STOP_RESULT_FAILED,
+            }:
+                manager.finalize_recording_job(
+                    job_id,
+                    item_id,
+                    state="failed",
+                    returncode=returncode,
+                    completion_reason="stop_failed",
+                )
+                dependencies.append_log(
+                    job_id, "Recording stop did not finalize cleanly."
+                )
+            elif output_path:
+                manager.finalize_recording_job(
+                    job_id,
+                    item_id,
+                    state="completed",
+                    returncode=returncode,
+                    completion_reason="stopped_by_user",
+                    output_path=output_path,
+                )
+                dependencies.append_log(job_id, "Recording stopped.")
+            else:
+                manager.finalize_recording_job(
+                    job_id,
+                    item_id,
+                    state="failed",
+                    returncode=returncode,
+                    completion_reason="stop_incomplete",
+                )
+                dependencies.append_log(
+                    job_id,
+                    "Recording stopped without a confirmed final media file.",
+                )
         elif returncode == 0:
             manager.finalize_recording_job(
                 job_id,
