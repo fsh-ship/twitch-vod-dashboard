@@ -334,6 +334,7 @@ class JobManager:
         paths: list[str],
         label: str,
         *,
+        playlist_id: Optional[str] = None,
         item_metadata: Optional[list[Dict[str, Any]]] = None,
         counter_getter: Optional[CounterGetter] = None,
         counter_setter: Optional[CounterSetter] = None,
@@ -342,7 +343,7 @@ class JobManager:
         with self.lock:
             job_id = self._next_job_id(counter_getter, counter_setter)
             item_ids = self._item_ids(job_id, len(paths))
-            self.jobs[job_id] = {
+            job = {
                 "id": job_id,
                 "label": label,
                 "status": "wartet",
@@ -368,6 +369,9 @@ class JobManager:
                 "returncode": None,
                 "type": "youtube_upload",
             }
+            if playlist_id is not None:
+                job["playlist_id"] = str(playlist_id or "").strip()
+            self.jobs[job_id] = job
         return job_id
 
     def append_job_log(
@@ -1533,8 +1537,12 @@ def run_upload_job(
     dependencies: UploadWorkerDependencies,
 ) -> None:
     """Run the existing sequential local YouTube upload lifecycle."""
-    settings = dependencies.load_settings()
     initial_job = manager.get_job(job_id) or {}
+    settings = dict(dependencies.load_settings())
+    if "playlist_id" in initial_job:
+        settings["youtube_playlist_id"] = str(
+            initial_job.get("playlist_id") or ""
+        ).strip()
     paths = list(initial_job.get("urls") or [])
     dependencies.append_log(
         job_id, f"Starting local YouTube upload: {len(paths)} file(s)"

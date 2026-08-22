@@ -798,8 +798,21 @@ def run_download_job(job_id: str) -> None:
 
 
 
-def create_upload_job(paths: List[str], label: str = "Local YouTube Upload") -> str:
+def create_upload_job(
+    paths: List[str],
+    label: str = "Local YouTube Upload",
+    *,
+    playlist_id: Optional[str] = None,
+) -> str:
     settings = load_settings()
+    resolved_playlist_id = str(
+        (
+            settings.get("youtube_playlist_id")
+            if playlist_id is None
+            else playlist_id
+        )
+        or ""
+    ).strip()
     manager = _job_manager_for_compatibility()
     unfinished = manager.unfinished_upload_paths()
     uploaded = set(map(str, settings.get("youtube_uploaded_files") or []))
@@ -829,6 +842,7 @@ def create_upload_job(paths: List[str], label: str = "Local YouTube Upload") -> 
     job_id = manager.create_upload_job(
         clean_paths,
         label,
+        playlist_id=resolved_playlist_id,
         item_metadata=item_metadata,
         counter_getter=lambda: job_counter,
         counter_setter=_set_job_counter,
@@ -1014,13 +1028,19 @@ def api_local_video_delete():
 def api_youtube_upload_local():
     data = request.json or {}
     paths = data.get("paths") or []
+    playlist_id = None
+    if "playlist_id" in data:
+        playlist_id = str(data.get("playlist_id") or "").strip()
     if isinstance(paths, str):
         paths = [paths]
     paths = [str(p).strip() for p in paths if str(p).strip()]
     if not paths:
         return jsonify({"error": "No files selected."}), 400
     try:
-        job_id = create_upload_job(paths)
+        if playlist_id is None:
+            job_id = create_upload_job(paths)
+        else:
+            job_id = create_upload_job(paths, playlist_id=playlist_id)
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"job_id": job_id})

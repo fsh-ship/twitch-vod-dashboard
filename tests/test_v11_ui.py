@@ -423,6 +423,16 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn("YouTubeNotConnectedError", TEMPLATE + JAVASCRIPT)
         self.assertIn("refreshButton.disabled = !data.connected", JAVASCRIPT)
 
+    def test_local_uploads_send_the_selected_playlist_with_each_job(self) -> None:
+        self.assertIn(
+            "JSON.stringify({ paths:[path], playlist_id:$('youtubePlaylistId').value })",
+            JAVASCRIPT,
+        )
+        self.assertIn(
+            "JSON.stringify({ paths, playlist_id:$('youtubePlaylistId').value })",
+            JAVASCRIPT,
+        )
+
     def test_single_vod_download_has_one_action(self) -> None:
         self.assertIn('id="singleDownload"', TEMPLATE)
         self.assertNotIn('id="validateSingleVod"', TEMPLATE)

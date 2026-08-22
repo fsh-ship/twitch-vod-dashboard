@@ -123,6 +123,19 @@ class JobManagerTests(unittest.TestCase):
             },
         )
 
+    def test_upload_jobs_store_their_explicit_playlist_independently(self):
+        manager = self.manager()
+
+        first_id = manager.create_upload_job(
+            ["C:/media/one.mp4"], "First", playlist_id="playlist-a"
+        )
+        second_id = manager.create_upload_job(
+            ["C:/media/two.mp4"], "Second", playlist_id="playlist-b"
+        )
+
+        self.assertEqual(manager.jobs[first_id]["playlist_id"], "playlist-a")
+        self.assertEqual(manager.jobs[second_id]["playlist_id"], "playlist-b")
+
     def test_existing_internal_status_values_can_be_applied(self):
         manager = self.manager()
         job_id = manager.create_download_job([], "Status")
@@ -992,8 +1005,20 @@ class UploadWorkerTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def run_worker(self, paths, *, safe=None, service=None, upload=None):
-        job_id = self.manager.create_upload_job([str(path) for path in paths], "Upload")
+    def run_worker(
+        self,
+        paths,
+        *,
+        safe=None,
+        service=None,
+        upload=None,
+        playlist_id=None,
+    ):
+        job_id = self.manager.create_upload_job(
+            [str(path) for path in paths],
+            "Upload",
+            playlist_id=playlist_id,
+        )
         dependencies = UploadWorkerDependencies(
             load_settings=lambda: dict(self.settings),
             append_log=self.manager.append_job_log,
@@ -1003,6 +1028,44 @@ class UploadWorkerTests(unittest.TestCase):
         )
         run_upload_job(job_id, self.manager, dependencies)
         return job_id, dependencies
+
+    def test_job_playlist_overrides_a_later_global_setting_change(self):
+        video = self.root / "one.mp4"
+        upload = mock.Mock(return_value="id-1")
+        job_id = self.manager.create_upload_job(
+            [str(video)], "Upload", playlist_id="playlist-original"
+        )
+        self.settings["youtube_playlist_id"] = "playlist-changed"
+        dependencies = UploadWorkerDependencies(
+            load_settings=lambda: dict(self.settings),
+            append_log=self.manager.append_job_log,
+            get_youtube_service=mock.Mock(),
+            safe_local_video_path=mock.Mock(
+                side_effect=lambda raw, settings: Path(raw)
+            ),
+            upload_to_youtube=upload,
+        )
+
+        run_upload_job(job_id, self.manager, dependencies)
+
+        upload_settings = upload.call_args.args[1]
+        self.assertEqual(job_id, "1")
+        self.assertEqual(
+            upload_settings["youtube_playlist_id"], "playlist-original"
+        )
+        self.assertEqual(
+            self.settings["youtube_playlist_id"], "playlist-changed"
+        )
+
+    def test_explicit_empty_job_playlist_overrides_global_default(self):
+        video = self.root / "one.mp4"
+        upload = mock.Mock(return_value="id-1")
+
+        self.run_worker([video], upload=upload, playlist_id="")
+
+        self.assertEqual(
+            upload.call_args.args[1]["youtube_playlist_id"], ""
+        )
 
     def test_single_file_upload_success(self):
         video = self.root / "one.mp4"
@@ -1174,6 +1237,36 @@ class AppJobCompatibilityTests(unittest.TestCase):
         self.assertEqual(dashboard.job_counter, 1)
         self.assertEqual(dashboard.jobs[job_id]["log"], ["ready"])
         logger.assert_called_once_with("Job 1: ready")
+
+    def test_create_upload_job_freezes_the_global_playlist_default(self):
+        settings = {
+            "youtube_playlist_id": "playlist-default",
+            "youtube_uploaded_files": [],
+        }
+        metadata = {
+            "streamer": "Example",
+            "date_de": "2026-08-22",
+            "title": "VOD",
+            "vod_id": "123",
+            "size_bytes": 100,
+            "size_gb": 0.0,
+        }
+        with mock.patch.object(
+            dashboard, "load_settings", return_value=settings
+        ), mock.patch.object(
+            dashboard,
+            "safe_local_video_path",
+            side_effect=lambda raw, _settings: Path(raw),
+        ), mock.patch.object(
+            dashboard, "local_video_metadata_payload", return_value=metadata
+        ), mock.patch.object(
+            dashboard.JOB_MANAGER, "start_worker"
+        ):
+            job_id = dashboard.create_upload_job(["C:/media/default.mp4"])
+
+        self.assertEqual(
+            dashboard.jobs[job_id]["playlist_id"], "playlist-default"
+        )
 
     def test_patched_app_registry_lock_and_counter_are_honored(self):
         patched_jobs = {}
@@ -1390,6 +1483,28 @@ class AppJobCompatibilityTests(unittest.TestCase):
         self.assertEqual(upload_response.get_json(), {"job_id": "upload-1"})
         create_upload.assert_called_once_with(
             ["C:/media/one.mp4", "C:/media/two.mp4"]
+        )
+
+    def test_upload_route_forwards_an_explicit_playlist(self):
+        client = dashboard.app.test_client()
+        csrf_token = client.get("/api/auth/status").get_json()["csrf_token"]
+
+        with mock.patch.object(
+            dashboard, "create_upload_job", return_value="upload-1"
+        ) as create_upload:
+            response = client.post(
+                "/api/youtube/upload-local",
+                json={
+                    "paths": ["C:/media/one.mp4"],
+                    "playlist_id": "  playlist-explicit  ",
+                },
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"job_id": "upload-1"})
+        create_upload.assert_called_once_with(
+            ["C:/media/one.mp4"], playlist_id="playlist-explicit"
         )
 
 

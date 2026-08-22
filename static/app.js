@@ -1575,7 +1575,7 @@ async function handleLocalVideoAction(action, path) {
   if (!video) throw new Error('VOD data is no longer available. Refresh the file list.');
 
   if (action === 'upload') {
-    await api('/api/youtube/upload-local', { method:'POST', body: JSON.stringify({ paths:[path] }) });
+    await api('/api/youtube/upload-local', { method:'POST', body: JSON.stringify({ paths:[path], playlist_id:$('youtubePlaylistId').value }) });
     showToast('VOD added to the upload queue.');
     showPage('queue');
     await Promise.all([pollJobs(), loadLocalVideos()]);
@@ -1636,7 +1636,7 @@ async function uploadSelectedLocalVideos() {
     alert('No local VODs selected.');
     return;
   }
-  const data = await api('/api/youtube/upload-local', { method:'POST', body: JSON.stringify({ paths }) });
+  const data = await api('/api/youtube/upload-local', { method:'POST', body: JSON.stringify({ paths, playlist_id:$('youtubePlaylistId').value }) });
   showPage('queue');
   await Promise.all([pollJobs(), loadLocalVideos()]);
   return data;
