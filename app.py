@@ -1315,8 +1315,22 @@ def api_streamers():
     if isinstance(names, str):
         names = names.splitlines()
     settings = load_settings()
+    profiles_supplied = "streamer_profiles" in data
+    if profiles_supplied:
+        settings = save_settings({
+            "streamer_profiles": data.get("streamer_profiles")
+        })
     streamers = write_streamers(names, settings)
-    return jsonify({"streamers": streamers, "streamer_file": str(FIXED_STREAMER_FILE), "count": len(streamers)})
+    payload = {
+        "streamers": streamers,
+        "streamer_file": str(FIXED_STREAMER_FILE),
+        "count": len(streamers),
+    }
+    if profiles_supplied:
+        payload["streamer_profiles"] = settings.get(
+            "streamer_profiles", {}
+        )
+    return jsonify(payload)
 
 
 

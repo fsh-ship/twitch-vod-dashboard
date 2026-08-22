@@ -838,12 +838,15 @@ main { width:100%; max-width:1320px; }
 .streamer-add-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:end; margin:14px 0; }
 .streamer-add-row button { min-height:43px; }
 .streamer-editor-list { display:grid; gap:7px; }
-.streamer-editor-row { display:grid; grid-template-columns:34px minmax(0,1fr) auto; gap:10px; align-items:center; padding:9px 11px; border:1px solid var(--line); border-radius:13px; background:#0e1522; }
+.streamer-editor-row { display:grid; grid-template-columns:34px minmax(120px,1fr) minmax(180px,280px) auto; gap:10px; align-items:center; padding:9px 11px; border:1px solid var(--line); border-radius:13px; background:#0e1522; }
 .streamer-order { display:grid; place-items:center; width:27px; height:27px; border-radius:999px; background:#182236; color:var(--muted); font-size:12px; }
 .streamer-editor-row strong { overflow-wrap:anywhere; }
+.streamer-playlist-field { display:grid; gap:4px; min-width:0; color:var(--muted); font-size:11px; }
+.streamer-playlist-field select { min-width:0; }
 .streamer-row-actions { display:flex; gap:6px; }
 .streamer-row-actions button { padding:7px 10px; }
 .streamer-editor-empty { padding:22px; border:1px dashed var(--line); border-radius:13px; text-align:center; }
+.local-upload-playlist-field { display:grid; gap:4px; min-width:min(260px,100%); color:var(--muted); font-size:12px; }
 
 @media (max-width:1100px) and (min-width:801px) {
   .local-video-table-head,
@@ -873,6 +876,7 @@ main { width:100%; max-width:1320px; }
   .video-primary-actions button { flex:1 1 120px; }
   .secondary-actions { grid-column:1 / -1; grid-row:5; justify-self:stretch; }
   .streamer-editor-row { grid-template-columns:34px minmax(0,1fr); }
+  .streamer-playlist-field { grid-column:2; }
   .streamer-row-actions { grid-column:1 / -1; display:grid; grid-template-columns:1fr 1fr 1.25fr; }
 }
 

@@ -17,6 +17,67 @@ STYLESHEET = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
 NODE = shutil.which("node")
 
 
+def _evaluate_playlist_ui() -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for playlist UI tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function canonicalStreamerLoginClient');
+const end = source.indexOf('function streamerEditorNames');
+if (start < 0 || end < 0 || end <= start) throw new Error('Playlist UI helpers not found');
+let youtubePlaylistChoices = [];
+function escapeHtml(value) {
+  return String(value).replace(/[&<>'"]/g, character => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;'
+  })[character]);
+}
+eval(source.slice(start, end));
+const profiles = {
+  digitalgirluli: {youtube_playlist_id:'PLAYLIST_A'},
+  orphan_streamer: {youtube_playlist_id:'ORPHAN'}
+};
+const setOverride = withStreamerPlaylistSelection(
+  profiles, 'Nika_LiveTV', 'PLAYLIST_B'
+);
+const removedOverride = withStreamerPlaylistSelection(
+  profiles, '@DigitalGirlUli', ''
+);
+process.stdout.write(JSON.stringify({
+  configured: streamerProfilePlaylistId(profiles, 'DigitalGirlUli'),
+  inherited: streamerProfilePlaylistId(profiles, 'NoOverride'),
+  configuredOptions: playlistOptionsHtml('PLAYLIST_A', 'Global Default'),
+  inheritedOptions: playlistOptionsHtml('', 'Global Default'),
+  setOverride,
+  removedOverride,
+  defaultSingle: buildYoutubeUploadRequest(['one.mp4'], 'streamer-default'),
+  defaultMultiple: buildYoutubeUploadRequest(
+    ['one.mp4', 'two.mp4'], 'streamer-default'
+  ),
+  noPlaylistSingle: buildYoutubeUploadRequest(['one.mp4'], 'no-playlist'),
+  noPlaylistMultiple: buildYoutubeUploadRequest(
+    ['one.mp4', 'two.mp4'], 'no-playlist'
+  ),
+  explicitSingle: buildYoutubeUploadRequest(
+    ['one.mp4'], 'playlist', 'PLAYLIST_A'
+  ),
+  explicitMultiple: buildYoutubeUploadRequest(
+    ['one.mp4', 'two.mp4'], 'playlist', 'PLAYLIST_A'
+  )
+}));
+"""
+    completed = subprocess.run(
+        [NODE, "-e", runner],
+        cwd=ROOT,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
 def _classify_download_jobs(
     jobs: list[dict], results: list[dict] | None = None
 ) -> list[dict]:
@@ -406,10 +467,50 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn('id="streamerAddInput"', TEMPLATE)
         self.assertIn('id="streamerEditorList"', TEMPLATE)
         self.assertIn('id="streamersText" class="hidden"', TEMPLATE)
+        self.assertIn('id="streamerPlaylistStatus"', TEMPLATE)
         self.assertIn("setStreamerEditorNames", JAVASCRIPT)
+        self.assertIn('class="streamer-playlist-select"', JAVASCRIPT)
+        self.assertIn("streamer_profiles:streamerProfileDraft", JAVASCRIPT)
         self.assertIn("data-streamer-action=\"remove\"", JAVASCRIPT)
         self.assertIn("data-streamer-action=\"up\"", JAVASCRIPT)
         self.assertIn("data-streamer-action=\"down\"", JAVASCRIPT)
+
+    def test_streamer_playlist_ui_represents_sets_and_removes_overrides(self) -> None:
+        result = _evaluate_playlist_ui()
+
+        self.assertEqual(result["configured"], "PLAYLIST_A")
+        self.assertEqual(result["inherited"], "")
+        self.assertIn('value="PLAYLIST_A" selected', result["configuredOptions"])
+        self.assertIn(">Global Default</option>", result["inheritedOptions"])
+        self.assertEqual(
+            result["setOverride"]["nika_livetv"],
+            {"youtube_playlist_id": "PLAYLIST_B"},
+        )
+        self.assertEqual(
+            result["setOverride"]["orphan_streamer"],
+            {"youtube_playlist_id": "ORPHAN"},
+        )
+        self.assertNotIn("digitalgirluli", result["removedOverride"])
+        self.assertEqual(
+            result["removedOverride"]["orphan_streamer"],
+            {"youtube_playlist_id": "ORPHAN"},
+        )
+
+    def test_playlist_refresh_failure_preserves_streamer_profile_draft(self) -> None:
+        loader = JAVASCRIPT.split(
+            "async function loadYoutubePlaylists()", 1
+        )[1].split("function friendlyYoutubeConnectError", 1)[0]
+        connection_status = JAVASCRIPT.split(
+            "async function refreshYoutubeStatus()", 1
+        )[1].split("async function loadYoutubePlaylists()", 1)[0]
+        self.assertIn(
+            "Existing streamer defaults are preserved.", loader
+        )
+        self.assertNotIn("streamerProfileDraft =", loader)
+        self.assertIn(
+            "youtubePlaylistChoices = Array.isArray(data.playlists)", loader
+        )
+        self.assertNotIn("streamer-playlist-select", connection_status)
 
     def test_settings_finishing_labels_and_youtube_disconnected_copy(self) -> None:
         general = TEMPLATE.split('data-settings-panel="general"', 1)[1].split('data-settings-panel="streamers"', 1)[0]
@@ -423,14 +524,39 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn("YouTubeNotConnectedError", TEMPLATE + JAVASCRIPT)
         self.assertIn("refreshButton.disabled = !data.connected", JAVASCRIPT)
 
-    def test_local_uploads_send_the_selected_playlist_with_each_job(self) -> None:
+    def test_local_upload_playlist_request_semantics_match_for_each_job_size(self) -> None:
+        result = _evaluate_playlist_ui()
+
+        self.assertEqual(result["defaultSingle"], {"paths": ["one.mp4"]})
+        self.assertEqual(
+            result["defaultMultiple"],
+            {"paths": ["one.mp4", "two.mp4"]},
+        )
+        self.assertEqual(
+            result["noPlaylistSingle"],
+            {"paths": ["one.mp4"], "playlist_id": ""},
+        )
+        self.assertEqual(
+            result["noPlaylistMultiple"],
+            {"paths": ["one.mp4", "two.mp4"], "playlist_id": ""},
+        )
+        self.assertEqual(
+            result["explicitSingle"],
+            {"paths": ["one.mp4"], "playlist_id": "PLAYLIST_A"},
+        )
+        self.assertEqual(
+            result["explicitMultiple"],
+            {
+                "paths": ["one.mp4", "two.mp4"],
+                "playlist_id": "PLAYLIST_A",
+            },
+        )
+        self.assertIn('id="localUploadPlaylistId"', TEMPLATE)
         self.assertIn(
-            "JSON.stringify({ paths:[path], playlist_id:$('youtubePlaylistId').value })",
-            JAVASCRIPT,
+            "JSON.stringify(localUploadRequestPayload([path]))", JAVASCRIPT
         )
         self.assertIn(
-            "JSON.stringify({ paths, playlist_id:$('youtubePlaylistId').value })",
-            JAVASCRIPT,
+            "JSON.stringify(localUploadRequestPayload(paths))", JAVASCRIPT
         )
 
     def test_single_vod_download_has_one_action(self) -> None:

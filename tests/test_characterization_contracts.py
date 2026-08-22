@@ -726,6 +726,81 @@ class SettingsContractTests(IsolatedDashboardTestCase):
             self.assertNotIn("VOD_DASHBOARD_SECRET_KEY", payload)
         self.assertEqual(set(persisted), DEFAULT_SETTINGS_KEYS)
 
+    def test_streamer_api_saves_profiles_without_changing_text_format(self):
+        dashboard.save_settings({"youtube_playlist_id": "GLOBAL"})
+        response = self.client.post(
+            "/api/streamers",
+            json={
+                "streamers": "DigitalGirlUli\nnika_livetv\n",
+                "streamer_profiles": {
+                    "DigitalGirlUli": {
+                        "youtube_playlist_id": " PLAYLIST_A "
+                    }
+                },
+            },
+            headers=self.csrf_headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["streamer_profiles"],
+            {
+                "digitalgirluli": {
+                    "youtube_playlist_id": "PLAYLIST_A"
+                }
+            },
+        )
+        self.assertEqual(
+            (self.runtime_dir / "streamer.txt").read_text(encoding="utf-8"),
+            "DigitalGirlUli\nnika_livetv\n",
+        )
+        self.assertEqual(
+            dashboard.load_settings()["streamer_profiles"],
+            {
+                "digitalgirluli": {
+                    "youtube_playlist_id": "PLAYLIST_A"
+                }
+            },
+        )
+        self.assertEqual(
+            dashboard.load_settings()["youtube_playlist_id"], "GLOBAL"
+        )
+
+        legacy_client = self.client.post(
+            "/api/streamers",
+            json={"streamers": ["DigitalGirlUli", "nika_livetv"]},
+            headers=self.csrf_headers,
+        )
+        self.assertNotIn("streamer_profiles", legacy_client.get_json())
+        self.assertEqual(
+            dashboard.load_settings()["streamer_profiles"],
+            {
+                "digitalgirluli": {
+                    "youtube_playlist_id": "PLAYLIST_A"
+                }
+            },
+        )
+
+        cleared = self.client.post(
+            "/api/streamers",
+            json={
+                "streamers": ["DigitalGirlUli", "nika_livetv"],
+                "streamer_profiles": {},
+            },
+            headers=self.csrf_headers,
+        )
+        self.assertEqual(cleared.get_json()["streamer_profiles"], {})
+        self.assertEqual(
+            dashboard.load_settings()["streamer_profiles"], {}
+        )
+        self.assertEqual(
+            dashboard.load_settings()["youtube_playlist_id"], "GLOBAL"
+        )
+        self.assertEqual(
+            (self.runtime_dir / "streamer.txt").read_text(encoding="utf-8"),
+            "DigitalGirlUli\nnika_livetv\n",
+        )
+
     def test_explicit_legacy_settings_preserve_compatible_values_only_by_opt_in(self):
         legacy = self.base / "legacy" / "settings.json"
         legacy.parent.mkdir()

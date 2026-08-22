@@ -264,6 +264,8 @@ let lastResults = [];
 let jobOpenState = {};
 let queueDetailOpenState = {};
 let autoExpandJobDetails = localStorage.getItem('vodJobAutoExpand') === '1';
+let youtubePlaylistChoices = [];
+let streamerProfileDraft = {};
 
 const $ = (id) => document.getElementById(id);
 
@@ -319,6 +321,7 @@ function setDateRange(days) {
 function renderState() {
   $('archiveCount').textContent = `Archive: ${state.archive_count} VODs`;
   if ($('settingsFilePath')) $('settingsFilePath').textContent = state.settings_file || state.settings._settings_file || 'unknown';
+  streamerProfileDraft = cloneStreamerProfiles(state.settings.streamer_profiles);
   $('streamersText').value = state.streamers.join('\n');
   renderStreamerEditor();
   if ($('streamerFileInfo')) $('streamerFileInfo').textContent = state.streamer_file_resolved || state.settings.streamer_file || 'unknown';
@@ -357,6 +360,8 @@ function renderState() {
   $('manualUploadWriteMetadataJson').checked = state.settings.manual_upload_write_metadata_json !== false;
   $('youtubeChunkSizeMb').value = String(state.settings.youtube_chunk_size_mb || 64);
   $('youtubeUploadMode').value = state.settings.youtube_upload_mode || 'stable';
+  renderGlobalPlaylistSelect();
+  renderLocalUploadPlaylistSelect();
   $('singleStreamer').innerHTML = state.streamers.map(s => `<option>${escapeHtml(s)}</option>`).join('');
   renderSearchStreamerCheckboxes();
 }
@@ -515,6 +520,98 @@ function setYoutubeCategoryValue(value) {
   select.value = categoryId;
 }
 
+function canonicalStreamerLoginClient(value) {
+  const login = String(value || '').trim().replace(/^@+/, '').toLowerCase();
+  return /^[a-z0-9_]{1,25}$/.test(login) ? login : '';
+}
+
+function cloneStreamerProfiles(profiles) {
+  const normalized = {};
+  Object.entries(profiles || {}).forEach(([rawLogin, profile]) => {
+    const login = canonicalStreamerLoginClient(rawLogin);
+    const playlistId = String(profile?.youtube_playlist_id || '').trim();
+    if (login && playlistId && !normalized[login]) {
+      normalized[login] = { youtube_playlist_id: playlistId };
+    }
+  });
+  return normalized;
+}
+
+function streamerProfilePlaylistId(profiles, streamer) {
+  const login = canonicalStreamerLoginClient(streamer);
+  if (!login) return '';
+  return String(profiles?.[login]?.youtube_playlist_id || '').trim();
+}
+
+function withStreamerPlaylistSelection(profiles, streamer, playlistId) {
+  const updated = cloneStreamerProfiles(profiles);
+  const login = canonicalStreamerLoginClient(streamer);
+  if (!login) return updated;
+  const selected = String(playlistId || '').trim();
+  if (selected) updated[login] = { youtube_playlist_id: selected };
+  else delete updated[login];
+  return updated;
+}
+
+function buildYoutubeUploadRequest(paths, mode, playlistId='') {
+  const payload = { paths:[...(paths || [])] };
+  if (mode === 'streamer-default') return payload;
+  payload.playlist_id = mode === 'no-playlist'
+    ? ''
+    : String(playlistId || '').trim();
+  return payload;
+}
+
+function availablePlaylistChoices(currentId='') {
+  const choices = (youtubePlaylistChoices || []).map(playlist => ({
+    id: String(playlist.id || '').trim(),
+    title: String(playlist.title || playlist.id || '').trim()
+  })).filter(playlist => playlist.id);
+  const current = String(currentId || '').trim();
+  if (current && !choices.some(playlist => playlist.id === current)) {
+    choices.unshift({ id:current, title:`Saved playlist (${current})` });
+  }
+  return choices;
+}
+
+function playlistOptionsHtml(currentId, emptyLabel) {
+  const current = String(currentId || '').trim();
+  return `<option value="" ${current ? '' : 'selected'}>${escapeHtml(emptyLabel)}</option>` + availablePlaylistChoices(current).map(playlist => `<option value="${escapeHtml(playlist.id)}" ${playlist.id === current ? 'selected' : ''}>${escapeHtml(playlist.title)}</option>`).join('');
+}
+
+function renderGlobalPlaylistSelect() {
+  const select = $('youtubePlaylistId');
+  if (!select || !state?.settings) return;
+  const current = String(state.settings.youtube_playlist_id || '').trim();
+  select.innerHTML = playlistOptionsHtml(current, 'No Playlist');
+}
+
+function renderLocalUploadPlaylistSelect() {
+  const select = $('localUploadPlaylistId');
+  if (!select) return;
+  const selected = select.selectedOptions?.[0];
+  const previousMode = selected?.dataset.playlistMode || 'streamer-default';
+  const previousId = selected?.value || '';
+  const concreteChoices = availablePlaylistChoices(
+    previousMode === 'playlist' ? previousId : ''
+  );
+  select.innerHTML = '<option value="" data-playlist-mode="streamer-default">Streamer Default</option><option value="" data-playlist-mode="no-playlist">No Playlist</option>' + concreteChoices.map(playlist => `<option value="${escapeHtml(playlist.id)}" data-playlist-mode="playlist">${escapeHtml(playlist.title)}</option>`).join('');
+  const match = [...select.options].find(option => (
+    option.dataset.playlistMode === previousMode
+    && (previousMode !== 'playlist' || option.value === previousId)
+  ));
+  (match || select.options[0]).selected = true;
+}
+
+function localUploadRequestPayload(paths) {
+  const selected = $('localUploadPlaylistId')?.selectedOptions?.[0];
+  return buildYoutubeUploadRequest(
+    paths,
+    selected?.dataset.playlistMode || 'streamer-default',
+    selected?.value || ''
+  );
+}
+
 function streamerEditorNames() {
   return String($('streamersText')?.value || '').split(/\r?\n/).map(name => name.trim()).filter(Boolean);
 }
@@ -532,7 +629,21 @@ function renderStreamerEditor() {
     list.innerHTML = '<div class="streamer-editor-empty muted">No streamers configured yet.</div>';
     return;
   }
-  list.innerHTML = names.map((name, index) => `<div class="streamer-editor-row" data-streamer-index="${index}"><span class="streamer-order">${index + 1}</span><strong>${escapeHtml(name)}</strong><div class="streamer-row-actions"><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></div>`).join('');
+  list.innerHTML = names.map((name, index) => {
+    const playlistId = streamerProfilePlaylistId(
+      streamerProfileDraft, name
+    );
+    return `<div class="streamer-editor-row" data-streamer-index="${index}"><span class="streamer-order">${index + 1}</span><strong>${escapeHtml(name)}</strong><label class="streamer-playlist-field"><span>Default Playlist</span><select class="streamer-playlist-select" data-streamer-login="${escapeHtml(name)}" aria-label="Default YouTube playlist for ${escapeHtml(name)}">${playlistOptionsHtml(playlistId, 'Global Default')}</select></label><div class="streamer-row-actions"><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></div>`;
+  }).join('');
+  list.querySelectorAll('.streamer-playlist-select').forEach(select => {
+    select.addEventListener('change', () => {
+      streamerProfileDraft = withStreamerPlaylistSelection(
+        streamerProfileDraft,
+        select.dataset.streamerLogin,
+        select.value
+      );
+    });
+  });
   list.querySelectorAll('[data-streamer-action]').forEach(button => button.addEventListener('click', () => {
     const row = button.closest('[data-streamer-index]');
     const index = Number(row.dataset.streamerIndex);
@@ -572,6 +683,8 @@ function showSettingsTab(name) {
   try { localStorage.setItem('vodSettingsTab', target); } catch {}
   if (target === 'youtube') {
     refreshYoutubeStatus().catch(() => {});
+  }
+  if (target === 'youtube' || target === 'streamers') {
     loadYoutubePlaylists().catch(() => {});
   }
 }
@@ -1575,7 +1688,7 @@ async function handleLocalVideoAction(action, path) {
   if (!video) throw new Error('VOD data is no longer available. Refresh the file list.');
 
   if (action === 'upload') {
-    await api('/api/youtube/upload-local', { method:'POST', body: JSON.stringify({ paths:[path], playlist_id:$('youtubePlaylistId').value }) });
+    await api('/api/youtube/upload-local', { method:'POST', body: JSON.stringify(localUploadRequestPayload([path])) });
     showToast('VOD added to the upload queue.');
     showPage('queue');
     await Promise.all([pollJobs(), loadLocalVideos()]);
@@ -1636,7 +1749,7 @@ async function uploadSelectedLocalVideos() {
     alert('No local VODs selected.');
     return;
   }
-  const data = await api('/api/youtube/upload-local', { method:'POST', body: JSON.stringify({ paths, playlist_id:$('youtubePlaylistId').value }) });
+  const data = await api('/api/youtube/upload-local', { method:'POST', body: JSON.stringify(localUploadRequestPayload(paths)) });
   showPage('queue');
   await Promise.all([pollJobs(), loadLocalVideos()]);
   return data;
@@ -1715,11 +1828,29 @@ async function refreshYoutubeStatus() {
 }
 
 async function loadYoutubePlaylists() {
-  const data = await api('/api/youtube/playlists');
-  const current = state.settings.youtube_playlist_id || '';
-  $('youtubePlaylistId').innerHTML = '<option value="">No Playlist</option>' + data.playlists.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.title)}</option>`).join('');
-  $('youtubePlaylistId').value = current;
-  return data;
+  const status = $('streamerPlaylistStatus');
+  try {
+    const data = await api('/api/youtube/playlists');
+    youtubePlaylistChoices = Array.isArray(data.playlists)
+      ? data.playlists
+      : [];
+    renderGlobalPlaylistSelect();
+    renderLocalUploadPlaylistSelect();
+    renderStreamerEditor();
+    if (status) {
+      status.textContent = youtubePlaylistChoices.length
+        ? `${youtubePlaylistChoices.length} YouTube playlist${youtubePlaylistChoices.length === 1 ? '' : 's'} available.`
+        : 'No YouTube playlists are currently available. Existing streamer defaults are preserved.';
+      status.className = 'field-message muted';
+    }
+    return data;
+  } catch (error) {
+    if (status) {
+      status.textContent = 'Playlists could not be refreshed. Existing streamer defaults are preserved.';
+      status.className = 'field-message warn';
+    }
+    throw error;
+  }
 }
 
 function friendlyYoutubeConnectError(message) {
@@ -1762,7 +1893,7 @@ $('streamerAddInput').addEventListener('keydown', event => {
   addStreamerFromInput();
 });
 $('saveStreamers').addEventListener('click', async () => {
-  const saved = await api('/api/streamers', { method:'POST', body: JSON.stringify({ streamers: $('streamersText').value }) });
+  const saved = await api('/api/streamers', { method:'POST', body: JSON.stringify({ streamers: $('streamersText').value, streamer_profiles:streamerProfileDraft }) });
   await loadState();
   if ($('streamerFileInfo')) $('streamerFileInfo').textContent = saved.streamer_file || state.streamer_file_resolved || 'unknown';
   if ($('streamerFileStatus')) $('streamerFileStatus').textContent = `${saved.count || 0} streamers saved`;
@@ -1793,7 +1924,7 @@ loadState().then(() => {
   showPage(localStorage.getItem('vodActivePage') || 'dashboard');
   refreshYoutubeStatus();
   refreshDashboard();
-  try { loadYoutubePlaylists(); } catch {}
+  loadYoutubePlaylists().catch(() => {});
 }).catch(e => {
   console.error(e);
   if (window.vodShowPage) window.vodShowPage(localStorage.getItem('vodActivePage') || 'dashboard');
