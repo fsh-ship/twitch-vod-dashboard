@@ -34,6 +34,7 @@ DEFAULT_SETTINGS_KEYS = {
     "playlist_end",
     "quality",
     "streamer_file",
+    "streamer_profiles",
     "strict_date_filter",
     "twitch_rate_limit",
     "uploaded_vods_folder",
@@ -117,6 +118,7 @@ class SettingsRepositoryTests(unittest.TestCase):
             "batch_postprocess_mode": "after_each",
             "youtube_privacy_status": "private",
             "youtube_playlist_id": "",
+            "streamer_profiles": {},
             "youtube_client_secret_file": str(
                 runtime_paths.youtube_client_secret_file
             ),
@@ -139,8 +141,120 @@ class SettingsRepositoryTests(unittest.TestCase):
             "manual_upload_write_metadata_json": True,
         }
         self.assertEqual(set(settings.DEFAULT_SETTINGS), DEFAULT_SETTINGS_KEYS)
-        self.assertEqual(len(settings.DEFAULT_SETTINGS), 39)
+        self.assertEqual(len(settings.DEFAULT_SETTINGS), 40)
         self.assertEqual(settings.DEFAULT_SETTINGS, expected)
+
+    def test_legacy_settings_without_streamer_profiles_use_empty_default(self):
+        legacy = {
+            key: value
+            for key, value in self.defaults.items()
+            if key != "streamer_profiles"
+        }
+        self.settings_file.write_text(
+            json.dumps(legacy), encoding="utf-8"
+        )
+
+        loaded = self.repository.load()
+
+        self.assertEqual(loaded["streamer_profiles"], {})
+
+    def test_streamer_profiles_round_trip_without_touching_streamer_file(self):
+        streamer_file = self.runtime_dir / "streamer.txt"
+        streamer_file.write_text("Alpha\nBeta\n", encoding="utf-8")
+
+        saved = self.repository.save(
+            {
+                "streamer_profiles": {
+                    "xerax_ttv": {"youtube_playlist_id": "PL123"}
+                }
+            }
+        )
+        loaded = self.repository.load()
+
+        expected = {
+            "xerax_ttv": {"youtube_playlist_id": "PL123"}
+        }
+        self.assertEqual(saved["streamer_profiles"], expected)
+        self.assertEqual(loaded["streamer_profiles"], expected)
+        self.assertEqual(
+            streamer_file.read_text(encoding="utf-8"), "Alpha\nBeta\n"
+        )
+
+    def test_streamer_profile_keys_and_lookup_are_case_insensitive(self):
+        normalized = settings.normalize_streamer_profiles(
+            {
+                "XeRaX_TTV": {"youtube_playlist_id": " PL123 "},
+                "xerax_ttv": {"youtube_playlist_id": "PL999"},
+                "@XERAX_TTV": {"youtube_playlist_id": "   "},
+                "@SECOND_ONE": {"youtube_playlist_id": "PL456"},
+            }
+        )
+
+        self.assertEqual(
+            normalized,
+            {
+                "xerax_ttv": {"youtube_playlist_id": "PL123"},
+                "second_one": {"youtube_playlist_id": "PL456"},
+            },
+        )
+        profile_settings = {"streamer_profiles": normalized}
+        for login in ("xerax_ttv", "XERAX_TTV", "@xerax_ttv"):
+            with self.subTest(login=login):
+                self.assertEqual(
+                    settings.streamer_profile_for(profile_settings, login),
+                    {"youtube_playlist_id": "PL123"},
+                )
+
+    def test_streamer_profiles_drop_empty_invalid_and_unknown_values(self):
+        raw_profiles = {
+            "ValidOne": {
+                "youtube_playlist_id": "PL123",
+                "random_future_setting": "foo",
+            },
+            "EmptyOne": {"youtube_playlist_id": "   "},
+            "invalid-name": {"youtube_playlist_id": "PL456"},
+            "": {"youtube_playlist_id": "PL789"},
+            "NotAMapping": "PL000",
+        }
+        normalized = settings.normalize_streamer_profiles(raw_profiles)
+        saved = self.repository.save({"streamer_profiles": raw_profiles})
+        persisted = json.loads(
+            self.settings_file.read_text(encoding="utf-8")
+        )
+
+        expected = {"validone": {"youtube_playlist_id": "PL123"}}
+        for payload in (
+            normalized,
+            saved["streamer_profiles"],
+            persisted["streamer_profiles"],
+        ):
+            self.assertEqual(payload, expected)
+        self.assertEqual(
+            settings.normalize_streamer_profiles(["not", "a", "mapping"]),
+            {},
+        )
+        self.assertEqual(
+            settings.streamer_profile_for(
+                {"streamer_profiles": normalized}, "invalid-name"
+            ),
+            {},
+        )
+
+    def test_global_playlist_remains_independent_of_streamer_profiles(self):
+        saved = self.repository.save(
+            {
+                "youtube_playlist_id": "GLOBAL-PLAYLIST",
+                "streamer_profiles": {
+                    "Example": {"youtube_playlist_id": "STREAMER-PLAYLIST"}
+                },
+            }
+        )
+
+        self.assertEqual(saved["youtube_playlist_id"], "GLOBAL-PLAYLIST")
+        self.assertEqual(
+            settings.streamer_profile_for(saved, "@EXAMPLE"),
+            {"youtube_playlist_id": "STREAMER-PLAYLIST"},
+        )
 
     def test_bool_normalization_including_legacy_values(self):
         truthy = (True, 1, 2.5, "1", "true", "yes", "ja", "on", "an")

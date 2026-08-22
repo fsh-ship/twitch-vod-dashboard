@@ -73,6 +73,7 @@ DEFAULT_SETTINGS_KEYS = {
     "playlist_end",
     "quality",
     "streamer_file",
+    "streamer_profiles",
     "strict_date_filter",
     "twitch_rate_limit",
     "uploaded_vods_folder",
@@ -615,6 +616,7 @@ class SettingsContractTests(IsolatedDashboardTestCase):
         self.assertFalse(defaults["youtube_auto_upload"])
         self.assertTrue(defaults["move_uploaded_vods"])
         self.assertEqual(defaults["youtube_privacy_status"], "private")
+        self.assertEqual(defaults["streamer_profiles"], {})
         self.assertEqual(defaults["youtube_upload_mode"], "stable")
         self.assertIn("{date_de}", defaults["youtube_title_template"])
         self.assertIn("{date_de}", defaults["youtube_description_template"])

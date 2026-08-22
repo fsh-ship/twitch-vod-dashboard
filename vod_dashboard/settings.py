@@ -45,6 +45,7 @@ def _default_settings(runtime_paths: RuntimePaths) -> Dict[str, Any]:
         "batch_postprocess_mode": "after_each",
         "youtube_privacy_status": "private",
         "youtube_playlist_id": "",
+        "streamer_profiles": {},
         "youtube_client_secret_file": str(
             runtime_paths.youtube_client_secret_file
         ),
@@ -312,6 +313,9 @@ def normalize_settings(
     settings["batch_postprocess_mode"] = clean_batch_postprocess_mode(
         settings.get("batch_postprocess_mode")
     )
+    settings["streamer_profiles"] = normalize_streamer_profiles(
+        settings.get("streamer_profiles")
+    )
 
     return force_user_data_paths(
         fix_template_confusion(
@@ -387,6 +391,44 @@ def clean_streamer_names(names: List[str]) -> List[str]:
             clean.append(name)
             seen.add(key)
     return clean
+
+
+def canonical_streamer_login(value: Any) -> str:
+    """Return a canonical Twitch login using the streamer-list rules."""
+    names = clean_streamer_names([value])
+    return names[0].lower() if names else ""
+
+
+def normalize_streamer_profiles(value: Any) -> Dict[str, Dict[str, str]]:
+    """Normalize the allowlisted per-streamer settings mapping."""
+    if not isinstance(value, Mapping):
+        return {}
+
+    profiles: Dict[str, Dict[str, str]] = {}
+    for raw_login, raw_profile in value.items():
+        login = canonical_streamer_login(raw_login)
+        if not login or not isinstance(raw_profile, Mapping):
+            continue
+
+        playlist_id = str(
+            raw_profile.get("youtube_playlist_id") or ""
+        ).strip()
+        if playlist_id and login not in profiles:
+            profiles[login] = {"youtube_playlist_id": playlist_id}
+    return profiles
+
+
+def streamer_profile_for(
+    settings: Mapping[str, Any], streamer_login: Any
+) -> Dict[str, str]:
+    """Look up a normalized profile without exposing mutable settings state."""
+    login = canonical_streamer_login(streamer_login)
+    if not login:
+        return {}
+    profile = normalize_streamer_profiles(
+        settings.get("streamer_profiles")
+    ).get(login)
+    return dict(profile or {})
 
 
 def read_streamers_from_path(path: Path) -> List[str]:
