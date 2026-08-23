@@ -59,6 +59,8 @@ TERMINAL_JOB_STATES = frozenset(
 )
 FAILURE_KINDS = frozenset({"", "known", "uncertain"})
 RECORDING_ORIGINS = frozenset({"manual", "auto"})
+DOWNLOAD_ORIGINS = frozenset({"manual", "auto_vod"})
+DOWNLOAD_POST_MODES = frozenset({"default", "download_only"})
 
 _JOB_ID_RE = re.compile(r"[1-9][0-9]{0,9}")
 _ITEM_ID_RE = re.compile(r"([1-9][0-9]{0,9})-item-([1-9][0-9]{0,3})")
@@ -514,6 +516,26 @@ def _normalize_download(job: Mapping[str, Any], result: Job, count: int) -> None
     total_urls = job.get("total_urls", count)
     if total_urls != count:
         raise JobStoreValidationError("invalid_total_urls")
+    origin = job.get("origin", "manual")
+    if not isinstance(origin, str) or origin not in DOWNLOAD_ORIGINS:
+        raise JobStoreValidationError("invalid_download_origin")
+    streamer = canonical_streamer_login(job.get("streamer", ""))
+    vod_id = job.get("twitch_vod_id", "")
+    if not isinstance(vod_id, str) or (vod_id and not _VOD_ID_RE.fullmatch(vod_id)):
+        raise JobStoreValidationError("invalid_download_vod_id")
+    attempt = _bounded_int(
+        job.get("attempt", 0), minimum=0, maximum=1_000,
+        code="invalid_download_attempt",
+    )
+    post_download_mode = job.get("post_download_mode", "default")
+    if not isinstance(post_download_mode, str) or post_download_mode not in DOWNLOAD_POST_MODES:
+        raise JobStoreValidationError("invalid_post_download_mode")
+    if origin == "auto_vod" and (
+        not streamer or not vod_id or attempt < 1 or post_download_mode != "download_only"
+    ):
+        raise JobStoreValidationError("invalid_auto_vod_download_metadata")
+    if origin == "manual" and (streamer or vod_id or attempt != 0 or post_download_mode != "default"):
+        raise JobStoreValidationError("invalid_manual_download_metadata")
     result.update(
         {
             "urls": normalized_urls,
@@ -544,6 +566,16 @@ def _normalize_download(job: Mapping[str, Any], result: Job, count: int) -> None
             ),
         }
     )
+    if origin == "auto_vod":
+        result.update(
+            {
+                "origin": origin,
+                "streamer": streamer,
+                "twitch_vod_id": vod_id,
+                "attempt": attempt,
+                "post_download_mode": post_download_mode,
+            }
+        )
 
 
 def _normalize_upload_metadata(value: Any) -> Dict[str, Any]:

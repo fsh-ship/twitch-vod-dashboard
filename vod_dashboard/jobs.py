@@ -1123,6 +1123,11 @@ class JobManager:
         label: str,
         *,
         retry_of: Optional[Dict[str, str]] = None,
+        origin: str = "manual",
+        streamer: str = "",
+        twitch_vod_id: str = "",
+        attempt: int = 0,
+        post_download_mode: str = "default",
         counter_getter: Optional[CounterGetter] = None,
         counter_setter: Optional[CounterSetter] = None,
     ) -> str:
@@ -1164,6 +1169,16 @@ class JobManager:
                 "log": [],
                 "returncode": None,
             }
+            if origin == "auto_vod":
+                job.update(
+                    {
+                        "origin": origin,
+                        "streamer": streamer,
+                        "twitch_vod_id": twitch_vod_id,
+                        "attempt": attempt,
+                        "post_download_mode": post_download_mode,
+                    }
+                )
             self.jobs[job_id] = job
             try:
                 self._attach_retry_relationship_locked(job, retry_of)
@@ -2979,6 +2994,8 @@ def run_download_job(
         settings.get("batch_postprocess_mode")
     )
     initial_job = manager.get_job(job_id) or {}
+    post_download_mode = str(initial_job.get("post_download_mode") or "default")
+    download_only = post_download_mode == "download_only"
     total = len(initial_job.get("urls") or [])
     failed = 0
     succeeded = 0
@@ -3002,6 +3019,11 @@ def run_download_job(
         f"auto_upload={bool(settings.get('youtube_auto_upload'))}, "
         f"privacy={settings.get('youtube_privacy_status')}",
     )
+    if download_only:
+        dependencies.append_log(
+            job_id,
+            "Post-download processing skipped: this Auto VOD download is download-only.",
+        )
 
     def detect_candidates(
         started_at: float, before_files: Dict[str, float]
@@ -3184,6 +3206,8 @@ def run_download_job(
                     dependencies.append_log(
                         job_id, f"VOD {idx}/{total} download completed."
                     )
+                    if download_only:
+                        continue
                     candidates = detect_candidates(started_at, before_files)
                     if postprocess_mode == "after_all":
                         deferred_items.append(
@@ -3221,7 +3245,7 @@ def run_download_job(
                 except Exception:
                     pass
 
-        if postprocess_mode == "after_all" and deferred_items:
+        if not download_only and postprocess_mode == "after_all" and deferred_items:
             dependencies.append_log(job_id, "")
             dependencies.append_log(
                 job_id,

@@ -1614,6 +1614,42 @@ class DownloadWorkerTests(unittest.TestCase):
             self.manager.jobs[job_id]["item_statuses"], ["fertig", "fertig"]
         )
 
+    def test_auto_vod_download_only_never_enters_youtube_path(self):
+        self.settings["youtube_enabled"] = True
+        self.settings["youtube_auto_upload"] = True
+        job_id = self.manager.create_download_job(
+            ["https://www.twitch.tv/videos/1234567890"],
+            "Automatic Twitch VOD: example_streamer",
+            origin="auto_vod",
+            streamer="example_streamer",
+            twitch_vod_id="1234567890",
+            attempt=1,
+            post_download_mode="download_only",
+        )
+        video = self.root / "new.mp4"
+        prepare = mock.Mock(return_value=video)
+        service = mock.Mock()
+        upload = mock.Mock()
+        enqueue = mock.Mock()
+        dependencies, _, _ = self.dependencies(
+            candidates=[video],
+            prepare=prepare,
+            service=service,
+            upload=upload,
+            enqueue=enqueue,
+        )
+
+        run_download_job(job_id, self.manager, dependencies)
+
+        prepare.assert_not_called()
+        service.assert_not_called()
+        upload.assert_not_called()
+        enqueue.assert_not_called()
+        dependencies.new_video_files.assert_not_called()
+        dependencies.recently_changed_video_files.assert_not_called()
+        self.assertEqual(self.manager.jobs[job_id]["status"], "fertig")
+        self.assertIn("download-only", "\n".join(self.manager.jobs[job_id]["log"]))
+
     def test_missing_subprocess_sets_not_found_returncode(self):
         job_id = self.create_job()
         dependencies, _, _ = self.dependencies()

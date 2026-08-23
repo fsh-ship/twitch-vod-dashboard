@@ -161,6 +161,44 @@ class JobStoreTests(unittest.TestCase):
             loaded.jobs[2]["live_started_at"], "2026-08-23T18:00:00Z"
         )
 
+    def test_auto_vod_download_metadata_round_trips_and_is_strict(self):
+        auto_vod = self.download(
+            origin="auto_vod",
+            streamer="Nika_LiveTV",
+            twitch_vod_id="1234567890",
+            attempt=2,
+            post_download_mode="download_only",
+        )
+        self.store.save([auto_vod], 2, revision=1)
+        loaded = self.store.load().jobs[0]
+
+        self.assertEqual(
+            {
+                key: loaded[key]
+                for key in (
+                    "origin",
+                    "streamer",
+                    "twitch_vod_id",
+                    "attempt",
+                    "post_download_mode",
+                )
+            },
+            {
+                "origin": "auto_vod",
+                "streamer": "nika_livetv",
+                "twitch_vod_id": "1234567890",
+                "attempt": 2,
+                "post_download_mode": "download_only",
+            },
+        )
+        with self.assertRaisesRegex(
+            job_store.JobStoreValidationError,
+            "invalid_auto_vod_download_metadata",
+        ):
+            job_store.serialize_job(
+                self.download(origin="auto_vod", streamer="", twitch_vod_id="1234567890")
+            )
+
     def test_timezone_aware_job_timestamps_are_normalized_and_naive_rejected(self):
         value = self.download(
             created_at="2026-08-23T20:00:00+02:00",

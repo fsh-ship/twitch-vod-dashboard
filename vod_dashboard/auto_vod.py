@@ -494,10 +494,20 @@ class AutoVodStateStore:
                 state, canonical_streamer, canonical_vod_id, record
             )
 
-    def set_queued(self, streamer: Any, vod_id: Any, job_id: Any) -> VodRecord:
+    def set_queued(
+        self,
+        streamer: Any,
+        vod_id: Any,
+        job_id: Any,
+        *,
+        attempts: Optional[int] = None,
+    ) -> VodRecord:
         canonical_streamer = _required_streamer(streamer)
         canonical_vod_id = _required_vod_id(vod_id)
         normalized_job_id = _required_job_id(job_id)
+        normalized_attempts = (
+            _required_attempts(attempts) if attempts is not None else None
+        )
         with self._lock:
             state = self._load_locked()
             existing = state["streamers"].get(
@@ -511,10 +521,17 @@ class AutoVodStateStore:
                 if existing["job_id"] == normalized_job_id:
                     return deepcopy(existing)
                 raise AutoVodStateValidationError("job_ownership_conflict")
+            attempts_value = (
+                normalized_attempts
+                if normalized_attempts is not None
+                else existing["attempts"]
+            )
+            if attempts_value < existing["attempts"]:
+                raise AutoVodStateValidationError("invalid_attempts")
             record = {
                 "disposition": "queued",
                 "reason": None,
-                "attempts": existing["attempts"],
+                "attempts": attempts_value,
                 "retry_after": None,
                 "job_id": normalized_job_id,
                 "discovered_at": existing["discovered_at"],
