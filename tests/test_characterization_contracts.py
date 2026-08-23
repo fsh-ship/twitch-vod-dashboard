@@ -238,6 +238,8 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
                 "GET",
                 "api_auto_recorder_status",
             ),
+            ("/api/auto-vod/status", "GET", "api_auto_vod_status"),
+            ("/api/auto-vod/check-now", "POST", "api_auto_vod_check_now"),
             ("/api/settings", "POST", "api_settings"),
             (
                 "/api/streamers/repair-newlines",

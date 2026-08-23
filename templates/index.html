@@ -48,6 +48,10 @@
                   <strong>Auto Recorder · Checking…</strong>
                   <span>Loading monitor status.</span>
                 </div>
+                <div id="autoVodStatus" class="auto-recorder-status is-loading" role="status" aria-live="polite">
+                  <strong>Auto VOD · Checking…</strong><span>Loading monitor status.</span>
+                </div>
+                <button type="button" class="quiet-button" id="checkAutoVodNow">Check now</button>
                 <div class="live-refresh-controls">
                   <button type="button" class="quiet-button" id="refreshLiveStatuses">Refresh Status</button>
                   <div id="liveStreamsRefreshStatus" class="live-refresh-status muted" role="status" aria-live="polite">Not updated yet.</div>
@@ -168,6 +172,8 @@
                 <div><strong>Auto Recorder</strong><span id="autoRecorderHelp" class="muted">Automatically monitor selected streamers and start a recording when they go live.</span><span id="autoRecorderSettingState" class="auto-recorder-setting-state">Paused · streamer selections are preserved.</span></div>
                 <label class="switch-control"><input type="checkbox" id="autoRecorderEnabled" role="switch" aria-label="Enable Auto Recorder" aria-describedby="autoRecorderHelp autoRecorderSettingState"><span class="switch-track" aria-hidden="true"></span></label>
               </div>
+              <div class="auto-recorder-setting"><div><strong>Auto VOD</strong><span id="autoVodHelp" class="muted">Automatically detect and download new Twitch VODs.</span><span id="autoVodSettingState" class="auto-recorder-setting-state">Paused · streamer selections are preserved.</span></div><label class="switch-control"><input type="checkbox" id="autoVodEnabled" role="switch" aria-label="Enable Auto VOD" aria-describedby="autoVodHelp autoVodSettingState"><span class="switch-track" aria-hidden="true"></span></label></div>
+              <label>Auto VOD interval <select id="autoVodPollMinutes" aria-label="Auto VOD polling interval"><option value="60">Every 1 hour</option><option value="120">Every 2 hours</option></select></label>
               <button id="saveSettings" class="primary" type="button">Save General Settings</button>
             </section>
           </section>

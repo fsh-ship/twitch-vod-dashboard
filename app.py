@@ -1126,6 +1126,35 @@ def auto_vod_monitor_snapshot() -> Dict[str, Any]:
     } if monitor is None else monitor.snapshot()
 
 
+def public_auto_vod_status(settings: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    current = dict(settings or load_settings())
+    snapshot = auto_vod_monitor_snapshot()
+    result = snapshot.get("last_result")
+    safe_result = None
+    if isinstance(result, Mapping):
+        safe_result = {
+            key: result[key]
+            for key in (
+                "checked_count", "discovered_count", "queued_count", "handled_count",
+                "retry_wait_count", "error_count", "action", "enabled", "state_healthy",
+            )
+            if key in result and isinstance(result[key], (str, int, float, bool, type(None)))
+        }
+    return {
+        "initialized": AUTO_VOD_MONITOR is not None,
+        "enabled": current.get("auto_vod_enabled") is True,
+        "poll_minutes": current.get("auto_vod_poll_minutes") if current.get("auto_vod_poll_minutes") in {60, 120} else 60,
+        "running": snapshot.get("running") is True,
+        "thread_alive": snapshot.get("thread_alive") is True,
+        "in_progress": snapshot.get("in_progress") is True,
+        "last_started_at": snapshot.get("last_started_at"),
+        "last_finished_at": snapshot.get("last_finished_at"),
+        "next_check_at": snapshot.get("next_check_at"),
+        "last_result": safe_result,
+        "watched_count": len(_configured_auto_vod_streamers(current)),
+    }
+
+
 def auto_recorder_monitor_snapshot() -> Dict[str, Any]:
     """Return internal runtime status without exposing a public endpoint."""
     with AUTO_RECORDER_MONITOR_LOCK:
@@ -1883,6 +1912,23 @@ def api_settings_status():
 @app.get("/api/auto-recorder/status")
 def api_auto_recorder_status():
     return jsonify(public_auto_recorder_status())
+
+
+@app.get("/api/auto-vod/status")
+def api_auto_vod_status():
+    return jsonify(public_auto_vod_status())
+
+
+@app.post("/api/auto-vod/check-now")
+def api_auto_vod_check_now():
+    status = public_auto_vod_status()
+    if not status["initialized"] or not status["running"]:
+        return jsonify({"ok": False, "status": "unavailable"}), 503
+    if not status["enabled"]:
+        return jsonify({"ok": False, "status": "disabled"}), 409
+    if not status["watched_count"]:
+        return jsonify({"ok": False, "status": "no_streamers"}), 409
+    return jsonify({"ok": bool(wake_auto_vod_monitor()), "status": "scheduled"})
 
 
 

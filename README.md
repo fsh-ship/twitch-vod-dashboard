@@ -12,6 +12,7 @@ The project is designed for a personal archive workflow. It includes secure-by-d
 - Validate individual Twitch VOD URLs before download.
 - Queue yt-dlp downloads and inspect bounded, browser-visible job logs.
 - Track downloaded VOD IDs through the yt-dlp archive file.
+- Optionally check selected streamers for newly published Twitch VODs every one or two hours, with a manual **Check now** wake-up.
 - List local VODs below an administrator-controlled media root.
 - Generate configurable YouTube titles, descriptions, filenames, and sidecar metadata.
 - Upload to YouTube with configurable privacy, chunk size, and optional playlist insertion.
@@ -178,6 +179,7 @@ Never commit `client_secret.json` or `youtube-token.json`. To reauthorize, stop 
 ## Normal workflow
 
 1. Open **Streamers**, enter one Twitch login per line, and save the list.
+   Auto VOD can be enabled globally and per streamer; it downloads newly published VODs only and does not automatically prepare or upload to YouTube.
 2. Open **VOD Search**, select a date range, and search for completed VODs.
 3. Review the results, select VODs, and choose **Download Selected**. The Queue page shows download progress and bounded logs.
 4. Use **Prepare for YouTube** to inspect downloaded media, generate metadata sidecars, and optionally rename files.
@@ -195,6 +197,7 @@ The dashboard-data directory contains small, important state:
 - `client_secret.json`: Google OAuth client credentials, when supplied
 - `youtube-token.json`: Google authorized-user token, when connected
 - `jobs.json`: bounded, allowlisted Queue history used by production Gunicorn restart recovery
+- `auto-vod-state.json`: durable Auto VOD ownership and retry state
 - `dashboard.log` and `dashboard.log.1`: bounded application logs
 - an optional Twitch cookie file
 

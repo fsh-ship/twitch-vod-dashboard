@@ -922,7 +922,7 @@ main { width:100%; max-width:1320px; }
 .streamer-add-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:end; margin:14px 0; }
 .streamer-add-row button { min-height:43px; }
 .streamer-editor-list { display:grid; gap:7px; }
-.streamer-editor-row { display:grid; grid-template-columns:34px minmax(110px,1fr) minmax(170px,260px) minmax(126px,150px) auto; gap:10px; align-items:center; padding:9px 11px; border:1px solid var(--line); border-radius:13px; background:#0e1522; }
+.streamer-editor-row { display:grid; grid-template-columns:34px minmax(110px,1fr) minmax(150px,230px) minmax(105px,130px) minmax(126px,150px) auto; gap:10px; align-items:center; padding:9px 11px; border:1px solid var(--line); border-radius:13px; background:#0e1522; }
 .streamer-order { display:grid; place-items:center; width:27px; height:27px; border-radius:999px; background:#182236; color:var(--muted); font-size:12px; }
 .streamer-editor-row strong { overflow-wrap:anywhere; }
 .streamer-playlist-field { display:grid; gap:4px; min-width:0; color:var(--muted); font-size:11px; }
