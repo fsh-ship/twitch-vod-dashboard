@@ -360,6 +360,17 @@ eval(source.slice(start, end));
 (async () => {
   syncLiveStreamers(['Nika_LiveTV', 'DigitalGirlUli', 'Bearykchen', 'Xerax_TTV']);
   const configuredHtml = elements.liveStreamsList.innerHTML;
+  const configuredSummary = elements.liveStreamsSummary.textContent;
+
+  liveStreamStatuses = new Map([
+    ['nika_livetv', {state:'live', streamer:'nika_livetv', title:'First confirmed live'}],
+    ['digitalgirluli', {state:'offline', streamer:'digitalgirluli'}],
+    ['bearykchen', {state:'checking', streamer:'bearykchen'}],
+    ['xerax_ttv', {state:'unknown', streamer:'xerax_ttv'}]
+  ]);
+  renderLiveStreams();
+  const partialInitialHtml = elements.liveStreamsList.innerHTML;
+  const partialInitialSummary = elements.liveStreamsSummary.textContent;
 
   liveStreamStatuses.set('nika_livetv', {
     state:'live', streamer:'nika_livetv', title:'Synthetic stream title',
@@ -455,10 +466,92 @@ eval(source.slice(start, end));
   await Promise.resolve();
   const updatingMessage = elements.liveStreamsRefreshStatus.textContent;
   const updatingDisabled = elements.refreshLiveStatuses.disabled;
-  refreshResolvers.forEach(resolve => resolve());
+  const initialRefreshHtml = elements.liveStreamsList.innerHTML;
+  const updatedBeforeFirstResult = liveStatusLastUpdatedAt;
+  refreshResolvers[0]();
+  await new Promise(resolve => setImmediate(resolve));
+  const oneResultMessage = elements.liveStreamsRefreshStatus.textContent;
+  const oneResultHtml = elements.liveStreamsList.innerHTML;
+  const updatedAfterFirstResult = liveStatusLastUpdatedAt;
+  refreshResolvers[1]();
   await refreshPromise;
   const refreshedDisabled = elements.refreshLiveStatuses.disabled;
   const refreshCalls = calls.filter(call => call.path.startsWith('/api/live/status'));
+  const updatedAfterRefresh = liveStatusLastUpdatedAt;
+
+  calls = [];
+  liveStreamers = ['Nika_LiveTV', 'DigitalGirlUli'];
+  liveStreamStatuses = new Map([
+    ['nika_livetv', {state:'live', streamer:'nika_livetv', title:'Previously live'}],
+    ['digitalgirluli', {state:'offline', streamer:'digitalgirluli'}]
+  ]);
+  liveStatusLastUpdatedAt = new Date('2026-08-23T20:00:00Z');
+  liveOfflineExpanded = true;
+  const manualResolvers = new Map();
+  apiHandler = path => new Promise(resolve => manualResolvers.set(path, resolve));
+  const manualRefreshPromise = refreshLiveStatuses();
+  await Promise.resolve();
+  const manualPendingHtml = elements.liveStreamsList.innerHTML;
+  const manualPendingSummary = elements.liveStreamsSummary.textContent;
+  manualResolvers.get('/api/live/status?streamer=nika_livetv')({
+    streamer:'nika_livetv', state:'offline'
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  const manualAfterFirstHtml = elements.liveStreamsList.innerHTML;
+  const manualAfterFirstSummary = elements.liveStreamsSummary.textContent;
+  manualResolvers.get('/api/live/status?streamer=digitalgirluli')({
+    streamer:'digitalgirluli', state:'live', title:'Newly live'
+  });
+  await manualRefreshPromise;
+  const manualFinalHtml = elements.liveStreamsList.innerHTML;
+  const manualFinalSummary = elements.liveStreamsSummary.textContent;
+
+  liveStreamers = ['Nika_LiveTV'];
+  liveStatusLastUpdatedAt = null;
+  liveStreamStatuses = new Map([['nika_livetv', {state:'unknown', streamer:'nika_livetv'}]]);
+  apiHandler = async () => { throw new Error('synthetic initial failure'); };
+  await requestLiveStatus('Nika_LiveTV');
+  const initialFailureHtml = elements.liveStreamsList.innerHTML;
+  const initialFailureState = liveStreamStatuses.get('nika_livetv');
+
+  liveStatusLastUpdatedAt = new Date('2026-08-23T20:00:00Z');
+  liveStreamStatuses = new Map([[
+    'nika_livetv', {state:'live', streamer:'nika_livetv', title:'Last confirmed title'}
+  ]]);
+  apiHandler = async () => { throw new Error('synthetic manual failure'); };
+  await requestLiveStatus('Nika_LiveTV');
+  const manualFailureHtml = elements.liveStreamsList.innerHTML;
+  const manualFailureState = liveStreamStatuses.get('nika_livetv');
+
+  liveRecordingJobs = [{
+    id:'recording-visible', type:'recording', streamer:'nika_livetv', state:'running',
+    recorded_seconds:12, title:'Still recording'
+  }];
+  const recordingVisibility = {};
+  for (const state of ['unknown', 'checking', 'error']) {
+    liveStreamStatuses.set('nika_livetv', {state, streamer:'nika_livetv'});
+    renderLiveStreams();
+    recordingVisibility[state] = elements.liveStreamsList.innerHTML;
+  }
+
+  calls = [];
+  liveRecordingJobs = [];
+  liveStreamers = ['One', 'Two', 'Three', 'Four', 'Five'];
+  liveStreamStatuses = new Map(liveStreamers.map(streamer => [
+    canonicalStreamerLoginClient(streamer),
+    {state:'unknown', streamer:canonicalStreamerLoginClient(streamer)}
+  ]));
+  liveStatusLastUpdatedAt = null;
+  let activeRequests = 0;
+  let maximumActiveRequests = 0;
+  apiHandler = async path => {
+    activeRequests += 1;
+    maximumActiveRequests = Math.max(maximumActiveRequests, activeRequests);
+    await new Promise(resolve => setTimeout(resolve, 2));
+    activeRequests -= 1;
+    return {streamer:path.split('streamer=')[1], state:'offline'};
+  };
+  await refreshLiveStatuses();
 
   calls = [];
   liveStreamStatuses = new Map();
@@ -490,7 +583,8 @@ eval(source.slice(start, end));
   const stopCall = calls.find(call => call.path.includes('/stop'));
 
   process.stdout.write(JSON.stringify({
-    configuredHtml, liveHtml, offlineHtml, errorHtml, statuses,
+    configuredHtml, configuredSummary, partialInitialHtml, partialInitialSummary,
+    liveHtml, offlineHtml, errorHtml, statuses,
     duration:formatRecordingDuration(5077),
     invalidDuration:formatRecordingDuration('invalid'),
     hierarchyHtml, summaryText, collapsedHtml, expandedHtml, recollapsedHtml,
@@ -500,6 +594,16 @@ eval(source.slice(start, end));
     refreshPaths:refreshCalls.map(call => call.path),
     duplicateCount:duplicateCalls.length,
     updatingMessage, updatingDisabled, refreshedDisabled,
+    initialRefreshHtml, oneResultMessage, oneResultHtml,
+    updatedBeforeFirstResult:updatedBeforeFirstResult === null,
+    updatedAfterFirstResult:updatedAfterFirstResult === null,
+    updatedAfterRefresh:updatedAfterRefresh instanceof Date,
+    manualPendingHtml, manualPendingSummary,
+    manualAfterFirstHtml, manualAfterFirstSummary,
+    manualFinalHtml, manualFinalSummary,
+    initialFailureHtml, initialFailureState,
+    manualFailureHtml, manualFailureState,
+    recordingVisibility, maximumActiveRequests,
     refreshMessage:elements.liveStreamsRefreshStatus.textContent,
     startPath:startCall.path,
     startBody:JSON.parse(startCall.options.body),
@@ -540,8 +644,11 @@ class V11UiContractTests(unittest.TestCase):
 
         self.assertIn('id="liveStreamsSection"', TEMPLATE)
         self.assertIn('id="refreshLiveStatuses"', TEMPLATE)
-        self.assertIn("Nika_LiveTV", result["configuredHtml"])
-        self.assertIn("DigitalGirlUli", result["configuredHtml"])
+        self.assertIn("Checking live status…", result["configuredHtml"])
+        self.assertNotIn("Nika_LiveTV", result["configuredHtml"])
+        self.assertNotIn("DigitalGirlUli", result["configuredHtml"])
+        self.assertNotIn("Offline Streamers", result["configuredHtml"])
+        self.assertEqual(result["configuredSummary"], "0 Live · 0 Recording · 0 Offline")
         self.assertIn("Synthetic stream title", result["liveHtml"])
         self.assertIn("LIVE", result["liveHtml"])
         self.assertIn("Start Recording", result["liveHtml"])
@@ -549,6 +656,19 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn("Start Recording", result["offlineHtml"])
         self.assertIn("Status could not be loaded", result["errorHtml"])
         self.assertNotIn("yt-dlp", result["errorHtml"])
+
+    def test_initial_live_status_only_renders_confirmed_results(self) -> None:
+        result = _evaluate_live_stream_ui()
+
+        self.assertIn("First confirmed live", result["partialInitialHtml"])
+        self.assertIn("Nika_LiveTV", result["partialInitialHtml"])
+        self.assertIn("Offline Streamers · 1", result["partialInitialHtml"])
+        self.assertIn("DigitalGirlUli", result["partialInitialHtml"])
+        self.assertNotIn("Bearykchen", result["partialInitialHtml"])
+        self.assertNotIn("Xerax_TTV", result["partialInitialHtml"])
+        self.assertEqual(
+            result["partialInitialSummary"], "1 Live · 0 Recording · 1 Offline"
+        )
 
     def test_live_summary_priority_grid_and_empty_state(self) -> None:
         result = _evaluate_live_stream_ui()
@@ -577,12 +697,72 @@ class V11UiContractTests(unittest.TestCase):
         )
         self.assertEqual(result["duplicateCount"], 1)
         self.assertEqual(result["updatingMessage"], "Updating 0 / 2")
+        self.assertEqual(result["oneResultMessage"], "Updating 1 / 2")
         self.assertTrue(result["updatingDisabled"])
         self.assertFalse(result["refreshedDisabled"])
         self.assertRegex(result["refreshMessage"], r"^Updated \d{2}:\d{2}$")
+        self.assertTrue(result["updatedBeforeFirstResult"])
+        self.assertTrue(result["updatedAfterFirstResult"])
+        self.assertTrue(result["updatedAfterRefresh"])
+        self.assertEqual(result["maximumActiveRequests"], 2)
         self.assertIn("const LIVE_STATUS_CONCURRENCY = 2", JAVASCRIPT)
         self.assertEqual(JAVASCRIPT.count("setInterval(() => pollJobs()"), 1)
         self.assertNotIn("setInterval(() => refreshLiveStatuses", JAVASCRIPT)
+
+    def test_initial_refresh_empty_state_changes_only_after_all_results(self) -> None:
+        result = _evaluate_live_stream_ui()
+
+        self.assertIn("Checking live status…", result["initialRefreshHtml"])
+        self.assertNotIn(
+            "No configured streamer is currently live.", result["initialRefreshHtml"]
+        )
+        self.assertIn('data-live-streamer="nika_livetv"', result["oneResultHtml"])
+        self.assertIn("Offline Streamers · 2", result["noLiveHtml"])
+        self.assertIn("No configured streamer is currently live.", result["noLiveHtml"])
+
+    def test_manual_refresh_keeps_confirmed_status_until_each_result(self) -> None:
+        result = _evaluate_live_stream_ui()
+
+        self.assertEqual(
+            result["manualPendingSummary"], "1 Live · 0 Recording · 1 Offline"
+        )
+        self.assertIn("Previously live", result["manualPendingHtml"])
+        self.assertIn("Offline Streamers · 1", result["manualPendingHtml"])
+        self.assertIn("DigitalGirlUli", result["manualPendingHtml"])
+        self.assertIn("Updating live status…", result["manualPendingHtml"])
+        self.assertEqual(
+            result["manualAfterFirstSummary"], "0 Live · 0 Recording · 2 Offline"
+        )
+        self.assertNotIn("Previously live", result["manualAfterFirstHtml"])
+        self.assertEqual(
+            result["manualFinalSummary"], "1 Live · 0 Recording · 1 Offline"
+        )
+        self.assertIn("Newly live", result["manualFinalHtml"])
+
+    def test_live_status_failures_never_become_offline(self) -> None:
+        result = _evaluate_live_stream_ui()
+
+        self.assertEqual(result["initialFailureState"]["state"], "error")
+        self.assertIn("Status could not be loaded", result["initialFailureHtml"])
+        self.assertNotIn("Offline Streamers", result["initialFailureHtml"])
+        self.assertEqual(result["manualFailureState"]["state"], "live")
+        self.assertTrue(result["manualFailureState"]["refreshError"])
+        self.assertIn("Last confirmed title", result["manualFailureHtml"])
+        self.assertIn(
+            "Status refresh failed; showing the last confirmed status.",
+            result["manualFailureHtml"],
+        )
+        self.assertNotIn("Offline Streamers", result["manualFailureHtml"])
+
+    def test_active_recording_remains_visible_for_unconfirmed_live_states(self) -> None:
+        result = _evaluate_live_stream_ui()
+
+        for state in ("unknown", "checking", "error"):
+            with self.subTest(state=state):
+                html = result["recordingVisibility"][state]
+                self.assertIn("LIVE · RECORDING", html)
+                self.assertIn("Still recording", html)
+                self.assertIn("Stop Recording", html)
 
     def test_recording_jobs_drive_lifecycle_duration_and_failure_copy(self) -> None:
         result = _evaluate_live_stream_ui()

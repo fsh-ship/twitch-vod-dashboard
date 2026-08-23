@@ -697,9 +697,11 @@ main { width:100%; max-width:1320px; }
 .live-stream-state { color:#dbe7ff; font-size:12px; font-weight:800; letter-spacing:.055em; }
 .live-stream-name { margin-top:2px; font-size:18px; line-height:1.25; }
 .live-stream-title { margin-top:3px; color:#cbd9f0; font-size:14px; line-height:1.4; }
-.live-stream-time, .live-recording-status, .live-recording-message, .live-recording-note { font-size:12px; line-height:1.4; }
+.live-stream-time, .live-recording-status, .live-recording-message, .live-recording-note, .live-status-refresh-note { font-size:12px; line-height:1.4; }
 .live-stream-time { color:var(--muted); }
 .live-recording-status { margin-top:5px; color:var(--good); font-weight:750; }
+.live-status-refresh-note { color:var(--muted); }
+.live-status-refresh-note.is-error { color:#ffcf91; }
 .live-stream-card.is-error .live-recording-status { color:#ffcf91; }
 .live-stream-actions { grid-column:2; display:flex; align-items:center; justify-content:flex-start; margin-top:3px; }
 .live-stream-actions button { min-width:148px; }

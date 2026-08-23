@@ -703,7 +703,7 @@ function liveStreamerIsFeatured(streamer) {
   const login = canonicalStreamerLoginClient(streamer);
   const status = liveStreamStatuses.get(login) || {state:'unknown'};
   const job = recordingJobForStreamer(login);
-  return status.state !== 'offline' || !!job;
+  return !!job || status.state === 'live' || status.state === 'error';
 }
 
 function liveStreamerDisplayPriority(streamer) {
@@ -749,6 +749,9 @@ function renderLiveStreamCard(streamer) {
   const startDisabledReason = status.state === 'live' && activeJob && !activeHere
     ? 'Another recording is already active.'
     : '';
+  const refreshNote = status.refreshError
+    ? 'Status refresh failed; showing the last confirmed status.'
+    : (liveStatusRequests.has(login) ? 'Updating live status…' : '');
   let actionHtml = '';
   if (activeHere && job.state === 'running') {
     actionHtml = `<button type="button" class="danger-outline live-recording-stop" data-job-id="${escapeHtml(job.id)}" data-streamer="${escapeHtml(login)}" ${action?.phase === 'stopping' ? 'disabled' : ''}>Stop Recording</button>`;
@@ -760,7 +763,8 @@ function renderLiveStreamCard(streamer) {
     started ? `<span class="live-stream-time">Live since ${escapeHtml(started)}</span>` : '',
     (activeHere || terminalHere) ? `<span class="live-recording-status">${escapeHtml(recordingStatusText(job))}</span>` : '',
     action?.message ? `<span class="live-recording-message bad">${escapeHtml(action.message)}</span>` : '',
-    startDisabledReason ? `<span class="live-recording-note muted">${escapeHtml(startDisabledReason)}</span>` : ''
+    startDisabledReason ? `<span class="live-recording-note muted">${escapeHtml(startDisabledReason)}</span>` : '',
+    refreshNote ? `<span class="live-status-refresh-note${status.refreshError ? ' is-error' : ''}">${escapeHtml(refreshNote)}</span>` : ''
   ].filter(Boolean).join('');
   return `<article class="live-stream-card is-${stateClass}" data-live-streamer="${escapeHtml(login)}">
     <div class="live-stream-indicator" aria-hidden="true"></div>
@@ -775,10 +779,14 @@ function renderLiveStreamCard(streamer) {
 
 function renderOfflineStreamer(streamer) {
   const login = canonicalStreamerLoginClient(streamer);
+  const status = liveStreamStatuses.get(login) || {state:'unknown'};
+  const refreshLabel = status.refreshError
+    ? 'Offline · refresh failed'
+    : (liveStatusRequests.has(login) ? 'Offline · updating…' : 'Offline');
   return `<div class="offline-stream-item" data-live-streamer="${escapeHtml(login)}">
     <span class="offline-stream-indicator" aria-hidden="true"></span>
     <strong>${escapeHtml(streamer)}</strong>
-    <span>Offline</span>
+    <span>${escapeHtml(refreshLabel)}</span>
   </div>`;
 }
 
@@ -805,12 +813,25 @@ function renderLiveStreams() {
     ))
     .map(item => item.streamer);
   const offline = indexed
-    .filter(item => !liveStreamerIsFeatured(item.streamer))
+    .filter(item => {
+      const login = canonicalStreamerLoginClient(item.streamer);
+      return liveStreamStatuses.get(login)?.state === 'offline'
+        && !liveStreamerIsFeatured(item.streamer);
+    })
     .map(item => item.streamer);
   if (summary) summary.textContent = liveStreamSummaryText(featured, offline);
+  const initialCheckPending = liveStatusLastUpdatedAt === null && (
+    liveStatusRefreshPromise !== null
+    || liveStatusRequests.size > 0
+    || indexed.some(item => {
+      const login = canonicalStreamerLoginClient(item.streamer);
+      const state = liveStreamStatuses.get(login)?.state || 'unknown';
+      return state === 'unknown' || state === 'checking';
+    })
+  );
   const liveContent = featured.length
     ? `<div class="live-stream-grid${featured.length === 1 ? ' is-single' : ''}">${featured.map(streamer => renderLiveStreamCard(streamer)).join('')}</div>`
-    : '<div class="live-stream-empty muted">No configured streamer is currently live.</div>';
+    : `<div class="live-stream-empty muted">${initialCheckPending ? 'Checking live status…' : 'No configured streamer is currently live.'}</div>`;
   const offlineContent = offline.length
     ? `<section class="offline-streams">
         <button type="button" class="offline-streams-toggle" aria-expanded="${liveOfflineExpanded ? 'true' : 'false'}" aria-controls="offlineStreamersList" aria-label="${liveOfflineExpanded ? 'Hide' : 'Show'} ${offline.length} offline streamers">
@@ -862,8 +883,11 @@ async function requestLiveStatus(streamer) {
   const login = canonicalStreamerLoginClient(streamer);
   if (!login) return null;
   if (liveStatusRequests.has(login)) return liveStatusRequests.get(login);
-  liveStreamStatuses.set(login, {state:'checking', streamer:login});
-  renderLiveStreams();
+  const previousStatus = liveStreamStatuses.get(login) || {state:'unknown', streamer:login};
+  const hasConfirmedStatus = previousStatus.state === 'live' || previousStatus.state === 'offline';
+  liveStreamStatuses.set(login, hasConfirmedStatus
+    ? {...previousStatus, refreshError:false}
+    : {state:'checking', streamer:login});
   const request = api(`/api/live/status?streamer=${encodeURIComponent(login)}`)
     .then(payload => {
       const nextState = payload?.state === 'live' || payload?.state === 'offline'
@@ -873,7 +897,9 @@ async function requestLiveStatus(streamer) {
       return liveStreamStatuses.get(login);
     })
     .catch(() => {
-      const failed = {state:'error', streamer:login};
+      const failed = hasConfirmedStatus
+        ? {...previousStatus, streamer:login, refreshError:true}
+        : {state:'error', streamer:login};
       liveStreamStatuses.set(login, failed);
       return failed;
     })
@@ -882,6 +908,7 @@ async function requestLiveStatus(streamer) {
       renderLiveStreams();
     });
   liveStatusRequests.set(login, request);
+  renderLiveStreams();
   return request;
 }
 
@@ -917,6 +944,7 @@ async function refreshLiveStatuses() {
     } else if (message) {
       message.textContent = 'No configured streamers to check.';
     }
+    renderLiveStreams();
   }
 }
 
