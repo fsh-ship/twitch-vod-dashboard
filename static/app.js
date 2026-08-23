@@ -2172,8 +2172,8 @@ function renderQueuePersistenceStatus(status={}) {
   const box = $('queuePersistenceWarning');
   if (!box) return;
   if (!status.enabled || (!status.current_degraded && !status.history_degraded)) {
-    box.classList.add('hidden');
     box.innerHTML = '';
+    box.hidden = true;
     return;
   }
   if (status.current_degraded && status.history_degraded) {
@@ -2183,7 +2183,7 @@ function renderQueuePersistenceStatus(status={}) {
   } else {
     box.innerHTML = '<strong>Some saved job history could not be restored.</strong><span>Current downloads and uploads can continue normally.</span>';
   }
-  box.classList.remove('hidden');
+  box.hidden = false;
 }
 
 function renderVodQueue(jobs, queueControls={}, persistenceStatus={}) {

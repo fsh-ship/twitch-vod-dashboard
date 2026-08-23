@@ -776,6 +776,7 @@ main { width:100%; max-width:1320px; }
 .completed-history-heading details { flex:1 1 auto; min-width:0; }
 .completed-section details[open] > .queue-vod-list { margin-top:14px; }
 .queue-persistence-warning { display:grid; gap:4px; padding:12px 14px; border:1px solid rgba(255,190,90,.42); border-radius:14px; background:rgba(65,45,18,.62); color:#ffe5bc; }
+.queue-persistence-warning[hidden] { display:none; }
 .queue-persistence-warning strong { font-size:14px; }
 .queue-persistence-warning span { color:#d9c6a9; font-size:13px; line-height:1.4; }
 .confirmation-dialog { width:min(520px,calc(100vw - 28px)); padding:0; border:1px solid var(--line); border-radius:18px; background:#131a26; color:var(--text); box-shadow:0 24px 80px rgba(0,0,0,.58); }

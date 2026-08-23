@@ -90,6 +90,22 @@ class JobRecoveryTests(unittest.TestCase):
         restored.restore_from_store()
         return restored, store, job_id
 
+    def shutdown_download(self, name, *, toggle=False):
+        store = self.store(name, toggle=toggle)
+        source = self.manager(store)
+        job_id = source.create_download_job(
+            ["https://www.twitch.tv/videos/1234567890"],
+            "Gracefully interrupted download",
+        )
+        claim = source.claim_next_item(job_id)
+        source.begin_shutdown()
+        self.assertTrue(
+            source.finish_download_shutdown_item(job_id, claim["item_id"])
+        )
+        restored = self.manager(store, restarted=True)
+        restored.restore_from_store()
+        return restored, store, job_id
+
     def upload_metadata(
         self,
         path,
@@ -237,6 +253,57 @@ class JobRecoveryTests(unittest.TestCase):
 
         self.assertEqual(archive.read_bytes(), original_files[0])
         self.assertEqual(partial.read_bytes(), original_files[1])
+
+    def test_worker_shutdown_download_retry_is_durable_and_linked(self):
+        manager, store, job_id = self.shutdown_download(
+            "worker-shutdown-download.json"
+        )
+        original_before = manager.get_job(job_id)
+        item_id = original_before["item_ids"][0]
+        capability = manager.snapshot_jobs()[0]["item_capabilities"][0]
+        self.assertTrue(capability["can_retry"])
+
+        observed = {}
+
+        def worker_start(_target, retry_job_id):
+            durable = JobStore(store.path).load().jobs
+            observed["parent"] = next(
+                job for job in durable if job["id"] == job_id
+            )
+            observed["retry"] = next(
+                job for job in durable if job["id"] == retry_job_id
+            )
+
+        with self.app_manager(manager) as client, mock.patch.object(
+            manager, "start_worker", side_effect=worker_start
+        ) as starter:
+            response = self.retry_request(client, job_id, item_id)
+
+        self.assertEqual(response.status_code, 200)
+        retry_id = response.get_json()["retry_job_id"]
+        self.assertNotEqual(retry_id, job_id)
+        original = manager.get_job(job_id)
+        retry = manager.get_job(retry_id)
+        self.assertEqual(original["state"], "interrupted")
+        self.assertEqual(original["item_states"], ["interrupted"])
+        self.assertEqual(original["completion_reason"], "worker_shutdown")
+        self.assertEqual(
+            original["item_completion_reasons"], ["worker_shutdown"]
+        )
+        self.assertEqual(original["item_retry_job_ids"], [retry_id])
+        self.assertEqual(
+            retry["urls"],
+            ["https://www.twitch.tv/videos/1234567890"],
+        )
+        self.assertEqual(
+            retry["retry_of"],
+            {"job_id": job_id, "item_id": item_id},
+        )
+        self.assertEqual(
+            observed["parent"]["item_retry_job_ids"], [retry_id]
+        )
+        self.assertEqual(observed["retry"]["id"], retry_id)
+        starter.assert_called_once()
 
     def test_noncanonical_download_is_blocked_without_worker(self):
         manager, _, job_id = self.restored_download("unsafe-download.json")
@@ -478,6 +545,56 @@ class JobRecoveryTests(unittest.TestCase):
                     capability["retry_blocked_reason"], "review_required"
                 )
 
+    def test_worker_shutdown_does_not_broaden_upload_or_recording_retry(self):
+        manager = JobManager()
+        upload_path = self.media / "worker-shutdown-upload.mp4"
+        upload_path.write_bytes(b"video")
+        upload_id = manager.create_upload_job(
+            [str(upload_path)], "Interrupted upload"
+        )
+        recording_id = manager.create_recording_job("nika_livetv")
+
+        for job_id in (upload_id, recording_id):
+            manager.update_job(
+                job_id,
+                state="interrupted",
+                item_states=["interrupted"],
+                item_statuses=["fehler"],
+                item_completion_reasons=["worker_shutdown"],
+                item_recovery_reasons=["worker_shutdown"],
+                completion_reason="worker_shutdown",
+                recovery_reason="worker_shutdown",
+            )
+
+        for job_id, expected_reason in (
+            (upload_id, "not_retryable"),
+            (recording_id, "recording_retry_unsupported"),
+        ):
+            with self.subTest(job_id=job_id):
+                job = manager.get_job(job_id)
+                item_id = job["item_ids"][0]
+                snapshot = next(
+                    value
+                    for value in manager.snapshot_jobs()
+                    if value["id"] == job_id
+                )
+                capability = snapshot["item_capabilities"][0]
+                self.assertFalse(capability["can_retry"])
+                self.assertEqual(
+                    capability["retry_blocked_reason"], expected_reason
+                )
+                with self.app_manager(manager) as client, mock.patch.object(
+                    manager, "start_worker"
+                ) as starter:
+                    response = self.retry_request(client, job_id, item_id)
+                self.assertEqual(response.status_code, 409)
+                payload = response.get_json()
+                if expected_reason == "recording_retry_unsupported":
+                    self.assertEqual(payload["reason"], expected_reason)
+                else:
+                    self.assertIn("can be retried", payload["error"])
+                starter.assert_not_called()
+
     def test_recording_retry_is_blocked_without_p4_or_process_actions(self):
         for state in ("queued", "running", "failed"):
             with self.subTest(state=state):
@@ -528,13 +645,9 @@ class JobRecoveryTests(unittest.TestCase):
                 auto_write.assert_not_called()
 
     def test_required_retry_save_failure_starts_nothing_and_consumes_id(self):
-        store = self.store("failing.json", toggle=True)
-        source = self.manager(store)
-        job_id = source.create_download_job(
-            ["https://www.twitch.tv/videos/1234567890"], "Download"
+        manager, store, job_id = self.shutdown_download(
+            "failing.json", toggle=True
         )
-        manager = self.manager(store, restarted=True)
-        manager.restore_from_store()
         item_id = manager.get_job(job_id)["item_ids"][0]
         store.fail = True
 

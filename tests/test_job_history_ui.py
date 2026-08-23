@@ -90,14 +90,17 @@ const box = {
 function $(id) { return id === 'queuePersistenceWarning' ? box : null; }
 eval(source.slice(start, end));
 function render(status) {
-  box.innerHTML=''; box.hidden=true; renderQueuePersistenceStatus(status);
+  renderQueuePersistenceStatus(status);
   return {html:box.innerHTML, hidden:box.hidden};
 }
+const storeless = render({enabled:false, healthy:null});
+const healthy = render({enabled:true, healthy:true});
+const current = render({enabled:true, healthy:false, current_degraded:true});
+const recovered = render({enabled:true, healthy:true});
+const history = render({enabled:true, healthy:true, history_degraded:true});
+const storelessAfterWarning = render({enabled:false, healthy:null});
 process.stdout.write(JSON.stringify({
-  storeless:render({enabled:false, healthy:null}),
-  healthy:render({enabled:true, healthy:true}),
-  current:render({enabled:true, healthy:false, current_degraded:true}),
-  history:render({enabled:true, healthy:true, history_degraded:true}),
+  storeless, healthy, current, recovered, history, storelessAfterWarning,
 }));
 """
     completed = subprocess.run(
@@ -170,7 +173,7 @@ class JobHistoryUiTests(unittest.TestCase):
         jobs = [
             _download_job("12", "completed", updated="2026-08-23T20:20:00Z"),
             _download_job("11", "completed", updated="2026-08-23T20:10:00Z"),
-            _download_job("10", "interrupted", reason="restart_interrupted", updated="2026-08-23T20:40:00Z", retry=True),
+            _download_job("10", "interrupted", reason="worker_shutdown", updated="2026-08-23T20:40:00Z", retry=True),
             _download_job("9", "interrupted", reason="restart_before_start", updated="2026-08-23T20:30:00Z", retry=True),
             {
                 "id": "8", "label": "Upload batch", "type": "youtube_upload",
@@ -232,6 +235,7 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertIn("while this download was running", running)
         self.assertIn("before this download started", before_start)
         self.assertIn('data-queue-action="retry"', running)
+        self.assertNotIn("worker_shutdown", running.split("<details", 1)[0])
         self.assertIn("Last recorded progress", running)
         self.assertNotIn("43.2x", running)
         self.assertNotIn("remaining", running)
@@ -283,11 +287,30 @@ class JobHistoryUiTests(unittest.TestCase):
     def test_persistence_health_only_warns_for_degradation(self):
         values = _evaluate_persistence_ui()
         self.assertTrue(values["storeless"]["hidden"])
+        self.assertEqual(values["storeless"]["html"], "")
         self.assertTrue(values["healthy"]["hidden"])
+        self.assertEqual(values["healthy"]["html"], "")
         self.assertFalse(values["current"]["hidden"])
         self.assertIn("Job history persistence degraded", values["current"]["html"])
+        self.assertIn("Current work can continue", values["current"]["html"])
+        self.assertTrue(values["recovered"]["hidden"])
+        self.assertEqual(values["recovered"]["html"], "")
         self.assertFalse(values["history"]["hidden"])
         self.assertIn("could not be restored", values["history"]["html"])
+        self.assertIn(
+            "Current downloads and uploads can continue normally",
+            values["history"]["html"],
+        )
+        self.assertTrue(values["storelessAfterWarning"]["hidden"])
+        self.assertEqual(values["storelessAfterWarning"]["html"], "")
+
+    def test_persistence_warning_has_no_empty_desktop_or_mobile_footprint(self):
+        self.assertIn(
+            'id="queuePersistenceWarning" class="queue-persistence-warning" role="status" aria-live="polite" hidden',
+            TEMPLATE,
+        )
+        hidden_rule = ".queue-persistence-warning[hidden] { display:none; }"
+        self.assertIn(hidden_rule, STYLESHEET)
 
     def test_template_has_accessible_history_confirmation_and_persistent_empty_copy(self):
         self.assertIn('id="clearCompletedDialog"', TEMPLATE)

@@ -1610,7 +1610,11 @@ class JobManager:
             job.get("type") == "download"
             and state == "interrupted"
             and recovery_reason
-            in {"restart_before_start", "restart_interrupted"}
+            in {
+                "restart_before_start",
+                "restart_interrupted",
+                "worker_shutdown",
+            }
         )
         interrupted_upload = (
             job.get("type") == "youtube_upload"
