@@ -22,6 +22,8 @@ DEBUG_KEYS = {
     "deduped",
     "kept",
     "unknown_dates",
+    "date_metadata_enriched",
+    "date_enrichment_failed",
     "skipped_by_date",
     "skipped_live",
     "skipped_nonvod",
@@ -111,6 +113,8 @@ class TwitchSearchOrchestrationTests(unittest.TestCase):
                 "deduped": 1,
                 "kept": 1,
                 "unknown_dates": 0,
+                "date_metadata_enriched": 0,
+                "date_enrichment_failed": 0,
                 "skipped_by_date": 0,
                 "skipped_live": 0,
                 "skipped_nonvod": 0,
@@ -216,14 +220,13 @@ class TwitchSearchOrchestrationTests(unittest.TestCase):
         self.assertEqual(excluded["debug"][0]["unknown_dates"], 1)
         self.assertEqual(excluded["debug"][0]["skipped_by_date"], 1)
 
-    def test_non_strict_filter_keeps_unknown_outside_range(self):
+    def test_include_unknown_off_filters_unknown_without_strict_range_filter(self):
         payload = self.search(
             [self.playlist("source", [self.entry("1234567890", upload_date="")])],
             include_unknown=False,
             strict_date_filter=False,
         )
-        self.assertEqual(len(payload["results"]), 1)
-        self.assertTrue(payload["results"][0]["outside_range"])
+        self.assertEqual(payload["results"], [])
         self.assertEqual(payload["debug"][0]["skipped_by_date"], 1)
 
     def test_live_upcoming_and_non_vod_entries_are_excluded(self):
@@ -273,6 +276,177 @@ class TwitchSearchOrchestrationTests(unittest.TestCase):
         self.assertEqual(result["date"], "2026-08-12")
         self.assertEqual(result["title"], "Detail title")
         self.assertTrue(result["date_enriched"])
+        self.assertEqual(payload["debug"][0]["date_metadata_enriched"], 1)
+        self.assertEqual(payload["debug"][0]["date_enrichment_failed"], 0)
+
+    def test_existing_flat_date_never_triggers_detail_extraction(self):
+        settings = {"enrich_vod_dates": True}
+        detail_runner = mock.Mock(
+            side_effect=AssertionError("dated entries must remain flat-only")
+        )
+        payload = self.search(
+            [self.playlist("source", [self.entry("1234567890")])],
+            settings=settings,
+            detail_runner=detail_runner,
+        )
+
+        detail_runner.assert_not_called()
+        self.assertEqual(payload["results"][0]["date"], "2026-08-10")
+        self.assertEqual(payload["debug"][0]["date_metadata_enriched"], 0)
+
+    def test_prefixed_flat_id_is_enriched_through_canonical_url_before_filter(self):
+        settings = {"enrich_vod_dates": True}
+        detail_runner = mock.Mock(
+            return_value={"upload_date": "20260823", "title": "Subscriber VOD"}
+        )
+        payload = self.search(
+            [
+                self.playlist(
+                    "source",
+                    [{"id": "v2854443252", "title": "", "upload_date": ""}],
+                )
+            ],
+            settings=settings,
+            include_unknown=False,
+            strict_date_filter=True,
+            detail_runner=detail_runner,
+        )
+
+        detail_runner.assert_called_once_with(
+            "https://www.twitch.tv/videos/2854443252", settings
+        )
+        self.assertEqual(len(payload["results"]), 1)
+        self.assertEqual(payload["results"][0]["id"], "2854443252")
+        self.assertEqual(payload["results"][0]["date"], "2026-08-23")
+
+    def test_timestamp_enrichment_and_recovered_out_of_range_filtering(self):
+        settings = {"enrich_vod_dates": True}
+        inside = self.search(
+            [
+                self.playlist(
+                    "source", [self.entry("1234567890", upload_date="")]
+                )
+            ],
+            settings=settings,
+            include_unknown=False,
+            strict_date_filter=True,
+            detail_runner=mock.Mock(return_value={"timestamp": 1_787_507_539}),
+        )
+        outside = self.search(
+            [
+                self.playlist(
+                    "source", [self.entry("1234567890", upload_date="")]
+                )
+            ],
+            settings=settings,
+            start=datetime(2026, 8, 24),
+            end=datetime(2026, 8, 31),
+            include_unknown=False,
+            strict_date_filter=True,
+            detail_runner=mock.Mock(return_value={"timestamp": 1_787_507_539}),
+        )
+
+        self.assertEqual(inside["results"][0]["date"], "2026-08-23")
+        self.assertEqual(outside["results"], [])
+        self.assertEqual(outside["debug"][0]["skipped_by_date"], 1)
+
+    def test_one_enrichment_failure_is_isolated_and_unknown_setting_still_applies(self):
+        settings = {"enrich_vod_dates": True}
+        entries = [
+            self.entry("1234567890", "Recovered", upload_date=""),
+            self.entry("2345678901", "Unavailable", upload_date=""),
+        ]
+
+        def detail(url, configured):
+            self.assertIs(configured, settings)
+            if url.endswith("2345678901"):
+                raise RuntimeError("private signed URL and cookie detail")
+            return {"release_timestamp": 1_787_507_539}
+
+        safe_log = mock.Mock()
+        excluded = self.search(
+            [self.playlist("source", entries)],
+            settings=settings,
+            include_unknown=False,
+            strict_date_filter=False,
+            detail_runner=detail,
+            log_callback=safe_log,
+        )
+        included = self.search(
+            [self.playlist("source", entries)],
+            settings=settings,
+            include_unknown=True,
+            strict_date_filter=True,
+            detail_runner=detail,
+        )
+
+        self.assertEqual([item["title"] for item in excluded["results"]], ["Recovered"])
+        self.assertEqual(len(included["results"]), 2)
+        unavailable = next(
+            item for item in included["results"] if item["title"] == "Unavailable"
+        )
+        self.assertEqual(unavailable["date"], "unknown")
+        self.assertNotIn("private signed", str(excluded))
+        safe_log.assert_called_once_with(
+            "Date metadata enrichment failed for Twitch VOD 2345678901."
+        )
+
+    def test_missing_dates_use_two_workers_and_request_cache_deduplicates_ids(self):
+        settings = {"enrich_vod_dates": True}
+        entries = [
+            self.entry("1234567890", upload_date=""),
+            self.entry("2345678901", upload_date=""),
+            self.entry("3456789012", upload_date=""),
+        ]
+        detail_runner = mock.Mock(return_value={"upload_date": "20260810"})
+        with mock.patch(
+            "vod_dashboard.twitch.ThreadPoolExecutor",
+            wraps=twitch.ThreadPoolExecutor,
+        ) as executor:
+            payload = self.search(
+                [self.playlist("source", entries)],
+                settings=settings,
+                detail_runner=detail_runner,
+            )
+        executor.assert_called_once_with(max_workers=2)
+        self.assertEqual(detail_runner.call_count, 3)
+        self.assertEqual(len(payload["results"]), 3)
+
+        repeated = mock.Mock(return_value={"upload_date": "20260810"})
+
+        def sources(streamer, limit, configured):
+            return [
+                self.playlist(
+                    streamer,
+                    [self.entry("4567890123", streamer, upload_date="")],
+                )
+            ]
+
+        duplicate_payload = self.search(
+            sources,
+            streamers=["alpha", "beta"],
+            settings=settings,
+            detail_runner=repeated,
+        )
+        repeated.assert_called_once_with(
+            "https://www.twitch.tv/videos/4567890123", settings
+        )
+        self.assertEqual(len(duplicate_payload["results"]), 2)
+
+    def test_malformed_unknown_id_is_never_sent_to_detail_extractor(self):
+        detail_runner = mock.Mock()
+        payload = self.search(
+            [
+                self.playlist(
+                    "source",
+                    [{"id": "v12-not-valid", "title": "Malformed"}],
+                )
+            ],
+            settings={"enrich_vod_dates": True},
+            detail_runner=detail_runner,
+        )
+        detail_runner.assert_not_called()
+        self.assertEqual(payload["results"], [])
 
     def test_enrichment_failure_is_logged_and_kept_as_unknown(self):
         settings = {"enrich_vod_dates": True}
@@ -292,8 +466,10 @@ class TwitchSearchOrchestrationTests(unittest.TestCase):
         self.assertEqual(payload["results"][0]["date"], "unknown")
         self.assertFalse(payload["results"][0]["date_enriched"])
         log_callback.assert_called_once_with(
-            "Could not retrieve the date for https://www.twitch.tv/videos/1234567890: detail failed"
+            "Date metadata enrichment failed for Twitch VOD 1234567890."
         )
+        self.assertNotIn("detail failed", str(payload))
+        self.assertEqual(payload["debug"][0]["date_enrichment_failed"], 1)
 
     def test_partial_source_failure_keeps_successful_fallback(self):
         payload = self.search(
@@ -386,6 +562,8 @@ class TwitchSearchOrchestrationTests(unittest.TestCase):
                         "deduped": 0,
                         "kept": 0,
                         "unknown_dates": 0,
+                        "date_metadata_enriched": 0,
+                        "date_enrichment_failed": 0,
                         "skipped_by_date": 0,
                         "skipped_live": 0,
                         "skipped_nonvod": 0,

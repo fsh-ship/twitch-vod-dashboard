@@ -28,6 +28,7 @@ class PureTwitchHelperTests(unittest.TestCase):
             imported_roots,
             {
                 "__future__",
+                "concurrent",
                 "datetime",
                 "json",
                 "pathlib",
@@ -72,6 +73,10 @@ class PureTwitchHelperTests(unittest.TestCase):
         )
         self.assertEqual(twitch.entry_date({"timestamp": "0"}), "1970-01-01")
         self.assertIsNone(twitch.entry_date({"timestamp": 0}))
+        self.assertEqual(
+            twitch.entry_date({"release_timestamp": 1_787_507_539}),
+            "2026-08-23",
+        )
 
     def test_vod_id_extraction_and_canonical_urls_are_preserved(self):
         self.assertEqual(twitch.vod_id_from_url("videos/123456"), "123456")
@@ -86,6 +91,8 @@ class PureTwitchHelperTests(unittest.TestCase):
             "456789",
         )
         self.assertEqual(twitch.extract_twitch_vod_id("567890"), "567890")
+        self.assertEqual(twitch.extract_twitch_vod_id("v2854443252"), "2854443252")
+        self.assertEqual(twitch.vod_id_from_url("v2854443252"), "2854443252")
         self.assertEqual(twitch.extract_twitch_vod_id("12345"), "")
         self.assertEqual(
             twitch.canonical_twitch_vod_url(
@@ -402,7 +409,7 @@ class YtDlpIntegrationHelperTests(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=30,
         )
 
         empty = SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -421,6 +428,41 @@ class YtDlpIntegrationHelperTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "detail failed"):
                 twitch.run_ytdlp_vod_detail("vod", self.settings)
+
+    def test_vod_detail_reuses_cookie_auth_and_accepts_warning_on_success(self):
+        cookie_file = self.base / "subscriber-cookies.txt"
+        cookie_file.write_text(
+            "# Netscape HTTP Cookie File\n", encoding="utf-8"
+        )
+        process = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "id": "2854443252",
+                    "upload_date": "20260823",
+                    "timestamp": 1_787_507_539,
+                }
+            ),
+            stderr=(
+                "WARNING: Unable to download JSON metadata: "
+                "HTTP Error 403: Forbidden"
+            ),
+        )
+        with mock.patch(
+            "vod_dashboard.twitch.subprocess.run", return_value=process
+        ) as run:
+            result = twitch.run_ytdlp_vod_detail(
+                "https://www.twitch.tv/videos/2854443252",
+                {"cookie_file": str(cookie_file), "cookie_browser": "firefox"},
+                command_factory=lambda: ["python", "-m", "yt_dlp"],
+            )
+
+        self.assertEqual(twitch.entry_date(result), "2026-08-23")
+        command = run.call_args.args[0]
+        self.assertIn("--cookies", command)
+        self.assertEqual(command[command.index("--cookies") + 1], str(cookie_file))
+        self.assertNotIn("--cookies-from-browser", command)
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
 
     def test_live_status_command_cookies_and_safe_metadata_normalization(self):
         cookie_file = self.base / "cookies.txt"

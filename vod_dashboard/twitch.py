@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -23,11 +24,16 @@ def parse_date(value: Optional[str]) -> Optional[datetime]:
 
 
 def entry_date(entry: Dict[str, Any]) -> Optional[str]:
-    for key in ("upload_date", "release_date", "timestamp"):
+    for key in (
+        "upload_date",
+        "release_date",
+        "timestamp",
+        "release_timestamp",
+    ):
         val = entry.get(key)
         if not val:
             continue
-        if key == "timestamp":
+        if key in {"timestamp", "release_timestamp"}:
             try:
                 return datetime.fromtimestamp(int(val), tz=timezone.utc).strftime("%Y-%m-%d")
             except Exception:
@@ -92,6 +98,9 @@ def is_live_or_upcoming_entry(entry: Dict[str, Any]) -> bool:
 
 
 def vod_id_from_url(url: str) -> str:
+    prefixed = re.fullmatch(r"v(\d{6,})", str(url or "").strip(), re.I)
+    if prefixed:
+        return prefixed.group(1)
     match = re.search(r"(?:videos/|video=|v=)(\d{6,})", str(url or ""))
     if match:
         return match.group(1)
@@ -118,6 +127,9 @@ def extract_twitch_vod_id(entry_or_url: Any) -> str:
         if value is None:
             continue
         s = str(value)
+        prefixed = re.fullmatch(r"v(\d{6,})", s.strip(), re.I)
+        if prefixed:
+            return prefixed.group(1)
         match = re.search(r"(?:videos/|video=|v=)(\d{6,})", s)
         if match:
             return match.group(1)
@@ -229,6 +241,8 @@ _TWITCH_NOT_LIVE_RE = re.compile(
     re.IGNORECASE,
 )
 LIVE_STATUS_TIMEOUT_SECONDS = 30
+VOD_DETAIL_TIMEOUT_SECONDS = 30
+VOD_DATE_ENRICHMENT_WORKERS = 2
 _TWITCH_QUALITY_RE = re.compile(
     r"(?<!\d)(\d{3,4})p(?:([1-9]\d{1,2}))?\b", re.IGNORECASE
 )
@@ -545,7 +559,10 @@ def run_ytdlp_vod_detail(
     command.append(str(url))
 
     process = subprocess.run(
-        command, capture_output=True, text=True, timeout=180
+        command,
+        capture_output=True,
+        text=True,
+        timeout=VOD_DETAIL_TIMEOUT_SECONDS,
     )
     if process.returncode != 0:
         raise RuntimeError(
@@ -705,6 +722,56 @@ def run_ytdlp_json_for_streamer(
     }
 
 
+def _enrich_unknown_vod_dates(
+    entries: List[Dict[str, Any]],
+    settings: Dict[str, Any],
+    *,
+    detail_runner: Callable[[str, Dict[str, Any]], Dict[str, Any]],
+    cache: Dict[str, Dict[str, Any]],
+    exclude_live: bool,
+    log_callback: Optional[Callable[[str], None]],
+) -> None:
+    """Populate one request-local detail cache for valid unknown-date VODs."""
+    if not settings.get("enrich_vod_dates", True):
+        return
+
+    pending: Dict[str, str] = {}
+    for entry in entries:
+        if entry_date(entry):
+            continue
+        if exclude_live and is_live_or_upcoming_entry(entry):
+            continue
+        vod_id = extract_twitch_vod_id(entry)
+        if not vod_id or not vod_id.isdigit() or vod_id in cache:
+            continue
+        url = canonical_twitch_vod_url(vod_id)
+        if url:
+            pending.setdefault(vod_id, url)
+
+    if not pending:
+        return
+
+    def retrieve(item: tuple[str, str]) -> tuple[str, Dict[str, Any]]:
+        vod_id, url = item
+        try:
+            detail = detail_runner(url, settings)
+        except Exception:
+            detail = {}
+        if not isinstance(detail, dict):
+            detail = {}
+        return vod_id, detail
+
+    worker_count = min(VOD_DATE_ENRICHMENT_WORKERS, len(pending))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        outcomes = executor.map(retrieve, pending.items())
+        for vod_id, detail in outcomes:
+            cache[vod_id] = detail
+            if not entry_date(detail) and log_callback:
+                log_callback(
+                    f"Date metadata enrichment failed for Twitch VOD {vod_id}."
+                )
+
+
 def search_vods(
     streamers: List[str],
     settings: Dict[str, Any],
@@ -731,6 +798,7 @@ def search_vods(
     results: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
     debug: List[Dict[str, Any]] = []
+    enrichment_cache: Dict[str, Dict[str, Any]] = {}
 
     for streamer in streamers:
         try:
@@ -763,9 +831,19 @@ def search_vods(
                         seen_entry_keys.add(key)
                     entry["_source_url"] = source_url
                     entries.append(entry)
+            _enrich_unknown_vod_dates(
+                entries,
+                settings,
+                detail_runner=run_detail,
+                cache=enrichment_cache,
+                exclude_live=exclude_live,
+                log_callback=log_callback,
+            )
             kept = 0
             skipped_by_date = 0
             unknown_dates = 0
+            date_metadata_enriched = 0
+            date_enrichment_failed = 0
             skipped_live = 0
             skipped_nonvod = 0
             for entry in entries:
@@ -785,8 +863,9 @@ def search_vods(
                 date_str = entry_date(entry)
                 enriched = False
                 if not date_str and settings.get("enrich_vod_dates", True):
-                    try:
-                        detail = run_detail(url, settings)
+                    vod_id = extract_twitch_vod_id(entry) or vod_id_from_url(url)
+                    detail = enrichment_cache.get(vod_id)
+                    if detail is not None:
                         if (
                             exclude_live
                             and detail
@@ -799,7 +878,6 @@ def search_vods(
                             if detail_url and not is_real_vod_url(detail_url):
                                 rescued_url = canonical_twitch_vod_url(detail)
                                 if rescued_url:
-                                    detail_url = rescued_url
                                     url = rescued_url
                                 else:
                                     skipped_nonvod += 1
@@ -807,13 +885,11 @@ def search_vods(
                         date_str = entry_date(detail)
                         if date_str:
                             enriched = True
+                            date_metadata_enriched += 1
                             if not entry.get("title") and detail.get("title"):
                                 entry["title"] = detail.get("title")
-                    except Exception as exc:
-                        if log_callback:
-                            log_callback(
-                                f"Could not retrieve the date for {url}: {exc}"
-                            )
+                        else:
+                            date_enrichment_failed += 1
                 if not date_str:
                     unknown_dates += 1
                 matches_date = in_range(
@@ -821,7 +897,9 @@ def search_vods(
                 )
                 if not matches_date:
                     skipped_by_date += 1
-                    if strict_date_filter:
+                    if strict_date_filter or (
+                        not date_str and not include_unknown
+                    ):
                         continue
                 vid = vod_id_from_url(url)
                 kept += 1
@@ -845,6 +923,8 @@ def search_vods(
                     "deduped": len(entries),
                     "kept": kept,
                     "unknown_dates": unknown_dates,
+                    "date_metadata_enriched": date_metadata_enriched,
+                    "date_enrichment_failed": date_enrichment_failed,
                     "skipped_by_date": skipped_by_date,
                     "skipped_live": skipped_live,
                     "skipped_nonvod": skipped_nonvod,

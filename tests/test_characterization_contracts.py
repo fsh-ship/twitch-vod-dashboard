@@ -2390,6 +2390,8 @@ class TwitchContractTests(IsolatedDashboardTestCase):
                 "deduped",
                 "kept",
                 "unknown_dates",
+                "date_metadata_enriched",
+                "date_enrichment_failed",
                 "skipped_by_date",
                 "skipped_live",
                 "skipped_nonvod",

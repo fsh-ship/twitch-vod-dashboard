@@ -1279,7 +1279,7 @@ function renderResults(results, errors, debug) {
   lastResults = results || [];
   rememberSearchResults(lastResults);
   const errHtml = errors && errors.length ? errors.map(e => `<div class="errorbox"><b>${escapeHtml(e.streamer)}</b>: ${escapeHtml(e.error)}</div>`).join('') : '';
-  const dbgHtml = debug && debug.length ? debug.map(d => `${escapeHtml(d.streamer)}: ${d.kept}/${d.deduped || d.found_raw} shown · raw source results: ${d.found_raw} · unknown date: ${d.unknown_dates} · outside date range: ${d.skipped_by_date} · live/upcoming filtered: ${d.skipped_live || 0} · non-VOD filtered: ${d.skipped_nonvod || 0}`).join('<br>') : 'No diagnostic details returned.';
+  const dbgHtml = debug && debug.length ? debug.map(d => `${escapeHtml(d.streamer)}: ${d.kept}/${d.deduped || d.found_raw} shown · raw source results: ${d.found_raw} · date metadata enriched: ${d.date_metadata_enriched || 0} · date enrichment failed: ${d.date_enrichment_failed || 0} · unknown date: ${d.unknown_dates} · outside date range: ${d.skipped_by_date} · live/upcoming filtered: ${d.skipped_live || 0} · non-VOD filtered: ${d.skipped_nonvod || 0}`).join('<br>') : 'No diagnostic details returned.';
   $('searchErrors').innerHTML = errHtml;
   if ($('searchDiagnostics')) $('searchDiagnostics').innerHTML = dbgHtml;
   if ($('searchResultSummary')) $('searchResultSummary').textContent = `${lastResults.length} VOD${lastResults.length === 1 ? '' : 's'} found`;
