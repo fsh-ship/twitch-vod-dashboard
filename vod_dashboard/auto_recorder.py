@@ -86,6 +86,11 @@ def _normalize_stream_id(value: Any) -> str:
     return candidate if _STREAM_ID_RE.fullmatch(candidate) else ""
 
 
+def normalize_auto_recorder_stream_id(value: Any) -> str:
+    """Return a safe persistent session identity, or an empty string."""
+    return _normalize_stream_id(value)
+
+
 def _normalize_attempts(value: Any) -> Optional[int]:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
@@ -506,6 +511,37 @@ class AutoRecorderStateStore:
             session["attempts"] = normalized_attempts
             session["retry_after"] = normalized_retry_after
             session["updated_at"] = _timestamp_from_clock(self._clock)
+            return self._persist_session_locked(state, canonical, session)
+
+    def return_to_pending(
+        self,
+        streamer: Any,
+        stream_id: Any,
+        *,
+        attempts: int,
+        retry_after: Optional[str] = None,
+    ) -> Session:
+        """Release one matching recording reservation without resetting handled."""
+        canonical = _required_streamer(streamer)
+        normalized_stream_id = _required_stream_id(stream_id)
+        normalized_attempts = _required_attempts(attempts)
+        normalized_retry_after = _optional_retry_after(retry_after)
+        with self._lock:
+            state = self._load_locked()
+            existing = state["sessions"].get(canonical)
+            if not existing or existing["stream_id"] != normalized_stream_id:
+                raise AutoRecorderStateValidationError("session_not_found")
+            if existing["disposition"] == "handled":
+                return deepcopy(existing)
+            session = {
+                "stream_id": normalized_stream_id,
+                "disposition": "pending",
+                "reason": None,
+                "attempts": normalized_attempts,
+                "retry_after": normalized_retry_after,
+                "job_id": None,
+                "updated_at": _timestamp_from_clock(self._clock),
+            }
             return self._persist_session_locked(state, canonical, session)
 
     def mark_interrupted_recordings_handled(self) -> int:

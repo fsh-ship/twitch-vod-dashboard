@@ -461,6 +461,20 @@ class AutoRecorderStateTests(unittest.TestCase):
         )
         self.assertEqual(unchanged, handled)
 
+    def test_recording_reservation_can_return_to_pending(self):
+        self.store.set_pending("nika_livetv", "ABC", attempts=1)
+        self.store.set_recording(
+            "nika_livetv", "ABC", job_id="job-1", attempts=2
+        )
+
+        pending = self.store.return_to_pending(
+            "nika_livetv", "ABC", attempts=1
+        )
+
+        self.assertEqual(pending["disposition"], "pending")
+        self.assertEqual(pending["attempts"], 1)
+        self.assertIsNone(pending["job_id"])
+
     def test_restart_reconciliation_changes_only_recording_sessions(self):
         self.store.set_pending("pending_one", "PENDING")
         self.store.set_recording(
