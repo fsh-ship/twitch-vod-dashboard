@@ -19,8 +19,11 @@ from flask import Flask, jsonify, redirect, render_template, request, session, u
 
 from vod_dashboard import dashboard_state
 from vod_dashboard import auto_recorder as dashboard_auto_recorder
+from vod_dashboard import auto_recording as dashboard_auto_recording
+from vod_dashboard import auto_recording_runtime as dashboard_auto_runtime
 from vod_dashboard import local_vods as dashboard_local_vods
 from vod_dashboard import jobs as dashboard_jobs
+from vod_dashboard import live_status as dashboard_live_status
 from vod_dashboard import media as dashboard_media
 from vod_dashboard import runtime as dashboard_runtime
 from vod_dashboard import security as dashboard_security
@@ -110,6 +113,10 @@ JOB_MANAGER = dashboard_jobs.JobManager()
 job_lock = JOB_MANAGER.lock
 jobs = JOB_MANAGER.jobs
 job_counter = JOB_MANAGER.counter
+AUTO_RECORDER_MONITOR_LOCK = threading.Lock()
+AUTO_RECORDER_MONITOR: Optional[
+    dashboard_auto_runtime.AutoRecorderMonitor
+] = None
 log_file_lock = dashboard_runtime.log_file_lock
 LOGIN_THROTTLE = dashboard_security.LoginThrottle()
 login_attempt_lock = LOGIN_THROTTLE.lock
@@ -765,6 +772,96 @@ def _job_manager_for_compatibility() -> dashboard_jobs.JobManager:
     return dashboard_jobs.JobManager.compatible_with(
         JOB_MANAGER, jobs, job_lock, job_counter
     )
+
+
+def create_auto_recorder_monitor() -> dashboard_auto_runtime.AutoRecorderMonitor:
+    """Construct the process-local production monitor without starting it."""
+    stop_event = threading.Event()
+
+    def start_unless_stopping(streamer: str, **kwargs: Any) -> str:
+        if stop_event.is_set():
+            raise RecordingStartError("shutdown_requested", streamer)
+        return start_live_recording(streamer, **kwargs)
+
+    coordinator = dashboard_auto_recording.AutoRecorderCoordinator(
+        settings_provider=load_settings,
+        streamer_provider=lambda settings: read_streamers(dict(settings)),
+        live_status_checker=run_ytdlp_live_status,
+        state_store=dashboard_auto_recorder.AutoRecorderStateStore.from_dashboard_dir(
+            DEFAULT_DASHBOARD_DIR, log=log_line
+        ),
+        recording_starter=start_unless_stopping,
+        recording_jobs_provider=lambda: (
+            _job_manager_for_compatibility().snapshot_jobs()
+        ),
+        should_stop=stop_event.is_set,
+    )
+    return dashboard_auto_runtime.AutoRecorderMonitor(
+        coordinator,
+        stop_event=stop_event,
+        log=log_line,
+    )
+
+
+def start_auto_recorder_monitor() -> dashboard_auto_runtime.AutoRecorderMonitor:
+    """Idempotently start one monitor in the current Gunicorn worker."""
+    global AUTO_RECORDER_MONITOR
+    with AUTO_RECORDER_MONITOR_LOCK:
+        if AUTO_RECORDER_MONITOR is None:
+            AUTO_RECORDER_MONITOR = create_auto_recorder_monitor()
+        AUTO_RECORDER_MONITOR.start()
+        return AUTO_RECORDER_MONITOR
+
+
+def wake_auto_recorder_monitor() -> bool:
+    """Wake the internal monitor for a future settings/UI integration."""
+    with AUTO_RECORDER_MONITOR_LOCK:
+        monitor = AUTO_RECORDER_MONITOR
+    return monitor.wake() if monitor is not None else False
+
+
+def stop_auto_recorder_monitor(timeout: float = 5.0) -> bool:
+    """Idempotently request monitor shutdown and join within a bound."""
+    with AUTO_RECORDER_MONITOR_LOCK:
+        monitor = AUTO_RECORDER_MONITOR
+    return True if monitor is None else monitor.stop(timeout=timeout)
+
+
+def auto_recorder_monitor_snapshot() -> Dict[str, Any]:
+    """Return internal runtime status without exposing a public endpoint."""
+    with AUTO_RECORDER_MONITOR_LOCK:
+        monitor = AUTO_RECORDER_MONITOR
+    if monitor is None:
+        return {
+            "running": False,
+            "enabled": False,
+            "state_healthy": None,
+            "watched_count": 0,
+            "phase": "stopped",
+            "last_check_started_at": None,
+            "last_check_completed_at": None,
+            "next_check_at": None,
+            "last_action": "none",
+            "last_action_streamer": "",
+            "error_count_last_run": 0,
+            "last_error_code": "",
+        }
+    return monitor.snapshot()
+
+
+def shutdown_worker_runtime() -> bool:
+    """Stop automatic starts, then reuse bounded Recording cleanup."""
+    monitor_stopped = stop_auto_recorder_monitor(timeout=5.0)
+    recording_stopped = (
+        _job_manager_for_compatibility().stop_recording_for_shutdown(
+            timeout=50.0
+        )
+    )
+    if not monitor_stopped:
+        log_line("Auto recorder monitor did not stop within its shutdown budget.")
+    if not recording_stopped:
+        log_line("Active recording did not stop within its shutdown budget.")
+    return monitor_stopped and recording_stopped
 
 
 def _set_job_counter(value: int) -> None:
@@ -1559,7 +1656,8 @@ def run_ytdlp_vod_detail(url: str, settings: Dict[str, Any]) -> Dict[str, Any]:
 def run_ytdlp_live_status(
     streamer: str, settings: Dict[str, Any]
 ) -> Dict[str, Any]:
-    return dashboard_twitch.run_ytdlp_live_status(
+    return dashboard_live_status.LIVE_STATUS_LIMITER.run(
+        dashboard_twitch.run_ytdlp_live_status,
         streamer,
         settings,
         command_factory=ytdlp_base_command,

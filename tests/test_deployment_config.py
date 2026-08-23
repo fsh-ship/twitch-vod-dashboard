@@ -211,6 +211,7 @@ class DeploymentConfigTests(unittest.TestCase):
         for source in (
             "requirements.txt",
             "app.py",
+            "gunicorn.conf.py",
             "vod_dashboard",
             "templates",
             "static",
@@ -218,6 +219,30 @@ class DeploymentConfigTests(unittest.TestCase):
             "docker-entrypoint.sh",
         ):
             self.assertIn(f"COPY {source} ", dockerfile)
+
+    def test_auto_recorder_gunicorn_and_compose_shutdown_budgets(self):
+        dockerfile = read_text("Dockerfile")
+        gunicorn = read_text("gunicorn.conf.py")
+        compose = read_text("compose.yml")
+        deployment = read_text("DEPLOYMENT.md")
+
+        self.assertIn(
+            'CMD ["gunicorn", "--config", "gunicorn.conf.py", "app:app"]',
+            dockerfile,
+        )
+        for setting in (
+            'bind = "0.0.0.0:8787"',
+            "workers = 1",
+            "threads = 4",
+            "timeout = 300",
+            "graceful_timeout = 60",
+            "def post_worker_init(worker)",
+            "def worker_exit(server, worker)",
+        ):
+            self.assertIn(setting, gunicorn)
+        self.assertIn("stop_grace_period: 75s", compose)
+        self.assertIn("exactly one worker", deployment)
+        self.assertIn("Native `python app.py`", deployment)
 
     def test_container_bootstrap_drops_root_and_protects_private_files(self):
         dockerfile = read_text("Dockerfile")

@@ -645,6 +645,44 @@ class QueueControlManagerTests(unittest.TestCase):
             )
         )
 
+    def test_worker_shutdown_reuses_recording_stop_and_waits_for_terminal(self):
+        job_id = self.manager.create_recording_job("nika_livetv")
+        claimed = self.manager.claim_recording_job(job_id)
+
+        def finalize(_job_id):
+            self.manager.finalize_recording_job(
+                job_id,
+                claimed["item_id"],
+                state="failed",
+                returncode=-2,
+                completion_reason="stop_incomplete",
+            )
+            return True
+
+        with mock.patch.object(
+            self.manager,
+            "start_recording_termination",
+            side_effect=finalize,
+        ) as terminate:
+            self.assertTrue(
+                self.manager.stop_recording_for_shutdown(timeout=0.1)
+            )
+
+        self.assertTrue(self.manager.jobs[job_id]["stop_requested"])
+        terminate.assert_called_once_with(job_id)
+
+    def test_worker_shutdown_wait_is_bounded(self):
+        job_id = self.manager.create_recording_job("nika_livetv")
+        with mock.patch.object(
+            self.manager,
+            "start_recording_termination",
+            return_value=False,
+        ):
+            self.assertFalse(
+                self.manager.stop_recording_for_shutdown(timeout=0)
+            )
+        self.assertTrue(self.manager.jobs[job_id]["stop_requested"])
+
     def test_recording_termination_thread_is_deduplicated(self):
         job_id = self.manager.create_recording_job("nika_livetv")
         claimed = self.manager.claim_recording_job(job_id)

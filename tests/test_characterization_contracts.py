@@ -3159,7 +3159,12 @@ class PlatformContractTests(IsolatedDashboardTestCase):
             [
                 sys.executable,
                 "-c",
-                "from app import app; print(app.import_name); print(len(app.url_map._rules))",
+                (
+                    "import app as dashboard; "
+                    "print(dashboard.app.import_name); "
+                    "print(len(dashboard.app.url_map._rules)); "
+                    "assert dashboard.AUTO_RECORDER_MONITOR is None"
+                ),
             ],
             cwd=str(Path(dashboard.__file__).resolve().parent),
             env=env,

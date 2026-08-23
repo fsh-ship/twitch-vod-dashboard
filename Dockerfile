@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir "gunicorn>=23,<24"
 
 COPY app.py .
+COPY gunicorn.conf.py .
 COPY vod_dashboard ./vod_dashboard
 COPY templates ./templates
 COPY static ./static
@@ -24,4 +25,4 @@ RUN groupadd --gid 1000 app \
     && chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["gunicorn", "--bind", "0.0.0.0:8787", "--workers", "1", "--threads", "4", "--timeout", "300", "app:app"]
+CMD ["gunicorn", "--config", "gunicorn.conf.py", "app:app"]

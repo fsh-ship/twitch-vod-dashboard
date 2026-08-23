@@ -375,6 +375,54 @@ class AutoRecorderCoordinatorTests(unittest.TestCase):
         self.assertEqual(result["checked_count"], 6)
         self.assertEqual(maximum, 2)
 
+    def test_shutdown_after_status_check_prevents_candidate_start(self):
+        stopping = threading.Event()
+
+        def checker(streamer, settings):
+            del settings
+            stopping.set()
+            return {
+                "state": "live",
+                "streamer": streamer,
+                "stream_id": "ABC",
+            }
+
+        starter = mock.Mock()
+        coordinator = AutoRecorderCoordinator(
+            settings_provider=lambda: self.settings("nika"),
+            streamer_provider=lambda _settings: ["nika"],
+            live_status_checker=checker,
+            state_store=self.store,
+            recording_starter=starter,
+            recording_jobs_provider=lambda: [],
+            should_stop=stopping.is_set,
+        )
+
+        result = coordinator.run_once()
+
+        self.assertEqual(result["action"], "shutdown_requested")
+        starter.assert_not_called()
+        self.assertIsNone(self.store.get_session("nika"))
+
+    def test_shutdown_at_starter_boundary_consumes_no_attempt(self):
+        def shutdown(*_args, **_kwargs):
+            raise RecordingStarterError("shutdown_requested")
+
+        result = self.coordinator(
+            settings=self.settings("nika"),
+            streamers=["nika"],
+            statuses={
+                "nika": {"state": "live", "stream_id": "ABC"}
+            },
+            starter=shutdown,
+        ).run_once()
+
+        session = self.store.get_session("nika")
+        self.assertEqual(result["action"], "shutdown_requested")
+        self.assertEqual(session["disposition"], "pending")
+        self.assertEqual(session["attempts"], 0)
+        self.assertIsNone(session["retry_after"])
+
     def test_reservation_precedes_safe_auto_start_and_job_is_persisted(self):
         observed_reservation = {}
 

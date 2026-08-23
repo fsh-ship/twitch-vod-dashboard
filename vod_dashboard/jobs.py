@@ -1183,6 +1183,38 @@ class JobManager:
             event = self._recording_stop_events.get(str(job_id))
             return bool(event and event.is_set())
 
+    def stop_recording_for_shutdown(self, timeout: float = 50.0) -> bool:
+        """Reuse the recording stop lifecycle and wait within a bounded budget."""
+        with self.lock:
+            active_job_id = next(
+                (
+                    str(job_id)
+                    for job_id, job in self.jobs.items()
+                    if job.get("type") == "recording"
+                    and job.get("state") in {"queued", "running", "stopping"}
+                ),
+                None,
+            )
+        if active_job_id is None:
+            return True
+
+        self.request_recording_stop(active_job_id)
+        self.start_recording_termination(active_job_id)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            while True:
+                job = self.jobs.get(active_job_id)
+                if job is None or job.get("state") not in {
+                    "queued",
+                    "running",
+                    "stopping",
+                }:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+
     def update_recorded_seconds(self, job_id: str, seconds: Any) -> bool:
         try:
             value = float(seconds)

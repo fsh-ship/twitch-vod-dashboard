@@ -89,6 +89,8 @@ Do not add these files to the image or Compose configuration. They are ignored b
 
 Dashboard logging defaults to `/data/dashboard.log`. It rotates to one `/data/dashboard.log.1` backup at approximately 5 MiB, keeping application-file logging bounded. Container stdout/stderr remains available through `docker compose logs`.
 
+Automatic recording runs only in the production Gunicorn deployment. The configuration intentionally uses exactly one worker; multiple Gunicorn workers are unsupported because recording jobs and coordination are process-local. The worker starts one Auto Recorder monitor after initialization and stops it before using the existing graceful Recording shutdown path. Gunicorn allows 60 seconds for graceful worker shutdown, while Compose allows the container 75 seconds. Native `python app.py` development mode does not start the monitor.
+
 ## HTTPS reverse proxy
 
 The base deployment has no proxy labels, external network, certificate resolver, or forwarded-header trust. `compose.traefik.example.yml` is an optional override:

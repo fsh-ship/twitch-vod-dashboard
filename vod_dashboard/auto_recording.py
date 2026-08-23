@@ -23,6 +23,7 @@ RecordingStarter = Callable[..., str]
 RecordingJobsProvider = Callable[[], Iterable[Mapping[str, Any]]]
 ExecutorFactory = Callable[..., Any]
 Clock = Callable[[], datetime]
+StopCallback = Callable[[], bool]
 
 START_FAILURE_COOLDOWNS = {1: 60, 2: 120}
 MAX_START_ATTEMPTS = 3
@@ -93,6 +94,7 @@ class AutoRecorderCoordinator:
         recording_starter: RecordingStarter,
         recording_jobs_provider: Optional[RecordingJobsProvider] = None,
         clock: Optional[Clock] = None,
+        should_stop: Optional[StopCallback] = None,
         executor_factory: ExecutorFactory = ThreadPoolExecutor,
         max_status_workers: int = 2,
     ) -> None:
@@ -103,8 +105,15 @@ class AutoRecorderCoordinator:
         self._recording_starter = recording_starter
         self._recording_jobs_provider = recording_jobs_provider or (lambda: ())
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._should_stop = should_stop or (lambda: False)
         self._executor_factory = executor_factory
         self._max_status_workers = max(1, min(2, int(max_status_workers)))
+
+    def _shutdown_requested(self) -> bool:
+        try:
+            return self._should_stop() is True
+        except Exception:
+            return True
 
     @staticmethod
     def _result(
@@ -465,6 +474,9 @@ class AutoRecorderCoordinator:
         result = self._result(enabled=True, watched_count=len(watched), state_healthy=None)
         if not watched:
             return result
+        if self._shutdown_requested():
+            result["action"] = "shutdown_requested"
+            return result
 
         reconciliation = self.reconcile_recording_jobs(
             suppressible_streamers=watched
@@ -521,6 +533,9 @@ class AutoRecorderCoordinator:
         result["live_count"] = sum(item["status"] == "live" for item in observations.values())
         result["offline_count"] = sum(item["status"] == "offline" for item in observations.values())
         result["error_count"] = sum(item["status"] == "error" for item in observations.values())
+        if self._shutdown_requested():
+            result["action"] = "shutdown_requested"
+            return result
 
         candidates = []
         sessions = dict(persisted.get("sessions") or {})
@@ -609,6 +624,18 @@ class AutoRecorderCoordinator:
         if reservation.get("disposition") != "recording":
             return result
 
+        if self._shutdown_requested():
+            try:
+                self._state_store.return_to_pending(
+                    streamer,
+                    stream_id,
+                    attempts=previous_attempts,
+                )
+            except AutoRecorderStateError as exc:
+                return self._state_error_result(result, exc)
+            result["action"] = "shutdown_requested"
+            return result
+
         try:
             job_id = str(
                 self._recording_starter(
@@ -623,9 +650,15 @@ class AutoRecorderCoordinator:
                 raise RuntimeError("recording starter returned no job id")
         except Exception as exc:
             reason = _safe_reason(getattr(exc, "reason", ""), "recording_start_failed")
-            consumed_attempts = previous_attempts if reason == "recording_conflict" else next_attempt
+            no_attempt_consumed = reason in {
+                "recording_conflict",
+                "shutdown_requested",
+            }
+            consumed_attempts = (
+                previous_attempts if no_attempt_consumed else next_attempt
+            )
             try:
-                if reason == "recording_conflict":
+                if no_attempt_consumed:
                     self._state_store.return_to_pending(
                         streamer, stream_id, attempts=previous_attempts
                     )
@@ -643,7 +676,13 @@ class AutoRecorderCoordinator:
             except AutoRecorderStateError as state_exc:
                 return self._state_error_result(result, state_exc)
             exhausted = consumed_attempts >= MAX_START_ATTEMPTS
-            result["action"] = reason if reason == "recording_conflict" else "retry_exhausted" if exhausted else "start_failed"
+            result["action"] = (
+                reason
+                if no_attempt_consumed
+                else "retry_exhausted"
+                if exhausted
+                else "start_failed"
+            )
             result["reason"] = "retry_exhausted" if exhausted else reason
             result.update(
                 {"streamer": streamer, "stream_id": stream_id, "attempt": consumed_attempts}

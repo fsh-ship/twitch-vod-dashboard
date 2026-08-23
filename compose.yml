@@ -6,6 +6,7 @@ services:
     image: twitch-vod-dashboard:latest
     restart: unless-stopped
     init: true
+    stop_grace_period: 75s
     environment:
       TZ: ${TZ:-UTC}
       HOME: /data
