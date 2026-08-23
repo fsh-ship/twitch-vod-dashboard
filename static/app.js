@@ -563,6 +563,7 @@ function cloneStreamerProfiles(profiles) {
     const normalizedProfile = {};
     if (playlistId) normalizedProfile.youtube_playlist_id = playlistId;
     if (profile?.auto_record === true) normalizedProfile.auto_record = true;
+    if (profile?.auto_vod_download === true) normalizedProfile.auto_vod_download = true;
     if (login && Object.keys(normalizedProfile).length && !normalized[login]) {
       normalized[login] = normalizedProfile;
     }

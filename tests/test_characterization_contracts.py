@@ -59,6 +59,8 @@ def tearDownModule():
 DEFAULT_SETTINGS_KEYS = {
     "archive_file",
     "auto_recorder_enabled",
+    "auto_vod_enabled",
+    "auto_vod_poll_minutes",
     "batch_postprocess_mode",
     "cookie_browser",
     "cookie_file",
@@ -658,6 +660,8 @@ class SettingsContractTests(IsolatedDashboardTestCase):
         self.assertFalse(defaults["youtube_enabled"])
         self.assertFalse(defaults["youtube_auto_upload"])
         self.assertFalse(defaults["auto_recorder_enabled"])
+        self.assertFalse(defaults["auto_vod_enabled"])
+        self.assertEqual(defaults["auto_vod_poll_minutes"], 60)
         self.assertTrue(defaults["move_uploaded_vods"])
         self.assertEqual(defaults["youtube_privacy_status"], "private")
         self.assertEqual(defaults["streamer_profiles"], {})
@@ -769,6 +773,63 @@ class SettingsContractTests(IsolatedDashboardTestCase):
             self.assertNotIn("unexpected_setting", payload)
             self.assertNotIn("VOD_DASHBOARD_SECRET_KEY", payload)
         self.assertEqual(set(persisted), DEFAULT_SETTINGS_KEYS)
+
+    def test_auto_vod_settings_api_is_allowlisted_and_has_no_runtime_side_effect(self):
+        with mock.patch.object(
+            dashboard, "_wake_auto_recorder_after_save"
+        ) as wake, mock.patch.object(
+            dashboard, "create_auto_recorder_monitor"
+        ) as create_monitor, mock.patch.object(
+            dashboard, "run_ytdlp_live_status"
+        ) as twitch_lookup:
+            response = self.client.post(
+                "/api/settings",
+                json={
+                    "auto_vod_enabled": True,
+                    "auto_vod_poll_minutes": 120,
+                },
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertIs(payload["auto_vod_enabled"], True)
+        self.assertEqual(payload["auto_vod_poll_minutes"], 120)
+        self.assertIs(dashboard.load_settings()["auto_vod_enabled"], True)
+        self.assertEqual(dashboard.load_settings()["auto_vod_poll_minutes"], 120)
+        wake.assert_not_called()
+        create_monitor.assert_not_called()
+        twitch_lookup.assert_not_called()
+
+    def test_streamer_api_round_trips_auto_vod_profile_without_waking_auto_recorder(self):
+        with mock.patch.object(
+            dashboard, "_wake_auto_recorder_after_save"
+        ) as wake:
+            response = self.client.post(
+                "/api/streamers",
+                json={
+                    "streamers": ["Nika_LiveTV"],
+                    "streamer_profiles": {
+                        "Nika_LiveTV": {
+                            "youtube_playlist_id": "PLAYLIST_A",
+                            "auto_vod_download": True,
+                        }
+                    },
+                },
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["streamer_profiles"],
+            {
+                "nika_livetv": {
+                    "youtube_playlist_id": "PLAYLIST_A",
+                    "auto_vod_download": True,
+                }
+            },
+        )
+        wake.assert_not_called()
 
     def test_streamer_api_saves_profiles_without_changing_text_format(self):
         dashboard.save_settings({"youtube_playlist_id": "GLOBAL"})

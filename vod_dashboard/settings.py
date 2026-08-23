@@ -46,6 +46,8 @@ def _default_settings(runtime_paths: RuntimePaths) -> Dict[str, Any]:
         "youtube_privacy_status": "private",
         "youtube_playlist_id": "",
         "auto_recorder_enabled": False,
+        "auto_vod_enabled": False,
+        "auto_vod_poll_minutes": 60,
         "streamer_profiles": {},
         "youtube_client_secret_file": str(
             runtime_paths.youtube_client_secret_file
@@ -278,6 +280,16 @@ def normalize_settings(
     }.items():
         settings[key] = to_bool(settings.get(key), default)
 
+    # Auto VOD is intentionally stricter than older legacy boolean settings:
+    # only a JSON boolean true can enable future automation.
+    settings["auto_vod_enabled"] = settings.get("auto_vod_enabled") is True
+    poll_minutes = settings.get("auto_vod_poll_minutes")
+    settings["auto_vod_poll_minutes"] = (
+        poll_minutes
+        if type(poll_minutes) is int and poll_minutes in {60, 120}
+        else 60
+    )
+
     old_base = str(settings.get("base_path") or "").strip()
     if old_base and not settings.get("download_path"):
         settings["download_path"] = old_base
@@ -420,6 +432,8 @@ def normalize_streamer_profiles(value: Any) -> Dict[str, Dict[str, Any]]:
             profile["youtube_playlist_id"] = playlist_id
         if raw_profile.get("auto_record") is True:
             profile["auto_record"] = True
+        if raw_profile.get("auto_vod_download") is True:
+            profile["auto_vod_download"] = True
         if profile and login not in profiles:
             profiles[login] = profile
     return profiles

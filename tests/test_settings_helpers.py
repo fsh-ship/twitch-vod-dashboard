@@ -15,6 +15,8 @@ from vod_dashboard.media import MediaPathPolicy
 DEFAULT_SETTINGS_KEYS = {
     "archive_file",
     "auto_recorder_enabled",
+    "auto_vod_enabled",
+    "auto_vod_poll_minutes",
     "batch_postprocess_mode",
     "cookie_browser",
     "cookie_file",
@@ -120,6 +122,8 @@ class SettingsRepositoryTests(unittest.TestCase):
             "youtube_privacy_status": "private",
             "youtube_playlist_id": "",
             "auto_recorder_enabled": False,
+            "auto_vod_enabled": False,
+            "auto_vod_poll_minutes": 60,
             "streamer_profiles": {},
             "youtube_client_secret_file": str(
                 runtime_paths.youtube_client_secret_file
@@ -143,14 +147,19 @@ class SettingsRepositoryTests(unittest.TestCase):
             "manual_upload_write_metadata_json": True,
         }
         self.assertEqual(set(settings.DEFAULT_SETTINGS), DEFAULT_SETTINGS_KEYS)
-        self.assertEqual(len(settings.DEFAULT_SETTINGS), 41)
+        self.assertEqual(len(settings.DEFAULT_SETTINGS), 43)
         self.assertEqual(settings.DEFAULT_SETTINGS, expected)
 
-    def test_legacy_settings_without_auto_recording_fields_use_defaults(self):
+    def test_legacy_settings_without_automation_fields_use_defaults(self):
         legacy = {
             key: value
             for key, value in self.defaults.items()
-            if key not in {"auto_recorder_enabled", "streamer_profiles"}
+            if key not in {
+                "auto_recorder_enabled",
+                "auto_vod_enabled",
+                "auto_vod_poll_minutes",
+                "streamer_profiles",
+            }
         }
         self.settings_file.write_text(
             json.dumps(legacy), encoding="utf-8"
@@ -159,6 +168,8 @@ class SettingsRepositoryTests(unittest.TestCase):
         loaded = self.repository.load()
 
         self.assertIs(loaded["auto_recorder_enabled"], False)
+        self.assertIs(loaded["auto_vod_enabled"], False)
+        self.assertEqual(loaded["auto_vod_poll_minutes"], 60)
         self.assertEqual(loaded["streamer_profiles"], {})
 
     def test_global_auto_recorder_enabled_round_trips(self):
@@ -170,6 +181,39 @@ class SettingsRepositoryTests(unittest.TestCase):
 
         for payload in (saved, loaded, persisted):
             self.assertIs(payload["auto_recorder_enabled"], True)
+
+    def test_auto_vod_settings_are_strict_and_only_accept_supported_polls(self):
+        cases = (
+            (True, 60, True, 60),
+            (False, 120, False, 120),
+            ("true", 30, False, 60),
+            (1, 90, False, 60),
+            (True, "120", True, 60),
+            (True, True, True, 60),
+        )
+        for enabled, poll, expected_enabled, expected_poll in cases:
+            with self.subTest(enabled=enabled, poll=poll):
+                normalized = self.repository.normalize(
+                    {
+                        **self.defaults,
+                        "auto_vod_enabled": enabled,
+                        "auto_vod_poll_minutes": poll,
+                    }
+                )
+                self.assertIs(normalized["auto_vod_enabled"], expected_enabled)
+                self.assertEqual(normalized["auto_vod_poll_minutes"], expected_poll)
+
+    def test_auto_vod_settings_round_trip_without_affecting_auto_recorder(self):
+        saved = self.repository.save(
+            {
+                "auto_recorder_enabled": True,
+                "auto_vod_enabled": True,
+                "auto_vod_poll_minutes": 120,
+            }
+        )
+        self.assertIs(saved["auto_recorder_enabled"], True)
+        self.assertIs(saved["auto_vod_enabled"], True)
+        self.assertEqual(saved["auto_vod_poll_minutes"], 120)
 
     def test_streamer_profiles_round_trip_without_touching_streamer_file(self):
         streamer_file = self.runtime_dir / "streamer.txt"
@@ -260,6 +304,36 @@ class SettingsRepositoryTests(unittest.TestCase):
 
         for payload in (saved, loaded, persisted):
             self.assertEqual(payload["streamer_profiles"], expected)
+
+    def test_streamer_auto_vod_profile_field_is_strict_and_independent(self):
+        raw_profiles = {
+            "VodOnly": {"auto_vod_download": True},
+            "AllFields": {
+                "youtube_playlist_id": " PL123 ",
+                "auto_record": True,
+                "auto_vod_download": True,
+                "unknown": "discard",
+            },
+            "FalseOnly": {"auto_vod_download": False},
+            "StringTrue": {"auto_vod_download": "true"},
+            "NumericTrue": {"auto_vod_download": 1},
+        }
+        expected = {
+            "vodonly": {"auto_vod_download": True},
+            "allfields": {
+                "youtube_playlist_id": "PL123",
+                "auto_record": True,
+                "auto_vod_download": True,
+            },
+        }
+        saved = self.repository.save({"streamer_profiles": raw_profiles})
+        self.assertEqual(saved["streamer_profiles"], expected)
+        self.assertEqual(
+            settings.normalize_streamer_profiles(
+                {"VodOnly": {"auto_vod_download": False}}
+            ),
+            {},
+        )
 
     def test_removing_one_profile_field_preserves_the_other(self):
         playlist_removed = settings.normalize_streamer_profiles(

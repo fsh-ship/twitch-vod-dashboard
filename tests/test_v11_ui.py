@@ -34,8 +34,9 @@ function escapeHtml(value) {
 }
 eval(source.slice(start, end));
 const profiles = {
-  digitalgirluli: {youtube_playlist_id:'PLAYLIST_A', auto_record:true},
+  digitalgirluli: {youtube_playlist_id:'PLAYLIST_A', auto_record:true, auto_vod_download:true},
   auto_only: {auto_record:true},
+  auto_vod_only: {auto_vod_download:true},
   false_only: {auto_record:false},
   string_true: {auto_record:'true'},
   orphan_streamer: {youtube_playlist_id:'ORPHAN'}
@@ -57,6 +58,13 @@ const playlistChangedAfterAuto = withStreamerPlaylistSelection(
 const autoRemovedAfterPlaylist = withStreamerAutoRecordSelection(
   playlistChangedAfterAuto, 'DigitalGirlUli', false
 );
+const autoEnabledAfterVod = withStreamerAutoRecordSelection(
+  {digitalgirluli:{youtube_playlist_id:'PLAYLIST_A', auto_vod_download:true}},
+  'DigitalGirlUli', true
+);
+const autoRemovedAfterVod = withStreamerAutoRecordSelection(
+  autoEnabledAfterVod, 'DigitalGirlUli', false
+);
 const emptyProfileRemoved = withStreamerAutoRecordSelection(
   {auto_only:{auto_record:true}}, 'auto_only', false
 );
@@ -73,6 +81,8 @@ process.stdout.write(JSON.stringify({
   autoEnabled,
   playlistChangedAfterAuto,
   autoRemovedAfterPlaylist,
+  autoEnabledAfterVod,
+  autoRemovedAfterVod,
   emptyProfileRemoved,
   defaultSingle: buildYoutubeUploadRequest(['one.mp4'], 'streamer-default'),
   defaultMultiple: buildYoutubeUploadRequest(
@@ -1142,7 +1152,11 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn(">Global Default</option>", result["inheritedOptions"])
         self.assertEqual(
             result["clonedProfiles"]["digitalgirluli"],
-            {"youtube_playlist_id": "PLAYLIST_A", "auto_record": True},
+            {
+                "youtube_playlist_id": "PLAYLIST_A",
+                "auto_record": True,
+                "auto_vod_download": True,
+            },
         )
         self.assertEqual(
             result["clonedProfiles"]["auto_only"],
@@ -1151,8 +1165,16 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn("false_only", result["clonedProfiles"])
         self.assertNotIn("string_true", result["clonedProfiles"])
         self.assertEqual(
+            result["clonedProfiles"]["auto_vod_only"],
+            {"auto_vod_download": True},
+        )
+        self.assertEqual(
             result["setOverride"]["digitalgirluli"],
-            {"youtube_playlist_id": "PLAYLIST_B", "auto_record": True},
+            {
+                "youtube_playlist_id": "PLAYLIST_B",
+                "auto_record": True,
+                "auto_vod_download": True,
+            },
         )
         self.assertEqual(
             result["setOverride"]["orphan_streamer"],
@@ -1160,7 +1182,7 @@ class V11UiContractTests(unittest.TestCase):
         )
         self.assertEqual(
             result["removedOverride"]["digitalgirluli"],
-            {"auto_record": True},
+            {"auto_record": True, "auto_vod_download": True},
         )
         self.assertEqual(
             result["removedOverride"]["orphan_streamer"],
@@ -1204,6 +1226,18 @@ class V11UiContractTests(unittest.TestCase):
             {"youtube_playlist_id": "PLAYLIST_B"},
         )
         self.assertEqual(result["emptyProfileRemoved"], {})
+        self.assertEqual(
+            result["autoEnabledAfterVod"]["digitalgirluli"],
+            {
+                "youtube_playlist_id": "PLAYLIST_A",
+                "auto_record": True,
+                "auto_vod_download": True,
+            },
+        )
+        self.assertEqual(
+            result["autoRemovedAfterVod"]["digitalgirluli"],
+            {"youtube_playlist_id": "PLAYLIST_A", "auto_vod_download": True},
+        )
 
     def test_playlist_refresh_failure_preserves_streamer_profile_draft(self) -> None:
         loader = JAVASCRIPT.split(
