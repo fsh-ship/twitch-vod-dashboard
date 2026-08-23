@@ -400,6 +400,7 @@ class JobManager:
         self.job_store = job_store
         self._media_root = Path(media_root) if media_root is not None else None
         self._persistence_revision = 0
+        self._persistence_dirty = False
         self._last_persistence_result_revision = -1
         self._last_progress_persist_at: Dict[str, float] = {}
         self._persistence_health: Dict[str, Any] = {
@@ -414,6 +415,9 @@ class JobManager:
         }
         self._restore_in_progress = False
         self._restore_result: Optional[JobRestoreResult] = None
+        self._worker_started = False
+        self._runtime_shutting_down = False
+        self._download_shutdown_requests: set[tuple[str, str]] = set()
         self._upload_measurements: Dict[tuple[str, int], Dict[str, Any]] = {}
         self._condition = threading.Condition(self.lock)
         self._lane_paused = {"download": False, "youtube_upload": False}
@@ -433,6 +437,45 @@ class JobManager:
         self._recording_termination_started: set[str] = set()
         self._recording_stop_results: Dict[str, str] = {}
         self._recording_termination_done: Dict[str, threading.Event] = {}
+
+    def configure_persistence(
+        self, job_store: Any, *, media_root: Path
+    ) -> bool:
+        """Activate production persistence before any job or worker exists."""
+        if job_store is None:
+            raise ValueError("A production JobStore is required.")
+        resolved_media_root = Path(media_root)
+        with self.lock:
+            if (
+                self.job_store is job_store
+                and self._media_root == resolved_media_root
+            ):
+                return False
+            if self.job_store is not None:
+                raise JobRestoreError("persistence_already_configured")
+            if (
+                self.jobs
+                or self.counter
+                or self._worker_started
+                or self._restore_result is not None
+                or self._restore_in_progress
+            ):
+                raise JobRestoreError("persistence_activation_too_late")
+            self.job_store = job_store
+            self._media_root = resolved_media_root
+            self._persistence_health.update(
+                {
+                    "enabled": True,
+                    "healthy": True,
+                    "last_save_at": None,
+                    "last_successful_revision": None,
+                    "last_error_code": "",
+                    "load_degraded": False,
+                    "load_source": "",
+                    "load_reason": "",
+                }
+            )
+        return True
 
     @classmethod
     def compatible_with(
@@ -499,6 +542,7 @@ class JobManager:
             ):
                 job["finished_at"] = value
         self._persistence_revision += 1
+        self._persistence_dirty = True
 
     def _snapshot_for_persistence_locked(self) -> Optional[Dict[str, Any]]:
         if self.job_store is None:
@@ -548,6 +592,11 @@ class JobManager:
                     self._persistence_health[
                         "last_successful_revision"
                     ] = revision
+                if (
+                    revision is not None
+                    and revision >= self._persistence_revision
+                ):
+                    self._persistence_dirty = False
 
     def _persist_snapshot(
         self,
@@ -616,6 +665,14 @@ class JobManager:
         """Return safe internal persistence health without paths or errors."""
         with self.lock:
             return deepcopy(self._persistence_health)
+
+    def flush_persistence(self) -> bool:
+        """Persist the latest dirty detached snapshot during graceful shutdown."""
+        with self.lock:
+            if self.job_store is None or not self._persistence_dirty:
+                return True
+            snapshot = self._snapshot_for_persistence_locked()
+        return self._persist_best_effort(snapshot, force=True)
 
     def clear_completed_history(self) -> Dict[str, int]:
         """Remove only fully completed jobs and durably save the new history."""
@@ -781,6 +838,8 @@ class JobManager:
         for lane in self._lane_active:
             self._lane_active[lane] = None
         self._cancel_events.clear()
+        self._runtime_shutting_down = False
+        self._download_shutdown_requests.clear()
         self._download_processes.clear()
         self._recording_processes.clear()
         self._recording_stop_events.clear()
@@ -1665,6 +1724,8 @@ class JobManager:
         """Atomically claim the next eligible item for one process-local lane."""
         with self._condition:
             while True:
+                if self._runtime_shutting_down:
+                    return None
                 job = self.jobs.get(job_id)
                 if job is None:
                     return None
@@ -2127,6 +2188,71 @@ class JobManager:
             self._download_processes[key] = process
             event = self._cancel_events.get(key)
             return bool(event and event.is_set())
+
+    def begin_shutdown(self) -> None:
+        """Prevent workers from claiming more queued work in this process."""
+        with self._condition:
+            self._runtime_shutting_down = True
+            self._condition.notify_all()
+
+    def runtime_shutdown_requested(self) -> bool:
+        with self.lock:
+            return self._runtime_shutting_down
+
+    def is_download_shutdown_requested(
+        self, job_id: str, item_id: str
+    ) -> bool:
+        with self.lock:
+            return (str(job_id), str(item_id)) in self._download_shutdown_requests
+
+    def finish_download_shutdown_item(self, job_id: str, item_id: str) -> bool:
+        """Truthfully finalize one worker-terminated download as interrupted."""
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if job is None or job.get("type") == "youtube_upload":
+                return False
+            index = self._item_index_locked(job, item_id)
+            if index is None:
+                return False
+            self._set_item_state_locked(job, index, "interrupted")
+            job["item_completion_reasons"][index] = "worker_shutdown"
+            job["item_recovery_reasons"][index] = "worker_shutdown"
+            job["completion_reason"] = "worker_shutdown"
+            job["recovery_reason"] = "worker_shutdown"
+            if self._lane_active.get("download") == (
+                str(job_id),
+                str(item_id),
+            ):
+                self._lane_active["download"] = None
+            self._download_processes.pop((str(job_id), str(item_id)), None)
+            self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            self._condition.notify_all()
+        self._persist_best_effort(snapshot)
+        return True
+
+    def stop_downloads_for_shutdown(
+        self,
+        *,
+        terminator: Callable[..., None] = terminate_download_process_tree,
+    ) -> bool:
+        """Stop only registered application-owned download process groups."""
+        with self.lock:
+            active = list(self._download_processes.items())
+            self._download_shutdown_requests.update(key for key, _ in active)
+        stopped = True
+        for (job_id, item_id), process in active:
+            try:
+                terminator(process)
+            except Exception:
+                stopped = False
+                continue
+            if process.poll() is None:
+                stopped = False
+            elif self.download_process(job_id, item_id) is not None:
+                self.finish_download_shutdown_item(job_id, item_id)
+        return stopped
 
     def download_process(self, job_id: str, item_id: str) -> Any:
         with self.lock:
@@ -2631,6 +2757,8 @@ class JobManager:
     ) -> threading.Thread:
         """Start one daemon worker for an already-created job."""
         factory = thread_factory or threading.Thread
+        with self.lock:
+            self._worker_started = True
         thread = factory(target=target, args=(job_id,), daemon=True)
         thread.start()
         return thread
@@ -3030,7 +3158,13 @@ def run_download_job(
                 rc = proc.wait()
                 manager.set_returncode(job_id, rc)
 
-                if manager.is_cancel_requested(job_id, item_id):
+                if manager.is_download_shutdown_requested(job_id, item_id):
+                    manager.finish_download_shutdown_item(job_id, item_id)
+                    dependencies.append_log(
+                        job_id,
+                        f"VOD {idx}/{total} download interrupted by worker shutdown. Partial files were retained.",
+                    )
+                elif manager.is_cancel_requested(job_id, item_id):
                     manager.finish_claimed_item(
                         job_id, item_id, "cancelled"
                     )
@@ -3101,6 +3235,8 @@ def run_download_job(
                     known_candidates=item.get("candidates") or [],
                 )
 
+        if manager.runtime_shutdown_requested():
+            return
         final_job = manager.get_job(job_id) or {}
         final_states = final_job.get("item_states") or []
         cancelled = sum(state == "cancelled" for state in final_states)
@@ -3269,6 +3405,8 @@ def run_upload_job(
                     dependencies.append_log(
                         job_id, f"YouTube Upload failed for {Path(raw).name}: {exc}"
                     )
+        if manager.runtime_shutdown_requested():
+            return
         final_job = manager.get_job(job_id) or {}
         cancelled = sum(
             state == "cancelled"

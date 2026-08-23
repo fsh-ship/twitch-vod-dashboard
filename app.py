@@ -24,6 +24,7 @@ from vod_dashboard import auto_recording as dashboard_auto_recording
 from vod_dashboard import auto_recording_runtime as dashboard_auto_runtime
 from vod_dashboard import local_vods as dashboard_local_vods
 from vod_dashboard import jobs as dashboard_jobs
+from vod_dashboard import job_store as dashboard_job_store
 from vod_dashboard import live_status as dashboard_live_status
 from vod_dashboard import media as dashboard_media
 from vod_dashboard import runtime as dashboard_runtime
@@ -118,6 +119,8 @@ AUTO_RECORDER_MONITOR_LOCK = threading.Lock()
 AUTO_RECORDER_MONITOR: Optional[
     dashboard_auto_runtime.AutoRecorderMonitor
 ] = None
+WORKER_RUNTIME_LOCK = threading.RLock()
+WORKER_RUNTIME_RESULT: Optional[Dict[str, Any]] = None
 log_file_lock = dashboard_runtime.log_file_lock
 LOGIN_THROTTLE = dashboard_security.LoginThrottle()
 login_attempt_lock = LOGIN_THROTTLE.lock
@@ -814,6 +817,105 @@ def start_auto_recorder_monitor() -> dashboard_auto_runtime.AutoRecorderMonitor:
         return AUTO_RECORDER_MONITOR
 
 
+def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
+    """Idempotently activate durable production state, then Auto Recorder."""
+    global AUTO_RECORDER_MONITOR, WORKER_RUNTIME_RESULT
+    try:
+        supported_worker_count = int(worker_count) == 1
+    except (TypeError, ValueError, OverflowError):
+        supported_worker_count = False
+    if not supported_worker_count:
+        return {
+            "initialized": False,
+            "usable": False,
+            "degraded": True,
+            "reason": "unsupported_worker_count",
+        }
+
+    with WORKER_RUNTIME_LOCK:
+        if WORKER_RUNTIME_RESULT is not None:
+            return dict(WORKER_RUNTIME_RESULT)
+
+        manager = JOB_MANAGER
+        store_construction_failed = False
+        try:
+            store = dashboard_job_store.JobStore.from_dashboard_dir(
+                DEFAULT_DASHBOARD_DIR
+            )
+        except Exception:
+            store = dashboard_job_store.UnavailableJobStore()
+            store_construction_failed = True
+
+        try:
+            manager.configure_persistence(store, media_root=MEDIA_ROOT)
+            restore = manager.restore_from_store()
+        except Exception as exc:
+            reason = (
+                exc.code
+                if isinstance(exc, dashboard_jobs.JobRestoreError)
+                else "runtime_initialization_failed"
+            )
+            WORKER_RUNTIME_RESULT = {
+                "initialized": False,
+                "usable": False,
+                "degraded": True,
+                "reason": reason,
+            }
+            app.logger.error(
+                "Worker runtime initialization failed (%s).", reason
+            )
+            return dict(WORKER_RUNTIME_RESULT)
+
+        monitor_started = False
+        monitor_reason = ""
+        try:
+            with AUTO_RECORDER_MONITOR_LOCK:
+                if AUTO_RECORDER_MONITOR is None:
+                    AUTO_RECORDER_MONITOR = create_auto_recorder_monitor()
+                monitor = AUTO_RECORDER_MONITOR
+            monitor.prepare_after_restart()
+            monitor.start()
+            monitor_started = True
+        except Exception:
+            monitor_reason = "monitor_start_failed"
+            app.logger.error(
+                "Auto recorder monitor startup failed (monitor_start_failed)."
+            )
+
+        degraded = bool(
+            store_construction_failed or restore.degraded or monitor_reason
+        )
+        reason = (
+            "store_unavailable"
+            if store_construction_failed
+            else monitor_reason or restore.reason
+        )
+        WORKER_RUNTIME_RESULT = {
+            "initialized": True,
+            "usable": True,
+            "degraded": degraded,
+            "reason": reason,
+            "loaded_count": restore.loaded_count,
+            "discarded_count": restore.discarded_count,
+            "reconciled_job_count": restore.reconciled_job_count,
+            "reconciled_item_count": restore.reconciled_item_count,
+            "source": restore.source,
+            "monitor_started": monitor_started,
+        }
+        app.logger.info(
+            "Worker runtime initialized: loaded=%d discarded=%d "
+            "reconciled_jobs=%d reconciled_items=%d degraded=%s source=%s reason=%s.",
+            restore.loaded_count,
+            restore.discarded_count,
+            restore.reconciled_job_count,
+            restore.reconciled_item_count,
+            degraded,
+            restore.source,
+            reason or "none",
+        )
+        return dict(WORKER_RUNTIME_RESULT)
+
+
 def wake_auto_recorder_monitor() -> bool:
     """Wake the internal monitor after relevant persisted settings change."""
     with AUTO_RECORDER_MONITOR_LOCK:
@@ -952,18 +1054,40 @@ def auto_recorder_monitor_snapshot() -> Dict[str, Any]:
 
 
 def shutdown_worker_runtime() -> bool:
-    """Stop automatic starts, then reuse bounded Recording cleanup."""
+    """Stop new work, clean up owned processes, then flush durable state."""
     monitor_stopped = stop_auto_recorder_monitor(timeout=5.0)
-    recording_stopped = (
-        _job_manager_for_compatibility().stop_recording_for_shutdown(
-            timeout=50.0
-        )
+    manager = _job_manager_for_compatibility()
+    manager.begin_shutdown()
+    download_result = {"stopped": True}
+
+    def stop_downloads() -> None:
+        download_result["stopped"] = manager.stop_downloads_for_shutdown()
+
+    cleanup_deadline = time.monotonic() + 50.0
+    download_thread = threading.Thread(target=stop_downloads, daemon=True)
+    download_thread.start()
+    recording_stopped = manager.stop_recording_for_shutdown(timeout=50.0)
+    download_thread.join(
+        timeout=max(0.0, cleanup_deadline - time.monotonic())
     )
+    downloads_stopped = (
+        not download_thread.is_alive() and download_result["stopped"]
+    )
+    persistence_flushed = manager.flush_persistence()
     if not monitor_stopped:
         log_line("Auto recorder monitor did not stop within its shutdown budget.")
+    if not downloads_stopped:
+        log_line("Active download did not stop within its shutdown budget.")
     if not recording_stopped:
         log_line("Active recording did not stop within its shutdown budget.")
-    return monitor_stopped and recording_stopped
+    if not persistence_flushed:
+        log_line("Final job history persistence checkpoint failed.")
+    return (
+        monitor_stopped
+        and downloads_stopped
+        and recording_stopped
+        and persistence_flushed
+    )
 
 
 def _set_job_counter(value: int) -> None:
@@ -1137,6 +1261,10 @@ def start_live_recording(
     except dashboard_jobs.RecordingConflictError as exc:
         raise RecordingStartError(
             "recording_conflict", canonical_login
+        ) from exc
+    except dashboard_jobs.JobPersistenceRequiredError as exc:
+        raise RecordingStartError(
+            exc.code, canonical_login
         ) from exc
     except Exception as exc:
         log_line(f"Recording job creation failed for {canonical_login}.")
@@ -1477,6 +1605,8 @@ def api_youtube_upload_local():
             job_id = create_upload_job(paths)
         else:
             job_id = create_upload_job(paths, playlist_id=playlist_id)
+    except dashboard_jobs.JobPersistenceRequiredError as exc:
+        return jsonify({"error": str(exc), "reason": exc.code}), 409
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"job_id": job_id})
@@ -1914,6 +2044,8 @@ def api_start_live_recording():
             "streamer_not_configured": 404,
             "streamer_not_live": 409,
             "recording_conflict": 409,
+            "persistence_unavailable": 409,
+            "persistence_validation_failed": 409,
             "live_status_unavailable": 502,
             "recording_start_failed": 500,
         }
@@ -2001,7 +2133,10 @@ def api_download():
     if selection.error is not None:
         return jsonify(selection.error), 400
 
-    job_id = create_job(selection.urls, selection.label)
+    try:
+        job_id = create_job(selection.urls, selection.label)
+    except dashboard_jobs.JobPersistenceRequiredError as exc:
+        return jsonify({"error": str(exc), "reason": exc.code}), 409
     return jsonify({"ok": True, "job_id": job_id, "urls": selection.urls, "url_count": len(selection.urls), "label": selection.label})
 
 

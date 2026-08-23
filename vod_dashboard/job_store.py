@@ -1096,3 +1096,26 @@ class JobStore:
                 "last_error_code": self._last_error_code,
                 "last_written_revision": self._last_written_revision,
             }
+
+
+class UnavailableJobStore:
+    """Fail-closed store used when production durability cannot be established."""
+
+    def load(self) -> JobStoreLoadResult:
+        raise JobStorePersistenceError("Job history storage is unavailable.")
+
+    def save(self, *args: Any, **kwargs: Any) -> JobStoreSaveResult:
+        del args, kwargs
+        raise JobStorePersistenceError("Job history storage is unavailable.")
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "healthy": False,
+            "degraded": True,
+            "source": "empty",
+            "reason": "store_unavailable",
+            "discarded_job_count": 0,
+            "last_save_at": None,
+            "last_error_code": "persistence_unavailable",
+            "last_written_revision": -1,
+        }

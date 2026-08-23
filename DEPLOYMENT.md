@@ -33,7 +33,7 @@ Fresh installations do not enable browser-cookie extraction. Docker does not ins
 
 | Host path | Container path | Purpose |
 | --- | --- | --- |
-| `./data` | `/data` | Dashboard settings, streamer/archive lists, OAuth files, and bounded log files |
+| `./data` | `/data` | Dashboard settings, streamer/archive lists, durable `jobs.json` history, OAuth files, and bounded log files |
 | `./downloads` | `/downloads` | The administrator-controlled media root and downloaded VODs |
 
 The directory mounts bootstrap cleanly; no pre-existing personal settings file is required. The application creates settings and list files as needed. The container starts as root only long enough to prepare mount ownership and private-file modes, then runs Gunicorn as `PUID`/`PGID` (both default to `1000`). Set those IDs to the owner of existing host data when necessary. The entrypoint does not recursively change ownership of the media library.
@@ -89,7 +89,11 @@ Do not add these files to the image or Compose configuration. They are ignored b
 
 Dashboard logging defaults to `/data/dashboard.log`. It rotates to one `/data/dashboard.log.1` backup at approximately 5 MiB, keeping application-file logging bounded. Container stdout/stderr remains available through `docker compose logs`.
 
-Automatic recording runs only in the production Gunicorn deployment. The configuration intentionally uses exactly one worker; multiple Gunicorn workers are unsupported because recording jobs and coordination are process-local. The worker starts one Auto Recorder monitor after initialization and stops it before using the existing graceful Recording shutdown path. Gunicorn allows 60 seconds for graceful worker shutdown, while Compose allows the container 75 seconds. Native `python app.py` development mode does not start the monitor.
+Automatic recording and durable Queue history run only in the production Gunicorn deployment. The configuration intentionally uses exactly one worker; startup aborts if a different worker count is configured so multiple managers cannot write the same history. The worker restores `/data/jobs.json`, reconciles stale process-owned states, prepares Auto Recorder restart state, and only then starts one monitor. No download, upload, or recording is automatically resumed.
+
+Completed and interrupted Queue history survives container recreation through the existing `./data:/data` bind mount. A missing `jobs.json` is a healthy first start and does not create an empty file. Malformed history is preserved for operator recovery, the dashboard remains available with degraded persistence status, and new external job side effects fail closed until durable storage works again. Running uploads interrupted by restart are marked as having an unknown remote outcome and require review before Retry.
+
+On graceful worker exit the monitor is stopped first, registered application-owned yt-dlp/ffmpeg process groups and live recordings use their bounded shutdown paths, and dirty job history receives a final persistence checkpoint. In-process YouTube uploads are not killed asynchronously; if one cannot finish before process exit, startup reconciliation remains authoritative. Gunicorn allows 60 seconds for graceful worker shutdown, while Compose allows the container 75 seconds. Native `python app.py` remains development-oriented: it starts neither the monitor nor production JobStore persistence.
 
 ## HTTPS reverse proxy
 

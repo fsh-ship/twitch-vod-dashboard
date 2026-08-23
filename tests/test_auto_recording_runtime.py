@@ -414,15 +414,23 @@ class GunicornLifecycleHookTests(unittest.TestCase):
 
     def test_post_worker_init_starts_once_and_rejects_multiple_workers(self):
         worker = self.worker()
-        with mock.patch.object(dashboard, "start_auto_recorder_monitor") as start:
+        with mock.patch.object(
+            dashboard,
+            "initialize_worker_runtime",
+            return_value={"usable": True},
+        ) as initialize:
             self.config["post_worker_init"](worker)
-        start.assert_called_once_with()
+        initialize.assert_called_once_with(worker_count=1)
 
         unsupported = self.worker(count=2)
-        with mock.patch.object(dashboard, "start_auto_recorder_monitor") as start:
+        with mock.patch.object(
+            dashboard, "initialize_worker_runtime"
+        ) as initialize, self.assertRaisesRegex(
+            RuntimeError, "unsupported_worker_count"
+        ):
             self.config["post_worker_init"](unsupported)
-        start.assert_not_called()
-        unsupported.log.error.assert_called_once()
+        initialize.assert_not_called()
+        unsupported.log.critical.assert_called_once()
 
     def test_worker_exit_invokes_bounded_runtime_shutdown(self):
         with mock.patch.object(dashboard, "shutdown_worker_runtime") as shutdown:
@@ -450,8 +458,15 @@ class GunicornLifecycleHookTests(unittest.TestCase):
     def test_worker_shutdown_orders_monitor_before_recording_cleanup(self):
         calls = []
         manager = mock.Mock()
+        manager.begin_shutdown.side_effect = lambda: calls.append(("begin",))
+        manager.stop_downloads_for_shutdown.side_effect = (
+            lambda: calls.append(("download",)) or True
+        )
         manager.stop_recording_for_shutdown.side_effect = (
             lambda timeout: calls.append(("recording", timeout)) or True
+        )
+        manager.flush_persistence.side_effect = (
+            lambda: calls.append(("flush",)) or True
         )
         with mock.patch.object(
             dashboard,
@@ -463,7 +478,12 @@ class GunicornLifecycleHookTests(unittest.TestCase):
             return_value=manager,
         ):
             self.assertTrue(dashboard.shutdown_worker_runtime())
-        self.assertEqual(calls, [("monitor", 5.0), ("recording", 50.0)])
+        self.assertEqual(calls[0], ("monitor", 5.0))
+        self.assertLess(calls.index(("begin",)), calls.index(("flush",)))
+        self.assertLess(calls.index(("download",)), calls.index(("flush",)))
+        self.assertLess(
+            calls.index(("recording", 50.0)), calls.index(("flush",))
+        )
 
 
 if __name__ == "__main__":

@@ -96,6 +96,8 @@ class AutoRecorderMonitor:
         self._lifecycle_lock = threading.RLock()
         self._status_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._prepared = False
+        self._prepare_result: Dict[str, Any] = {}
         self._status: Dict[str, Any] = {
             "running": False,
             "enabled": False,
@@ -141,14 +143,21 @@ class AutoRecorderMonitor:
 
     def start(self) -> bool:
         with self._lifecycle_lock:
+            if not self._prepared:
+                self.prepare_after_restart()
             if self._thread is not None and self._thread.is_alive():
                 return False
             self._stop_event.clear()
             self._wake_event.clear()
             now = _utc_now(self._clock)
+            phase = (
+                "degraded"
+                if self.snapshot().get("state_healthy") is False
+                else "starting"
+            )
             self._update_status(
                 running=True,
-                phase="starting",
+                phase=phase,
                 next_check_at=_utc_timestamp(
                     now + timedelta(seconds=self._startup_delay_seconds)
                 ),
@@ -172,6 +181,33 @@ class AutoRecorderMonitor:
                 )
                 raise
             return True
+
+    def prepare_after_restart(self) -> Dict[str, Any]:
+        """Run restart preparation synchronously and at most once."""
+        with self._lifecycle_lock:
+            if self._prepared:
+                return deepcopy(self._prepare_result)
+            self._prepared = True
+            try:
+                raw_result = self._coordinator.prepare_after_restart()
+                result = dict(raw_result) if isinstance(raw_result, Mapping) else {}
+                if result.get("state_healthy") is False:
+                    self._update_status(
+                        phase="degraded",
+                        state_healthy=False,
+                        last_action=_safe_action(result.get("action")),
+                        last_error_code=_safe_code(
+                            result.get("reason"), "state_unhealthy"
+                        ),
+                    )
+            except Exception as exc:
+                self._record_unexpected_error(exc)
+                result = {
+                    "state_healthy": False,
+                    "reason": "unexpected_iteration_error",
+                }
+            self._prepare_result = result
+            return deepcopy(result)
 
     def wake(self) -> bool:
         with self._lifecycle_lock:
@@ -253,21 +289,6 @@ class AutoRecorderMonitor:
 
     def _run(self) -> None:
         try:
-            try:
-                prepared = self._coordinator.prepare_after_restart()
-                if isinstance(prepared, Mapping):
-                    if prepared.get("state_healthy") is False:
-                        self._update_status(
-                            phase="degraded",
-                            state_healthy=False,
-                            last_action=_safe_action(prepared.get("action")),
-                            last_error_code=_safe_code(
-                                prepared.get("reason"), "state_unhealthy"
-                            ),
-                        )
-            except Exception as exc:
-                self._record_unexpected_error(exc)
-
             if self._wait(self._startup_delay_seconds):
                 return
 

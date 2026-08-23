@@ -255,6 +255,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("chmod 0600", entrypoint)
         self.assertIn("chmod 0700 /data", entrypoint)
         self.assertIn("youtube-token.json", entrypoint)
+        self.assertIn("jobs.json", entrypoint)
         self.assertIn("twitch-cookies.txt", entrypoint)
         self.assertIn("*.sh text eol=lf", attributes)
         self.assertIn(".env", dockerignore)

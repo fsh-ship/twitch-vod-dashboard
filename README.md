@@ -194,6 +194,7 @@ The dashboard-data directory contains small, important state:
 - `archive.txt`: yt-dlp download archive entries
 - `client_secret.json`: Google OAuth client credentials, when supplied
 - `youtube-token.json`: Google authorized-user token, when connected
+- `jobs.json`: bounded, allowlisted Queue history used by production Gunicorn restart recovery
 - `dashboard.log` and `dashboard.log.1`: bounded application logs
 - an optional Twitch cookie file
 
@@ -216,7 +217,8 @@ The media root contains VOD files, yt-dlp `.info.json` metadata, upload markers,
 - **Open Folder**, **Show in Folder**, and file-selection integration use Windows APIs. These actions are not currently implemented for native Linux or Docker browsers.
 - Docker YouTube authorization requires a one-time host/native browser bootstrap.
 - The native entry point is loopback-only and uses Flask's development server.
-- Job state and login throttling are process-local; jobs do not survive a restart.
+- Production Gunicorn persists Queue history, but active work is never automatically resumed after a restart. Native `python app.py` keeps development-only process-local job state.
+- A running YouTube upload interrupted by restart has an uncertain remote outcome and must be reviewed before Retry.
 - Docker host UID/GID mapping assumes a Linux-style host filesystem. Review `PUID` and `PGID` when using mounted existing data.
 
 ## Development and testing

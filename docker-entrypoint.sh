@@ -39,6 +39,7 @@ for private_file in \
     /data/twitch-cookies.txt \
     /data/client_secret.json \
     /data/youtube-token.json \
+    /data/jobs.json \
     /data/dashboard.log \
     /data/dashboard.log.1
 do

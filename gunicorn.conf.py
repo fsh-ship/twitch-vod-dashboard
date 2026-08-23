@@ -16,13 +16,19 @@ def _single_worker(worker) -> bool:
 
 def post_worker_init(worker) -> None:
     if not _single_worker(worker):
-        worker.log.error(
-            "Auto Recorder requires exactly one Gunicorn worker; monitor disabled."
+        worker.log.critical(
+            "Persistent dashboard runtime requires exactly one Gunicorn worker."
         )
-        return
+        raise RuntimeError("unsupported_worker_count")
     import app as dashboard
 
-    dashboard.start_auto_recorder_monitor()
+    result = dashboard.initialize_worker_runtime(worker_count=worker.cfg.workers)
+    if not result.get("usable"):
+        reason = str(result.get("reason") or "runtime_initialization_failed")
+        worker.log.critical(
+            "Persistent dashboard runtime initialization failed (%s).", reason
+        )
+        raise RuntimeError(reason)
 
 
 def worker_exit(server, worker) -> None:
