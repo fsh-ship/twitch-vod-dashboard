@@ -45,6 +45,7 @@ def _default_settings(runtime_paths: RuntimePaths) -> Dict[str, Any]:
         "batch_postprocess_mode": "after_each",
         "youtube_privacy_status": "private",
         "youtube_playlist_id": "",
+        "auto_recorder_enabled": False,
         "streamer_profiles": {},
         "youtube_client_secret_file": str(
             runtime_paths.youtube_client_secret_file
@@ -268,6 +269,7 @@ def normalize_settings(
         "enrich_vod_dates": True,
         "youtube_enabled": False,
         "youtube_auto_upload": False,
+        "auto_recorder_enabled": False,
         "manual_upload_prepare_enabled": True,
         "manual_upload_rename_video": True,
         "manual_upload_write_description": True,
@@ -399,28 +401,33 @@ def canonical_streamer_login(value: Any) -> str:
     return names[0].lower() if names else ""
 
 
-def normalize_streamer_profiles(value: Any) -> Dict[str, Dict[str, str]]:
+def normalize_streamer_profiles(value: Any) -> Dict[str, Dict[str, Any]]:
     """Normalize the allowlisted per-streamer settings mapping."""
     if not isinstance(value, Mapping):
         return {}
 
-    profiles: Dict[str, Dict[str, str]] = {}
+    profiles: Dict[str, Dict[str, Any]] = {}
     for raw_login, raw_profile in value.items():
         login = canonical_streamer_login(raw_login)
         if not login or not isinstance(raw_profile, Mapping):
             continue
 
+        profile: Dict[str, Any] = {}
         playlist_id = str(
             raw_profile.get("youtube_playlist_id") or ""
         ).strip()
-        if playlist_id and login not in profiles:
-            profiles[login] = {"youtube_playlist_id": playlist_id}
+        if playlist_id:
+            profile["youtube_playlist_id"] = playlist_id
+        if raw_profile.get("auto_record") is True:
+            profile["auto_record"] = True
+        if profile and login not in profiles:
+            profiles[login] = profile
     return profiles
 
 
 def streamer_profile_for(
     settings: Mapping[str, Any], streamer_login: Any
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     """Look up a normalized profile without exposing mutable settings state."""
     login = canonical_streamer_login(streamer_login)
     if not login:

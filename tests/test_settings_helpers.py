@@ -14,6 +14,7 @@ from vod_dashboard.media import MediaPathPolicy
 
 DEFAULT_SETTINGS_KEYS = {
     "archive_file",
+    "auto_recorder_enabled",
     "batch_postprocess_mode",
     "cookie_browser",
     "cookie_file",
@@ -118,6 +119,7 @@ class SettingsRepositoryTests(unittest.TestCase):
             "batch_postprocess_mode": "after_each",
             "youtube_privacy_status": "private",
             "youtube_playlist_id": "",
+            "auto_recorder_enabled": False,
             "streamer_profiles": {},
             "youtube_client_secret_file": str(
                 runtime_paths.youtube_client_secret_file
@@ -141,14 +143,14 @@ class SettingsRepositoryTests(unittest.TestCase):
             "manual_upload_write_metadata_json": True,
         }
         self.assertEqual(set(settings.DEFAULT_SETTINGS), DEFAULT_SETTINGS_KEYS)
-        self.assertEqual(len(settings.DEFAULT_SETTINGS), 40)
+        self.assertEqual(len(settings.DEFAULT_SETTINGS), 41)
         self.assertEqual(settings.DEFAULT_SETTINGS, expected)
 
-    def test_legacy_settings_without_streamer_profiles_use_empty_default(self):
+    def test_legacy_settings_without_auto_recording_fields_use_defaults(self):
         legacy = {
             key: value
             for key, value in self.defaults.items()
-            if key != "streamer_profiles"
+            if key not in {"auto_recorder_enabled", "streamer_profiles"}
         }
         self.settings_file.write_text(
             json.dumps(legacy), encoding="utf-8"
@@ -156,7 +158,18 @@ class SettingsRepositoryTests(unittest.TestCase):
 
         loaded = self.repository.load()
 
+        self.assertIs(loaded["auto_recorder_enabled"], False)
         self.assertEqual(loaded["streamer_profiles"], {})
+
+    def test_global_auto_recorder_enabled_round_trips(self):
+        saved = self.repository.save({"auto_recorder_enabled": True})
+        loaded = self.repository.load()
+        persisted = json.loads(
+            self.settings_file.read_text(encoding="utf-8")
+        )
+
+        for payload in (saved, loaded, persisted):
+            self.assertIs(payload["auto_recorder_enabled"], True)
 
     def test_streamer_profiles_round_trip_without_touching_streamer_file(self):
         streamer_file = self.runtime_dir / "streamer.txt"
@@ -183,7 +196,10 @@ class SettingsRepositoryTests(unittest.TestCase):
     def test_streamer_profile_keys_and_lookup_are_case_insensitive(self):
         normalized = settings.normalize_streamer_profiles(
             {
-                "XeRaX_TTV": {"youtube_playlist_id": " PL123 "},
+                "XeRaX_TTV": {
+                    "youtube_playlist_id": " PL123 ",
+                    "auto_record": True,
+                },
                 "xerax_ttv": {"youtube_playlist_id": "PL999"},
                 "@XERAX_TTV": {"youtube_playlist_id": "   "},
                 "@SECOND_ONE": {"youtube_playlist_id": "PL456"},
@@ -193,7 +209,10 @@ class SettingsRepositoryTests(unittest.TestCase):
         self.assertEqual(
             normalized,
             {
-                "xerax_ttv": {"youtube_playlist_id": "PL123"},
+                "xerax_ttv": {
+                    "youtube_playlist_id": "PL123",
+                    "auto_record": True,
+                },
                 "second_one": {"youtube_playlist_id": "PL456"},
             },
         )
@@ -202,8 +221,72 @@ class SettingsRepositoryTests(unittest.TestCase):
             with self.subTest(login=login):
                 self.assertEqual(
                     settings.streamer_profile_for(profile_settings, login),
-                    {"youtube_playlist_id": "PL123"},
+                    {
+                        "youtube_playlist_id": "PL123",
+                        "auto_record": True,
+                    },
                 )
+
+    def test_streamer_auto_record_round_trip_and_allowlist(self):
+        raw_profiles = {
+            "AutoOnly": {"auto_record": True},
+            "Combined": {
+                "youtube_playlist_id": " PL123 ",
+                "auto_record": True,
+                "future_field": "drop me",
+            },
+            "PlaylistOnly": {
+                "youtube_playlist_id": "PL456",
+                "auto_record": False,
+            },
+            "FalseOnly": {"auto_record": False},
+            "StringTrue": {"auto_record": "true"},
+            "NumericTrue": {"auto_record": 1},
+        }
+        expected = {
+            "autoonly": {"auto_record": True},
+            "combined": {
+                "youtube_playlist_id": "PL123",
+                "auto_record": True,
+            },
+            "playlistonly": {"youtube_playlist_id": "PL456"},
+        }
+
+        saved = self.repository.save({"streamer_profiles": raw_profiles})
+        loaded = self.repository.load()
+        persisted = json.loads(
+            self.settings_file.read_text(encoding="utf-8")
+        )
+
+        for payload in (saved, loaded, persisted):
+            self.assertEqual(payload["streamer_profiles"], expected)
+
+    def test_removing_one_profile_field_preserves_the_other(self):
+        playlist_removed = settings.normalize_streamer_profiles(
+            {
+                "Nika_LiveTV": {
+                    "youtube_playlist_id": "",
+                    "auto_record": True,
+                }
+            }
+        )
+        auto_record_removed = settings.normalize_streamer_profiles(
+            {
+                "Nika_LiveTV": {
+                    "youtube_playlist_id": "PL123",
+                    "auto_record": False,
+                }
+            }
+        )
+
+        self.assertEqual(
+            playlist_removed,
+            {"nika_livetv": {"auto_record": True}},
+        )
+        self.assertEqual(
+            auto_record_removed,
+            {"nika_livetv": {"youtube_playlist_id": "PL123"}},
+        )
 
     def test_streamer_profiles_drop_empty_invalid_and_unknown_values(self):
         raw_profiles = {

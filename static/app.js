@@ -544,8 +544,11 @@ function cloneStreamerProfiles(profiles) {
   Object.entries(profiles || {}).forEach(([rawLogin, profile]) => {
     const login = canonicalStreamerLoginClient(rawLogin);
     const playlistId = String(profile?.youtube_playlist_id || '').trim();
-    if (login && playlistId && !normalized[login]) {
-      normalized[login] = { youtube_playlist_id: playlistId };
+    const normalizedProfile = {};
+    if (playlistId) normalizedProfile.youtube_playlist_id = playlistId;
+    if (profile?.auto_record === true) normalizedProfile.auto_record = true;
+    if (login && Object.keys(normalizedProfile).length && !normalized[login]) {
+      normalized[login] = normalizedProfile;
     }
   });
   return normalized;
@@ -562,7 +565,10 @@ function withStreamerPlaylistSelection(profiles, streamer, playlistId) {
   const login = canonicalStreamerLoginClient(streamer);
   if (!login) return updated;
   const selected = String(playlistId || '').trim();
-  if (selected) updated[login] = { youtube_playlist_id: selected };
+  const profile = { ...(updated[login] || {}) };
+  if (selected) profile.youtube_playlist_id = selected;
+  else delete profile.youtube_playlist_id;
+  if (Object.keys(profile).length) updated[login] = profile;
   else delete updated[login];
   return updated;
 }

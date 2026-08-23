@@ -34,16 +34,21 @@ function escapeHtml(value) {
 }
 eval(source.slice(start, end));
 const profiles = {
-  digitalgirluli: {youtube_playlist_id:'PLAYLIST_A'},
+  digitalgirluli: {youtube_playlist_id:'PLAYLIST_A', auto_record:true},
+  auto_only: {auto_record:true},
+  false_only: {auto_record:false},
+  string_true: {auto_record:'true'},
   orphan_streamer: {youtube_playlist_id:'ORPHAN'}
 };
+const clonedProfiles = cloneStreamerProfiles(profiles);
 const setOverride = withStreamerPlaylistSelection(
-  profiles, 'Nika_LiveTV', 'PLAYLIST_B'
+  profiles, 'DigitalGirlUli', 'PLAYLIST_B'
 );
 const removedOverride = withStreamerPlaylistSelection(
   profiles, '@DigitalGirlUli', ''
 );
 process.stdout.write(JSON.stringify({
+  clonedProfiles,
   configured: streamerProfilePlaylistId(profiles, 'DigitalGirlUli'),
   inherited: streamerProfilePlaylistId(profiles, 'NoOverride'),
   configuredOptions: playlistOptionsHtml('PLAYLIST_A', 'Global Default'),
@@ -1022,18 +1027,36 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn('value="PLAYLIST_A" selected', result["configuredOptions"])
         self.assertIn(">Global Default</option>", result["inheritedOptions"])
         self.assertEqual(
-            result["setOverride"]["nika_livetv"],
-            {"youtube_playlist_id": "PLAYLIST_B"},
+            result["clonedProfiles"]["digitalgirluli"],
+            {"youtube_playlist_id": "PLAYLIST_A", "auto_record": True},
+        )
+        self.assertEqual(
+            result["clonedProfiles"]["auto_only"],
+            {"auto_record": True},
+        )
+        self.assertNotIn("false_only", result["clonedProfiles"])
+        self.assertNotIn("string_true", result["clonedProfiles"])
+        self.assertEqual(
+            result["setOverride"]["digitalgirluli"],
+            {"youtube_playlist_id": "PLAYLIST_B", "auto_record": True},
         )
         self.assertEqual(
             result["setOverride"]["orphan_streamer"],
             {"youtube_playlist_id": "ORPHAN"},
         )
-        self.assertNotIn("digitalgirluli", result["removedOverride"])
+        self.assertEqual(
+            result["removedOverride"]["digitalgirluli"],
+            {"auto_record": True},
+        )
         self.assertEqual(
             result["removedOverride"]["orphan_streamer"],
             {"youtube_playlist_id": "ORPHAN"},
         )
+
+    def test_auto_record_profile_state_has_no_visible_p4b_control(self) -> None:
+        self.assertNotIn('id="autoRecorderEnabled"', TEMPLATE)
+        self.assertNotIn('class="streamer-auto-record', TEMPLATE)
+        self.assertNotIn("Auto Recording", TEMPLATE)
 
     def test_playlist_refresh_failure_preserves_streamer_profile_draft(self) -> None:
         loader = JAVASCRIPT.split(

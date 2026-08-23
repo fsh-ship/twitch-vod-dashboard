@@ -53,6 +53,7 @@ def tearDownModule():
 
 DEFAULT_SETTINGS_KEYS = {
     "archive_file",
+    "auto_recorder_enabled",
     "batch_postprocess_mode",
     "cookie_browser",
     "cookie_file",
@@ -621,6 +622,7 @@ class SettingsContractTests(IsolatedDashboardTestCase):
         self.assertEqual(defaults["merge_format"], "mp4")
         self.assertFalse(defaults["youtube_enabled"])
         self.assertFalse(defaults["youtube_auto_upload"])
+        self.assertFalse(defaults["auto_recorder_enabled"])
         self.assertTrue(defaults["move_uploaded_vods"])
         self.assertEqual(defaults["youtube_privacy_status"], "private")
         self.assertEqual(defaults["streamer_profiles"], {})
@@ -741,7 +743,8 @@ class SettingsContractTests(IsolatedDashboardTestCase):
                 "streamers": "DigitalGirlUli\nnika_livetv\n",
                 "streamer_profiles": {
                     "DigitalGirlUli": {
-                        "youtube_playlist_id": " PLAYLIST_A "
+                        "youtube_playlist_id": " PLAYLIST_A ",
+                        "auto_record": True,
                     }
                 },
             },
@@ -753,7 +756,8 @@ class SettingsContractTests(IsolatedDashboardTestCase):
             response.get_json()["streamer_profiles"],
             {
                 "digitalgirluli": {
-                    "youtube_playlist_id": "PLAYLIST_A"
+                    "youtube_playlist_id": "PLAYLIST_A",
+                    "auto_record": True,
                 }
             },
         )
@@ -765,7 +769,8 @@ class SettingsContractTests(IsolatedDashboardTestCase):
             dashboard.load_settings()["streamer_profiles"],
             {
                 "digitalgirluli": {
-                    "youtube_playlist_id": "PLAYLIST_A"
+                    "youtube_playlist_id": "PLAYLIST_A",
+                    "auto_record": True,
                 }
             },
         )
@@ -783,7 +788,8 @@ class SettingsContractTests(IsolatedDashboardTestCase):
             dashboard.load_settings()["streamer_profiles"],
             {
                 "digitalgirluli": {
-                    "youtube_playlist_id": "PLAYLIST_A"
+                    "youtube_playlist_id": "PLAYLIST_A",
+                    "auto_record": True,
                 }
             },
         )
