@@ -271,6 +271,8 @@ let liveStreamStatuses = new Map();
 let liveStatusRequests = new Map();
 let liveStatusRefreshPromise = null;
 let liveStatusInitialRefreshStarted = false;
+let liveOfflineExpanded = false;
+let liveStatusLastUpdatedAt = null;
 let liveRecordingJobs = [];
 let liveRecordingActions = new Map();
 
@@ -660,8 +662,10 @@ function activeRecordingJob(jobs=liveRecordingJobs) {
 function recordingStatusText(job) {
   if (!job) return '';
   if (job.state === 'queued') return 'Recording is starting…';
-  if (job.state === 'running') return `Recording running · ${formatRecordingDuration(job.recorded_seconds)}`;
+  if (job.state === 'running') return `Recording ${formatRecordingDuration(job.recorded_seconds)}`;
   if (job.state === 'stopping') return 'Recording is stopping…';
+  if (job.state === 'completed' && job.completion_reason === 'natural_end' && job.output_complete) return 'Stream ended · recording saved';
+  if (job.state === 'completed' && job.completion_reason === 'stopped_by_user' && job.output_complete) return 'Recording saved';
   if (job.state === 'completed' && job.completion_reason === 'natural_end') return 'Stream ended · recording completed';
   if (job.state === 'completed' && job.completion_reason === 'stopped_by_user') return 'Recording stopped';
   if (job.state === 'failed' && job.completion_reason === 'stop_incomplete') return 'Recording could not be saved completely';
@@ -679,10 +683,52 @@ function liveStatusText(status) {
 }
 
 function liveStatusClass(status, recordingJob) {
+  if (recordingJob?.state === 'failed') return 'error';
   if (recordingJob && ACTIVE_RECORDING_STATES.has(recordingJob.state)) return 'recording';
   if (status?.state === 'live') return 'live';
   if (status?.state === 'error') return 'error';
   return status?.state === 'checking' ? 'checking' : 'offline';
+}
+
+function liveCardStatusLabel(status, job, action) {
+  if (action?.phase === 'starting' || job?.state === 'queued') return 'LIVE · STARTING';
+  if (action?.phase === 'stopping' || job?.state === 'stopping') return 'LIVE · STOPPING';
+  if (job?.state === 'running') return 'LIVE · RECORDING';
+  if (job?.state === 'failed') return 'RECORDING ERROR';
+  if (job?.state === 'completed') return 'RECORDING COMPLETE';
+  return liveStatusText(status);
+}
+
+function liveStreamerIsFeatured(streamer) {
+  const login = canonicalStreamerLoginClient(streamer);
+  const status = liveStreamStatuses.get(login) || {state:'unknown'};
+  const job = recordingJobForStreamer(login);
+  return status.state !== 'offline' || !!job;
+}
+
+function liveStreamerDisplayPriority(streamer) {
+  const login = canonicalStreamerLoginClient(streamer);
+  const status = liveStreamStatuses.get(login) || {state:'unknown'};
+  const job = recordingJobForStreamer(login);
+  if (job && ACTIVE_RECORDING_STATES.has(job.state)) return 0;
+  if (status.state === 'live') return 1;
+  if (job?.state === 'failed') return 2;
+  if (job?.state === 'completed') return 3;
+  if (status.state === 'error') return 4;
+  if (status.state === 'checking') return 5;
+  return 6;
+}
+
+function liveStreamSummaryText(featured, offline) {
+  const liveCount = featured.filter(streamer => {
+    const login = canonicalStreamerLoginClient(streamer);
+    return liveStreamStatuses.get(login)?.state === 'live';
+  }).length;
+  const recordingCount = featured.filter(streamer => {
+    const job = recordingJobForStreamer(streamer);
+    return !!job && ACTIVE_RECORDING_STATES.has(job.state);
+  }).length;
+  return `${liveCount} Live · ${recordingCount} Recording · ${offline.length} Offline`;
 }
 
 function renderLiveStreamCard(streamer) {
@@ -694,18 +740,11 @@ function renderLiveStreamCard(streamer) {
   const activeHere = !!job && ACTIVE_RECORDING_STATES.has(job.state);
   const terminalHere = !!job && (job.state === 'completed' || job.state === 'failed');
   const stateClass = liveStatusClass(status, job);
-  const statusLabel = action?.phase === 'starting'
-    ? 'Recording is starting…'
-    : action?.phase === 'stopping'
-      ? 'Recording is stopping…'
-      : (activeHere || (terminalHere && status.state !== 'live'))
-        ? recordingStatusText(job)
-        : liveStatusText(status);
+  const statusLabel = liveCardStatusLabel(status, job, action);
   const title = status.state === 'live'
     ? String(status.title || job?.title || '').trim()
-    : (activeHere ? String(job?.title || '').trim() : '');
+    : ((activeHere || terminalHere) ? String(job?.title || '').trim() : '');
   const started = status.state === 'live' ? formatLiveStartedAt(status.started_at) : '';
-  const saved = !!job?.output_complete && (job.state === 'completed' || job.state === 'failed');
   const canStart = status.state === 'live' && !activeJob && (!action || action.phase === 'error');
   const startDisabledReason = status.state === 'live' && activeJob && !activeHere
     ? 'Another recording is already active.'
@@ -718,37 +757,76 @@ function renderLiveStreamCard(streamer) {
   }
   const secondary = [
     title ? `<span class="live-stream-title">${escapeHtml(title)}</span>` : '',
-    started && !activeHere ? `<span class="live-stream-time">Live since ${escapeHtml(started)}</span>` : '',
-    terminalHere && status.state === 'live' ? `<span class="live-recording-note muted">${escapeHtml(recordingStatusText(job))}</span>` : '',
-    saved ? '<span class="live-recording-saved">Recording saved</span>' : '',
+    started ? `<span class="live-stream-time">Live since ${escapeHtml(started)}</span>` : '',
+    (activeHere || terminalHere) ? `<span class="live-recording-status">${escapeHtml(recordingStatusText(job))}</span>` : '',
     action?.message ? `<span class="live-recording-message bad">${escapeHtml(action.message)}</span>` : '',
     startDisabledReason ? `<span class="live-recording-note muted">${escapeHtml(startDisabledReason)}</span>` : ''
   ].filter(Boolean).join('');
   return `<article class="live-stream-card is-${stateClass}" data-live-streamer="${escapeHtml(login)}">
     <div class="live-stream-indicator" aria-hidden="true"></div>
     <div class="live-stream-copy">
-      <strong>${escapeHtml(streamer)}</strong>
       <span class="live-stream-state">${escapeHtml(statusLabel)}</span>
+      <strong class="live-stream-name">${escapeHtml(streamer)}</strong>
       ${secondary}
     </div>
     <div class="live-stream-actions">${actionHtml}</div>
   </article>`;
 }
 
+function renderOfflineStreamer(streamer) {
+  const login = canonicalStreamerLoginClient(streamer);
+  return `<div class="offline-stream-item" data-live-streamer="${escapeHtml(login)}">
+    <span class="offline-stream-indicator" aria-hidden="true"></span>
+    <strong>${escapeHtml(streamer)}</strong>
+    <span>Offline</span>
+  </div>`;
+}
+
+function toggleOfflineStreamers() {
+  liveOfflineExpanded = !liveOfflineExpanded;
+  renderLiveStreams();
+}
+
 function renderLiveStreams() {
   const box = $('liveStreamsList');
   if (!box) return;
+  const summary = $('liveStreamsSummary');
   if (!liveStreamers.length) {
+    if (summary) summary.textContent = '0 Live · 0 Recording · 0 Offline';
     box.innerHTML = '<div class="live-stream-empty muted">No streamers are configured. Add streamers in Settings.</div>';
     return;
   }
-  box.innerHTML = liveStreamers.map(streamer => renderLiveStreamCard(streamer)).join('');
+  const indexed = liveStreamers.map((streamer, index) => ({streamer, index}));
+  const featured = indexed
+    .filter(item => liveStreamerIsFeatured(item.streamer))
+    .sort((left, right) => (
+      liveStreamerDisplayPriority(left.streamer) - liveStreamerDisplayPriority(right.streamer)
+      || left.index - right.index
+    ))
+    .map(item => item.streamer);
+  const offline = indexed
+    .filter(item => !liveStreamerIsFeatured(item.streamer))
+    .map(item => item.streamer);
+  if (summary) summary.textContent = liveStreamSummaryText(featured, offline);
+  const liveContent = featured.length
+    ? `<div class="live-stream-grid${featured.length === 1 ? ' is-single' : ''}">${featured.map(streamer => renderLiveStreamCard(streamer)).join('')}</div>`
+    : '<div class="live-stream-empty muted">No configured streamer is currently live.</div>';
+  const offlineContent = offline.length
+    ? `<section class="offline-streams">
+        <button type="button" class="offline-streams-toggle" aria-expanded="${liveOfflineExpanded ? 'true' : 'false'}" aria-controls="offlineStreamersList" aria-label="${liveOfflineExpanded ? 'Hide' : 'Show'} ${offline.length} offline streamers">
+          <span>Offline Streamers · ${offline.length}</span><span>${liveOfflineExpanded ? 'Hide' : 'Show'}</span>
+        </button>
+        <div id="offlineStreamersList" class="offline-stream-grid"${liveOfflineExpanded ? '' : ' hidden'}>${offline.map(streamer => renderOfflineStreamer(streamer)).join('')}</div>
+      </section>`
+    : '';
+  box.innerHTML = liveContent + offlineContent;
   box.querySelectorAll('.live-recording-start').forEach(button => button.addEventListener('click', () => {
     startLiveRecording(button.dataset.streamer).catch(() => {});
   }));
   box.querySelectorAll('.live-recording-stop').forEach(button => button.addEventListener('click', () => {
     stopLiveRecording(button.dataset.jobId, button.dataset.streamer).catch(() => {});
   }));
+  box.querySelector('.offline-streams-toggle')?.addEventListener('click', toggleOfflineStreamers);
 }
 
 function syncLiveStreamers(streamers) {
@@ -812,14 +890,17 @@ async function refreshLiveStatuses() {
   const button = $('refreshLiveStatuses');
   const message = $('liveStreamsRefreshStatus');
   if (button) button.disabled = true;
-  if (message) message.textContent = liveStreamers.length ? 'Live status is being refreshed…' : 'No configured streamers to check.';
   const queue = [...liveStreamers];
+  let completed = 0;
+  if (message) message.textContent = queue.length ? `Updating ${completed} / ${queue.length}` : 'No configured streamers to check.';
   liveStatusRefreshPromise = (async () => {
     let index = 0;
     const worker = async () => {
       while (index < queue.length) {
         const streamer = queue[index++];
         await requestLiveStatus(streamer);
+        completed += 1;
+        if (message) message.textContent = `Updating ${completed} / ${queue.length}`;
       }
     };
     const workerCount = Math.min(LIVE_STATUS_CONCURRENCY, queue.length);
@@ -830,7 +911,12 @@ async function refreshLiveStatuses() {
   } finally {
     liveStatusRefreshPromise = null;
     if (button) button.disabled = false;
-    if (message) message.textContent = liveStreamers.length ? 'Live status updated.' : 'No configured streamers to check.';
+    if (queue.length) {
+      liveStatusLastUpdatedAt = new Date();
+      if (message) message.textContent = `Updated ${formatLiveStartedAt(liveStatusLastUpdatedAt)}`;
+    } else if (message) {
+      message.textContent = 'No configured streamers to check.';
+    }
   }
 }
 
@@ -1842,7 +1928,6 @@ async function refreshDashboard() {
     if (state && state.settings && state.settings.youtube_enabled && !yt.connected) alerts.push('<article class="action-alert warn-alert"><div><strong>YouTube is not connected</strong><span>Connect YouTube before starting an upload.</span></div><button type="button" class="goto-page" data-page="settings" data-settings-target="youtube">Open YouTube Settings</button></article>');
     if (disk.ok && disk.free_gb < 50) alerts.push(`<article class="action-alert warn-alert"><div><strong>Storage is running low</strong><span>${escapeHtml(disk.free_gb)} GB is available for VOD downloads.</span></div><button type="button" class="goto-page" data-page="settings" data-settings-target="advanced">Review Settings</button></article>`);
     $('dashboardAlerts').innerHTML = alerts.join('');
-    $('dashboardIdle').classList.toggle('hidden', hasActivity);
     document.querySelectorAll('#page-dashboard .goto-page').forEach(btn => btn.onclick = () => {
       showPage(btn.dataset.page);
       if (btn.dataset.settingsTarget) showSettingsTab(btn.dataset.settingsTarget);

@@ -318,10 +318,17 @@ let liveStreamStatuses = new Map();
 let liveStatusRequests = new Map();
 let liveStatusRefreshPromise = null;
 let liveStatusInitialRefreshStarted = false;
+let liveOfflineExpanded = false;
+let liveStatusLastUpdatedAt = null;
 let liveRecordingJobs = [];
 let liveRecordingActions = new Map();
 const elements = {
-  liveStreamsList: {innerHTML:'', querySelectorAll:() => []},
+  liveStreamsList: {
+    innerHTML:'',
+    querySelectorAll:() => [],
+    querySelector:() => null
+  },
+  liveStreamsSummary: {textContent:''},
   liveStreamsRefreshStatus: {textContent:''},
   refreshLiveStatuses: {disabled:false}
 };
@@ -351,7 +358,7 @@ function showToast() {}
 eval(source.slice(start, end));
 
 (async () => {
-  syncLiveStreamers(['Nika_LiveTV', 'DigitalGirlUli']);
+  syncLiveStreamers(['Nika_LiveTV', 'DigitalGirlUli', 'Bearykchen', 'Xerax_TTV']);
   const configuredHtml = elements.liveStreamsList.innerHTML;
 
   liveStreamStatuses.set('nika_livetv', {
@@ -361,7 +368,7 @@ eval(source.slice(start, end));
   liveRecordingJobs = [];
   const liveHtml = renderLiveStreamCard('Nika_LiveTV');
   liveStreamStatuses.set('nika_livetv', {state:'offline', streamer:'nika_livetv'});
-  const offlineHtml = renderLiveStreamCard('Nika_LiveTV');
+  const offlineHtml = renderOfflineStreamer('Nika_LiveTV');
   liveStreamStatuses.set('nika_livetv', {state:'error', streamer:'nika_livetv'});
   const errorHtml = renderLiveStreamCard('Nika_LiveTV');
 
@@ -369,12 +376,48 @@ eval(source.slice(start, end));
     queued: recordingStatusText({state:'queued'}),
     running: recordingStatusText({state:'running', recorded_seconds:5077}),
     stopping: recordingStatusText({state:'stopping'}),
-    natural: recordingStatusText({state:'completed', completion_reason:'natural_end'}),
-    stopped: recordingStatusText({state:'completed', completion_reason:'stopped_by_user'}),
+    natural: recordingStatusText({state:'completed', completion_reason:'natural_end', output_complete:true}),
+    stopped: recordingStatusText({state:'completed', completion_reason:'stopped_by_user', output_complete:true}),
     processError: recordingStatusText({state:'failed', completion_reason:'process_error'}),
     incomplete: recordingStatusText({state:'failed', completion_reason:'stop_incomplete'}),
     stopFailed: recordingStatusText({state:'failed', completion_reason:'stop_failed'})
   };
+
+  liveStreamStatuses = new Map([
+    ['nika_livetv', {state:'live', streamer:'nika_livetv', title:'Recording stream', started_at:'2026-08-23T20:14:00Z'}],
+    ['digitalgirluli', {state:'live', streamer:'digitalgirluli', title:'Second live stream', started_at:'2026-08-23T20:20:00Z'}],
+    ['bearykchen', {state:'offline', streamer:'bearykchen'}],
+    ['xerax_ttv', {state:'offline', streamer:'xerax_ttv'}]
+  ]);
+  liveRecordingJobs = [{
+    id:'recording-7', type:'recording', streamer:'nika_livetv', state:'running',
+    recorded_seconds:5077, title:'Recording title'
+  }];
+  renderLiveStreams();
+  const hierarchyHtml = elements.liveStreamsList.innerHTML;
+  const summaryText = elements.liveStreamsSummary.textContent;
+  const collapsedHtml = elements.liveStreamsList.innerHTML;
+  toggleOfflineStreamers();
+  const expandedHtml = elements.liveStreamsList.innerHTML;
+  toggleOfflineStreamers();
+  const recollapsedHtml = elements.liveStreamsList.innerHTML;
+
+  liveStreamStatuses.set('nika_livetv', {state:'live', streamer:'nika_livetv'});
+  liveRecordingJobs = [{
+    id:'recording-complete', type:'recording', streamer:'nika_livetv',
+    state:'completed', completion_reason:'stopped_by_user', output_complete:true
+  }];
+  const stoppedSavedHtml = renderLiveStreamCard('Nika_LiveTV');
+  liveRecordingJobs = [{
+    id:'recording-natural', type:'recording', streamer:'nika_livetv',
+    state:'completed', completion_reason:'natural_end', output_complete:true
+  }];
+  const naturalSavedHtml = renderLiveStreamCard('Nika_LiveTV');
+  liveRecordingJobs = [{
+    id:'recording-failed', type:'recording', streamer:'nika_livetv',
+    state:'failed', completion_reason:'stop_incomplete', output_complete:false
+  }];
+  const failedRecordingHtml = renderLiveStreamCard('Nika_LiveTV');
 
   liveStreamStatuses.set('nika_livetv', {state:'error', streamer:'nika_livetv'});
   liveRecordingJobs = [{
@@ -387,17 +430,34 @@ eval(source.slice(start, end));
   });
   const otherStreamerHtml = renderLiveStreamCard('DigitalGirlUli');
 
+  liveStreamers = ['Nika_LiveTV', 'DigitalGirlUli'];
+  liveRecordingJobs = [];
+  liveStreamStatuses = new Map([
+    ['nika_livetv', {state:'offline', streamer:'nika_livetv'}],
+    ['digitalgirluli', {state:'offline', streamer:'digitalgirluli'}]
+  ]);
+  liveOfflineExpanded = false;
+  renderLiveStreams();
+  const noLiveHtml = elements.liveStreamsList.innerHTML;
+
   calls = [];
   liveRecordingJobs = [];
   liveRecordingActions = new Map();
   liveStreamers = ['Nika_LiveTV', 'DigitalGirlUli'];
   liveStreamStatuses = new Map();
-  apiHandler = async path => ({
+  const refreshResolvers = [];
+  apiHandler = path => new Promise(resolve => refreshResolvers.push(() => resolve({
     streamer:path.includes('nika_livetv') ? 'nika_livetv' : 'digitalgirluli',
     state:path.includes('nika_livetv') ? 'live' : 'offline',
     title:'Refreshed title'
-  });
-  await refreshLiveStatuses();
+  })));
+  const refreshPromise = refreshLiveStatuses();
+  await Promise.resolve();
+  const updatingMessage = elements.liveStreamsRefreshStatus.textContent;
+  const updatingDisabled = elements.refreshLiveStatuses.disabled;
+  refreshResolvers.forEach(resolve => resolve());
+  await refreshPromise;
+  const refreshedDisabled = elements.refreshLiveStatuses.disabled;
   const refreshCalls = calls.filter(call => call.path.startsWith('/api/live/status'));
 
   calls = [];
@@ -433,9 +493,13 @@ eval(source.slice(start, end));
     configuredHtml, liveHtml, offlineHtml, errorHtml, statuses,
     duration:formatRecordingDuration(5077),
     invalidDuration:formatRecordingDuration('invalid'),
-    recordingOverridesErrorHtml, otherStreamerHtml,
+    hierarchyHtml, summaryText, collapsedHtml, expandedHtml, recollapsedHtml,
+    stoppedSavedHtml, naturalSavedHtml, failedRecordingHtml,
+    recordingOverridesErrorHtml,
+    otherStreamerHtml, noLiveHtml,
     refreshPaths:refreshCalls.map(call => call.path),
     duplicateCount:duplicateCalls.length,
+    updatingMessage, updatingDisabled, refreshedDisabled,
     refreshMessage:elements.liveStreamsRefreshStatus.textContent,
     startPath:startCall.path,
     startBody:JSON.parse(startCall.options.body),
@@ -486,6 +550,21 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("Status could not be loaded", result["errorHtml"])
         self.assertNotIn("yt-dlp", result["errorHtml"])
 
+    def test_live_summary_priority_grid_and_empty_state(self) -> None:
+        result = _evaluate_live_stream_ui()
+
+        self.assertEqual(result["summaryText"], "2 Live · 1 Recording · 2 Offline")
+        self.assertIn('class="live-stream-grid"', result["hierarchyHtml"])
+        self.assertLess(
+            result["hierarchyHtml"].index('data-live-streamer="nika_livetv"'),
+            result["hierarchyHtml"].index("Offline Streamers · 2"),
+        )
+        self.assertIn("LIVE · RECORDING", result["hierarchyHtml"])
+        self.assertIn("Recording 01:24:37", result["hierarchyHtml"])
+        self.assertIn("Stop Recording", result["hierarchyHtml"])
+        self.assertIn("No configured streamer is currently live.", result["noLiveHtml"])
+        self.assertIn("Offline Streamers · 2", result["noLiveHtml"])
+
     def test_live_status_refresh_is_bounded_deduplicated_and_manual(self) -> None:
         result = _evaluate_live_stream_ui()
 
@@ -497,7 +576,10 @@ class V11UiContractTests(unittest.TestCase):
             ],
         )
         self.assertEqual(result["duplicateCount"], 1)
-        self.assertEqual(result["refreshMessage"], "Live status updated.")
+        self.assertEqual(result["updatingMessage"], "Updating 0 / 2")
+        self.assertTrue(result["updatingDisabled"])
+        self.assertFalse(result["refreshedDisabled"])
+        self.assertRegex(result["refreshMessage"], r"^Updated \d{2}:\d{2}$")
         self.assertIn("const LIVE_STATUS_CONCURRENCY = 2", JAVASCRIPT)
         self.assertEqual(JAVASCRIPT.count("setInterval(() => pollJobs()"), 1)
         self.assertNotIn("setInterval(() => refreshLiveStatuses", JAVASCRIPT)
@@ -509,15 +591,24 @@ class V11UiContractTests(unittest.TestCase):
         self.assertEqual(result["duration"], "01:24:37")
         self.assertEqual(result["invalidDuration"], "00:00:00")
         self.assertEqual(statuses["queued"], "Recording is starting…")
-        self.assertEqual(statuses["running"], "Recording running · 01:24:37")
+        self.assertEqual(statuses["running"], "Recording 01:24:37")
         self.assertEqual(statuses["stopping"], "Recording is stopping…")
-        self.assertEqual(statuses["natural"], "Stream ended · recording completed")
-        self.assertEqual(statuses["stopped"], "Recording stopped")
+        self.assertEqual(statuses["natural"], "Stream ended · recording saved")
+        self.assertEqual(statuses["stopped"], "Recording saved")
         self.assertEqual(statuses["processError"], "Recording failed")
         self.assertEqual(statuses["incomplete"], "Recording could not be saved completely")
         self.assertEqual(statuses["stopFailed"], "Recording could not be stopped cleanly")
-        self.assertIn("Recording running", result["recordingOverridesErrorHtml"])
+        self.assertIn("LIVE · RECORDING", result["recordingOverridesErrorHtml"])
+        self.assertIn("Recording 01:24:37", result["recordingOverridesErrorHtml"])
         self.assertIn('data-job-id="recording-7"', result["recordingOverridesErrorHtml"])
+        self.assertEqual(result["stoppedSavedHtml"].count("Recording saved"), 1)
+        self.assertEqual(
+            result["naturalSavedHtml"].count("Stream ended · recording saved"), 1
+        )
+        self.assertIn('class="live-stream-card is-error"', result["failedRecordingHtml"])
+        self.assertIn(
+            "Recording could not be saved completely", result["failedRecordingHtml"]
+        )
         self.assertIn("if (job?.type === 'recording') return;", JAVASCRIPT)
 
         queue_items = _classify_download_jobs(
@@ -554,8 +645,29 @@ class V11UiContractTests(unittest.TestCase):
     def test_live_streams_mobile_and_accessibility_contract(self) -> None:
         self.assertIn('role="status" aria-live="polite"', TEMPLATE)
         self.assertIn('id="liveStreamsList" class="live-stream-list" aria-live="polite"', TEMPLATE)
-        self.assertIn(".live-stream-card { grid-template-columns:12px minmax(0,1fr);", STYLESHEET)
+        self.assertIn('id="liveStreamsSummary" class="live-stream-summary" aria-live="polite"', TEMPLATE)
+        self.assertIn('class="offline-streams-toggle" aria-expanded=', JAVASCRIPT)
+        self.assertIn('aria-controls="offlineStreamersList"', JAVASCRIPT)
+        self.assertIn(".live-stream-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr));", STYLESHEET)
+        self.assertIn(".live-stream-grid, .live-stream-grid.is-single { grid-template-columns:1fr; }", STYLESHEET)
         self.assertIn(".live-stream-actions button { width:100%; min-height:44px; }", STYLESHEET)
+        self.assertIn(".offline-stream-grid { grid-template-columns:1fr; }", STYLESHEET)
+        self.assertIn("html, body { max-width:100%; overflow-x:hidden; }", STYLESHEET)
+
+    def test_offline_disclosure_is_compact_collapsed_and_toggleable(self) -> None:
+        result = _evaluate_live_stream_ui()
+
+        self.assertIn('aria-expanded="false"', result["collapsedHtml"])
+        self.assertIn('aria-label="Show 2 offline streamers"', result["collapsedHtml"])
+        self.assertIn('class="offline-stream-grid" hidden', result["collapsedHtml"])
+        self.assertIn('aria-expanded="true"', result["expandedHtml"])
+        self.assertIn('aria-label="Hide 2 offline streamers"', result["expandedHtml"])
+        self.assertIn('class="offline-stream-grid"', result["expandedHtml"])
+        self.assertNotIn('class="offline-stream-grid" hidden', result["expandedHtml"])
+        self.assertIn('aria-expanded="false"', result["recollapsedHtml"])
+        self.assertIn('class="offline-stream-item"', result["expandedHtml"])
+        self.assertNotIn("Start Recording", result["expandedHtml"].split("Offline Streamers", 1)[1])
+        self.assertIn(".offline-stream-grid[hidden] { display:none; }", STYLESHEET)
 
     def test_primary_navigation_is_task_oriented(self) -> None:
         buttons = re.findall(
@@ -571,6 +683,8 @@ class V11UiContractTests(unittest.TestCase):
                 ("settings", "Settings"),
             ],
         )
+        self.assertNotIn("Ready for another VOD?", TEMPLATE)
+        self.assertNotIn('id="dashboardIdle"', TEMPLATE)
 
     def test_settings_sections_replace_old_primary_pages(self) -> None:
         self.assertEqual(

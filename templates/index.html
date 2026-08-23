@@ -43,9 +43,12 @@
           <section class="card live-streams-section" id="liveStreamsSection">
             <div class="section-heading">
               <div><p class="eyebrow">Manual recorder</p><h2>Live Streams</h2><p class="muted">Check configured Twitch channels and start one recording at a time.</p></div>
-              <button type="button" class="quiet-button" id="refreshLiveStatuses">Refresh Status</button>
+              <div class="live-refresh-controls">
+                <button type="button" class="quiet-button" id="refreshLiveStatuses">Refresh Status</button>
+                <div id="liveStreamsRefreshStatus" class="live-refresh-status muted" role="status" aria-live="polite">Not updated yet.</div>
+              </div>
             </div>
-            <div id="liveStreamsRefreshStatus" class="field-message muted" role="status" aria-live="polite"></div>
+            <div id="liveStreamsSummary" class="live-stream-summary" aria-live="polite">0 Live · 0 Recording · 0 Offline</div>
             <div id="liveStreamsList" class="live-stream-list" aria-live="polite">
               <div class="live-stream-empty muted">Configured streamers have not been loaded yet.</div>
             </div>
@@ -57,10 +60,6 @@
           <section class="card" id="dashboardUpcomingSection">
             <div class="section-heading"><div><p class="eyebrow">Waiting</p><h2>Up Next</h2></div></div>
             <div id="dashboardUpcoming" class="activity-list muted">Nothing is waiting.</div>
-          </section>
-          <section class="card dashboard-idle" id="dashboardIdle">
-            <div><h2>Ready for another VOD?</h2><p>Search Twitch by date and streamer, or paste a VOD link.</p></div>
-            <button type="button" class="primary goto-page" data-page="search">Search VODs</button>
           </section>
         </section>
 
