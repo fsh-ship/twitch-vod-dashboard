@@ -121,10 +121,6 @@
         </section>
 
         <section class="page" id="page-queue">
-          <section id="queueErrorsSection" class="card queue-section queue-error-section hidden">
-            <div class="section-heading"><div><p class="eyebrow">Action required</p><h2>Errors</h2></div><span id="queueFailed" class="section-count">0</span></div>
-            <div id="queueErrors" class="queue-vod-list"></div>
-          </section>
           <section class="card queue-section">
             <div class="section-heading"><div><p class="eyebrow">In progress</p><h2>Running</h2></div><span id="queueActive" class="section-count">0</span></div>
             <div id="queueLaneControls" class="queue-lane-controls" aria-live="polite"></div>
@@ -135,6 +131,11 @@
             <div class="section-heading"><div><p class="eyebrow">Waiting</p><h2>Up Next</h2></div><span id="queueWaitingCount" class="section-count">0</span></div>
             <div id="queueWaiting" class="queue-vod-list muted">Nothing is waiting.</div>
           </section>
+          <div id="queuePersistenceWarning" class="queue-persistence-warning hidden" role="status" aria-live="polite"></div>
+          <section id="queueErrorsSection" class="card queue-section queue-attention-section hidden">
+            <div class="section-heading"><div><p class="eyebrow">Action required</p><h2>Needs Attention</h2></div><span id="queueFailed" class="section-count">0</span></div>
+            <div id="queueErrors" class="queue-vod-list"></div>
+          </section>
           <section class="card queue-section" id="readyForUploadSection">
             <div class="section-heading"><div><p class="eyebrow">Downloaded VODs</p><h2>Ready for Upload <span id="workspacePending" class="heading-count">0</span></h2><p class="muted">Select prepared VODs and upload them using the connected YouTube account.</p></div><button id="refreshLocalVideos" type="button">Refresh</button></div>
             <div class="workspace-toolbar"><div class="button-row"><button id="uploadSelectedLocalVideos" class="primary" type="button" disabled>Upload Selected</button><button id="checkAllLocalVideos" type="button">Select All</button><button id="uncheckAllLocalVideos" type="button">Clear Selection</button></div><label class="local-upload-playlist-field">Upload Playlist <select id="localUploadPlaylistId"><option value="" data-playlist-mode="streamer-default">Streamer Default</option><option value="" data-playlist-mode="no-playlist">No Playlist</option></select></label><label class="inlinecheck"><input type="checkbox" id="includeUploadedLocalVideos"> Show Uploaded Archive</label></div>
@@ -143,10 +144,10 @@
             <div id="localVideoCards" class="video-workspace-grid"><div class="empty-workspace muted">No uploads are waiting.</div></div>
           </section>
           <section class="card queue-section completed-section">
-            <details id="queueCompletedDetails"><summary>Completed <span id="queueDone">0</span></summary><div id="queueCompleted" class="queue-vod-list muted">Nothing completed in this session.</div></details>
+            <div class="completed-history-heading"><details id="queueCompletedDetails"><summary>Completed <span id="queueDone">0</span></summary><div id="queueCompleted" class="queue-vod-list muted">No completed jobs.</div></details><button id="clearCompletedJobs" class="quiet-button hidden" type="button" aria-label="Clear completed job history" disabled>Clear completed history</button></div>
           </section>
           <section id="queueCancelledSection" class="card queue-section completed-section hidden">
-            <details><summary>Cancelled <span id="queueCancelledCount">0</span></summary><div id="queueCancelled" class="queue-vod-list muted">Nothing cancelled in this session.</div></details>
+            <details id="queueCancelledDetails"><summary>Cancelled <span id="queueCancelledCount">0</span></summary><div id="queueCancelled" class="queue-vod-list muted">No cancelled jobs.</div></details>
           </section>
           <div id="jobs" class="hidden" aria-hidden="true"></div>
           <span id="queueTotal" class="hidden">0</span><span id="queueCurrent" class="hidden"></span><span id="queueEta" class="hidden"></span>
@@ -208,7 +209,14 @@
     <div><strong id="searchSelectionBarCount">0 VODs selected</strong><span>Selection stays available while you review results.</span></div>
     <div class="button-row"><button id="stickyClearSelection" type="button">Clear Selection</button><button id="stickyDownloadSelected" class="primary" type="button">Download Selected</button></div>
   </div>
-  <div id="appToast" class="app-toast hidden"></div>
+  <dialog id="clearCompletedDialog" class="confirmation-dialog" aria-labelledby="clearCompletedDialogTitle" aria-describedby="clearCompletedDialogDescription">
+    <form method="dialog">
+      <h2 id="clearCompletedDialogTitle">Clear completed history?</h2>
+      <p id="clearCompletedDialogDescription">This removes completed jobs from Dashboard history only. Downloaded and uploaded media are not deleted.</p>
+      <div class="button-row dialog-actions"><button type="submit" value="cancel">Keep history</button><button id="confirmClearCompletedJobs" class="danger-outline" type="button">Clear completed history</button></div>
+    </form>
+  </dialog>
+  <div id="appToast" class="app-toast hidden" role="status" aria-live="polite"></div>
   <script src="/static/app.js"></script>
 </body>
 </html>

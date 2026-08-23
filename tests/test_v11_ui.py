@@ -262,13 +262,14 @@ def _render_queue_item_with_saved_open_state(item: dict) -> str:
     runner = r"""
 const fs = require('fs');
 const source = fs.readFileSync('static/app.js', 'utf8');
-const start = source.indexOf('function renderQueueVodItem');
+const start = source.indexOf('function queueRecoveryPresentation');
 const end = source.indexOf('function renderQueueGroup');
 if (start < 0 || end < 0 || end <= start) throw new Error('Queue renderer source not found');
 const queueDetailOpenState = {'youtube_upload:upload-1:upload-1-item-1': true};
 function escapeHtml(value) { return String(value || ''); }
 function niceStatus(value) { return value; }
 function renderProgressBar() { return ''; }
+function formatProcessedDuration(value) { return `${value}s`; }
 function queueErrorSummary(value) { return String(value || ''); }
 function queueItemKey(value) { return `${value.job.type || 'download'}:${value.job.id}:${value.itemId || value.index}`; }
 eval(source.slice(start, end));
@@ -848,7 +849,7 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn(
             "Recording could not be saved completely", result["failedRecordingHtml"]
         )
-        self.assertIn("if (job?.type === 'recording') return;", JAVASCRIPT)
+        self.assertIn("if (job?.type === 'recording') {", JAVASCRIPT)
 
         queue_items = _classify_download_jobs(
             [
@@ -1001,7 +1002,7 @@ class V11UiContractTests(unittest.TestCase):
             self.assertNotIn(label, TEMPLATE)
 
     def test_queue_exposes_vod_oriented_sections_and_details(self) -> None:
-        for heading in ("Running", "Up Next", "Errors"):
+        for heading in ("Running", "Up Next", "Needs Attention"):
             self.assertIn(f">{heading}<", TEMPLATE)
         self.assertIn(">Ready for Upload ", TEMPLATE)
         self.assertIn("<summary>Completed ", TEMPLATE)

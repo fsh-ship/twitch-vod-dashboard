@@ -617,6 +617,58 @@ class JobManager:
         with self.lock:
             return deepcopy(self._persistence_health)
 
+    def clear_completed_history(self) -> Dict[str, int]:
+        """Remove only fully completed jobs and durably save the new history."""
+        with self.lock:
+            completed_ids = []
+            removed_jobs: Dict[str, Job] = {}
+            original_order = list(self.jobs)
+            for job_id, job in self.jobs.items():
+                self._ensure_control_lists_locked(job)
+                states = list(job.get("item_states") or [])
+                if (
+                    job.get("state") == "completed"
+                    and states
+                    and all(state == "completed" for state in states)
+                ):
+                    completed_ids.append(str(job_id))
+                    removed_jobs[str(job_id)] = job
+
+            for job_id in completed_ids:
+                self.jobs.pop(job_id, None)
+            if not completed_ids:
+                return {
+                    "cleared_jobs": 0,
+                    "remaining_jobs": len(self.jobs),
+                }
+
+            self._mark_dirty_locked()
+            snapshot = self._snapshot_for_persistence_locked()
+
+        try:
+            self._persist_required(snapshot)
+        except JobPersistenceRequiredError:
+            # Restore only the removed records. Concurrently added or updated
+            # jobs remain intact, while the original registry order is kept.
+            with self.lock:
+                current = dict(self.jobs)
+                restored: Dict[str, Job] = {}
+                for job_id in original_order:
+                    if job_id in removed_jobs:
+                        restored[job_id] = removed_jobs[job_id]
+                    elif job_id in current:
+                        restored[job_id] = current.pop(job_id)
+                restored.update(current)
+                self.jobs.clear()
+                self.jobs.update(restored)
+                self._mark_dirty_locked()
+            raise
+
+        return {
+            "cleared_jobs": len(completed_ids),
+            "remaining_jobs": len(self.jobs),
+        }
+
     @staticmethod
     def _restored_created_display(value: str) -> str:
         candidate = str(value or "")

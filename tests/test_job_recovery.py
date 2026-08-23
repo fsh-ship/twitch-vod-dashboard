@@ -30,6 +30,7 @@ if "app" not in sys.modules:
     os.environ.pop("VOD_DASHBOARD_LEGACY_SETTINGS_PATH", None)
 
 import app as dashboard  # noqa: E402
+from vod_dashboard import jobs as dashboard_jobs
 from vod_dashboard.job_store import JobStore, JobStorePersistenceError
 from vod_dashboard.jobs import JobManager
 
@@ -601,6 +602,205 @@ class JobRecoveryTests(unittest.TestCase):
         capability = manager.snapshot_jobs()[0]["item_capabilities"][0]
         self.assertFalse(capability["can_retry"])
         self.assertIsNone(manager.reserve_retry(job_id, item_id))
+
+    def test_clear_completed_history_removes_only_fully_completed_jobs(self):
+        manager = JobManager()
+        media = self.media / "keep.mp4"
+        partial = self.media / "keep.mp4.part"
+        archive = self.root / "archive.txt"
+        auto_state = self.root / "auto-recorder-state.json"
+        upload_history = self.root / "uploaded-history.json"
+        media.write_bytes(b"media")
+        partial.write_bytes(b"partial")
+        archive.write_text("1234567890\n", encoding="utf-8")
+        auto_state.write_text('{"enabled":true}', encoding="utf-8")
+        upload_history.write_text(
+            '{"youtube_uploaded_files":["keep.mp4"]}', encoding="utf-8"
+        )
+        original_files = {
+            path: path.read_bytes()
+            for path in (
+                media,
+                partial,
+                archive,
+                auto_state,
+                upload_history,
+            )
+        }
+
+        completed = manager.create_download_job(
+            ["https://www.twitch.tv/videos/1234567890"], "Completed"
+        )
+        completed_item = manager.get_job(completed)["item_ids"][0]
+        manager.finish_claimed_item(completed, completed_item, "completed")
+
+        failed = manager.create_download_job(
+            ["https://www.twitch.tv/videos/2234567890"], "Failed"
+        )
+        failed_item = manager.get_job(failed)["item_ids"][0]
+        manager.finish_claimed_item(failed, failed_item, "failed")
+
+        interrupted = manager.create_upload_job([str(media)], "Uncertain")
+        with manager.lock:
+            job = manager.jobs[interrupted]
+            manager._set_item_state_locked(
+                job, 0, "interrupted", failure_kind="uncertain"
+            )
+            job["item_completion_reasons"][0] = "upload_status_unknown"
+            job["item_recovery_reasons"][0] = "upload_status_unknown"
+            manager._recompute_job_state_locked(job)
+
+        cancelled = manager.create_download_job(
+            ["https://www.twitch.tv/videos/3234567890"], "Cancelled"
+        )
+        cancelled_item = manager.get_job(cancelled)["item_ids"][0]
+        manager.remove_queued_item(cancelled, cancelled_item)
+        mixed_terminal = manager.create_download_job(
+            [
+                "https://www.twitch.tv/videos/3334567890",
+                "https://www.twitch.tv/videos/3434567890",
+            ],
+            "Completed and cancelled",
+        )
+        mixed_items = manager.get_job(mixed_terminal)["item_ids"]
+        manager.finish_claimed_item(
+            mixed_terminal, mixed_items[0], "completed"
+        )
+        manager.remove_queued_item(mixed_terminal, mixed_items[1])
+        active = manager.create_download_job(
+            ["https://www.twitch.tv/videos/4234567890"], "Active"
+        )
+        high_water = manager.counter
+
+        result = manager.clear_completed_history()
+
+        self.assertEqual(result["cleared_jobs"], 1)
+        self.assertIsNone(manager.get_job(completed))
+        self.assertEqual(
+            set(manager.jobs),
+            {failed, interrupted, cancelled, mixed_terminal, active},
+        )
+        self.assertEqual(manager.counter, high_water)
+        next_id = manager.create_download_job(
+            ["https://www.twitch.tv/videos/5234567890"], "Next"
+        )
+        self.assertEqual(next_id, str(high_water + 1))
+        for path, content in original_files.items():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_clear_completed_history_persists_and_restores_result(self):
+        store = self.store("clear-completed.json")
+        manager = self.manager(store)
+        completed = manager.create_download_job(
+            ["https://www.twitch.tv/videos/1234567890"], "Completed"
+        )
+        completed_item = manager.get_job(completed)["item_ids"][0]
+        manager.finish_claimed_item(completed, completed_item, "completed")
+        failed = manager.create_download_job(
+            ["https://www.twitch.tv/videos/2234567890"], "Failed"
+        )
+        failed_item = manager.get_job(failed)["item_ids"][0]
+        manager.finish_claimed_item(failed, failed_item, "failed")
+        high_water = manager.counter
+
+        result = manager.clear_completed_history()
+        restored = self.manager(store, restarted=True)
+        restored.restore_from_store()
+
+        self.assertEqual(result, {"cleared_jobs": 1, "remaining_jobs": 1})
+        self.assertEqual(list(restored.jobs), [failed])
+        self.assertEqual(restored.counter, high_water)
+        self.assertEqual(
+            restored.create_download_job(
+                ["https://www.twitch.tv/videos/3234567890"], "Next"
+            ),
+            str(high_water + 1),
+        )
+
+    def test_clear_completed_history_rolls_back_when_required_save_fails(self):
+        store = self.store("clear-failure.json", toggle=True)
+        manager = self.manager(store)
+        completed = manager.create_download_job(
+            ["https://www.twitch.tv/videos/1234567890"], "Completed"
+        )
+        completed_item = manager.get_job(completed)["item_ids"][0]
+        manager.finish_claimed_item(completed, completed_item, "completed")
+        durable_before = store.path.read_bytes()
+        high_water = manager.counter
+        store.fail = True
+
+        with self.assertRaises(dashboard_jobs.JobPersistenceRequiredError):
+            manager.clear_completed_history()
+
+        self.assertIsNotNone(manager.get_job(completed))
+        self.assertEqual(manager.counter, high_water)
+        self.assertEqual(store.path.read_bytes(), durable_before)
+        self.assertFalse(manager.persistence_status()["healthy"])
+
+    def test_jobs_api_exposes_only_allowlisted_persistence_health(self):
+        store = self.store("status.json")
+        manager = self.manager(store)
+        manager._persistence_health.update({
+            "last_error_code": "private-code",
+            "load_source": "C:/private/jobs.json",
+            "load_reason": "private-reason",
+        })
+
+        with self.app_manager(manager) as client:
+            response = client.get("/api/jobs")
+
+        self.assertEqual(response.status_code, 200)
+        status = response.get_json()["persistence_status"]
+        self.assertEqual(
+            set(status),
+            {"enabled", "healthy", "current_degraded", "history_degraded"},
+        )
+        self.assertNotIn("private", str(status).lower())
+
+    def test_clear_completed_endpoint_returns_counts_without_job_payloads(self):
+        manager = JobManager()
+        completed = manager.create_download_job(
+            ["https://www.twitch.tv/videos/1234567890"], "Completed"
+        )
+        item_id = manager.get_job(completed)["item_ids"][0]
+        manager.finish_claimed_item(completed, item_id, "completed")
+
+        with self.app_manager(manager) as client:
+            response = client.post(
+                "/api/jobs/clear-completed",
+                json={},
+                headers={"X-CSRF-Token": self.csrf(client)},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json(),
+            {"ok": True, "cleared_jobs": 1, "remaining_jobs": 0},
+        )
+
+    def test_clear_completed_endpoint_reports_persistence_failure_and_rolls_back(self):
+        store = self.store("clear-endpoint-failure.json", toggle=True)
+        manager = self.manager(store)
+        completed = manager.create_download_job(
+            ["https://www.twitch.tv/videos/1234567890"], "Completed"
+        )
+        item_id = manager.get_job(completed)["item_ids"][0]
+        manager.finish_claimed_item(completed, item_id, "completed")
+        store.fail = True
+
+        with self.app_manager(manager) as client:
+            response = client.post(
+                "/api/jobs/clear-completed",
+                json={},
+                headers={"X-CSRF-Token": self.csrf(client)},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.get_json()["reason"], "persistence_unavailable"
+        )
+        self.assertIsNotNone(manager.get_job(completed))
+        self.assertNotIn("private", response.get_data(as_text=True).lower())
 
 
 def tearDownModule():

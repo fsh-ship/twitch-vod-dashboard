@@ -260,6 +260,11 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
             ("/api/vod/validate", "POST", "api_vod_validate"),
             ("/api/download", "POST", "api_download"),
             ("/api/jobs", "GET", "api_jobs"),
+            (
+                "/api/jobs/clear-completed",
+                "POST",
+                "api_clear_completed_jobs",
+            ),
             ("/api/queue/pause", "POST", "api_pause_queue"),
             ("/api/queue/resume", "POST", "api_resume_queue"),
             (
@@ -466,7 +471,12 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
         jobs = self.client.get("/api/jobs").get_json()
         self.assert_typed_keys(
             jobs,
-            {"jobs": list, "queue_controls": dict, "persistence": str},
+            {
+                "jobs": list,
+                "queue_controls": dict,
+                "persistence": str,
+                "persistence_status": dict,
+            },
         )
 
         local_videos = self.client.get("/api/local-videos").get_json()

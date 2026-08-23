@@ -328,7 +328,10 @@ async function api(path, options = {}) {
   try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text.slice(0, 1000) }; }
   if (!res.ok) {
     const detail = [data.error || `HTTP ${res.status}`, data.hint, data.client_secret_path ? ('client_secret: ' + data.client_secret_path) : '', data.token_path ? ('token: ' + data.token_path) : ''].filter(Boolean).join('\n\n');
-    throw new Error(detail);
+    const error = new Error(detail);
+    error.reason = String(data.reason || '');
+    error.status = res.status;
+    throw error;
   }
   return data;
 }
@@ -1702,10 +1705,39 @@ function explicitQueueItemState(job, index) {
   return ({queued:'waiting', running:'running', cancelling:'cancelling', completed:'completed', failed:'error', cancelled:'cancelled', interrupted:'interrupted'})[state] || '';
 }
 
+function queueItemListValue(job, key, index, fallback='') {
+  const values = Array.isArray(job?.[key]) ? job[key] : [];
+  return index >= 0 && index < values.length ? values[index] : fallback;
+}
+
 function queueItemsFromJobs(jobs, nowMs=Date.now()) {
   const items = [];
   (jobs || []).slice().reverse().forEach(job => {
-    if (job?.type === 'recording') return;
+    if (job?.type === 'recording') {
+      const zeroIndex = 0;
+      const stateName = explicitQueueItemState(job, zeroIndex) || (job.state === 'failed' ? 'error' : job.state);
+      if (!['interrupted', 'error'].includes(stateName)) return;
+      const itemId = queueItemListValue(job, 'item_ids', zeroIndex, `${job.id}-item-1`);
+      items.push({
+        job, itemId,
+        capabilities: queueItemListValue(job, 'item_capabilities', zeroIndex, {}),
+        state: stateName,
+        operation: stateName === 'interrupted' ? 'Recording interrupted' : 'Recording failed',
+        resolved: !!queueItemListValue(job, 'item_resolved', zeroIndex, false),
+        streamer: job.streamer || '', date: '', title: job.title || job.label,
+        vodId: '', filename: '', sizeBytes: null, sizeGb: null,
+        progress: null, etaSeconds: null, updatedAt: null, extra: '',
+        historicalProgress: null,
+        historicalProcessedSeconds: Number(job.recorded_seconds) || null,
+        detailLogs: Array.isArray(job.log) ? job.log : [],
+        error: stateName === 'error' ? queueErrorFromLines(job.log || []) : '',
+        completionReason: queueItemListValue(job, 'item_completion_reasons', zeroIndex, job.completion_reason || ''),
+        recoveryReason: queueItemListValue(job, 'item_recovery_reasons', zeroIndex, job.recovery_reason || ''),
+        failureKind: queueItemListValue(job, 'item_failure_kinds', zeroIndex, ''),
+        index: zeroIndex,
+      });
+      return;
+    }
     const logs = job.log || [];
     const progress = parseProgress(logs);
     const sources = job.urls || [];
@@ -1758,8 +1790,14 @@ function queueItemsFromJobs(jobs, nowMs=Date.now()) {
           etaSeconds,
           updatedAt: activeTransfer ? trackedUpdatedAt : null,
           extra: [speedLabel, formatRemainingDuration(etaSeconds)].filter(Boolean).join(' · '),
+          historicalProgress: activeTransfer ? null : trackedProgress,
+          historicalProcessedSeconds: null,
           detailLogs: segment,
-          error: trackedError || failure || (stateName === 'error' ? queueErrorFromLines(segment) : ''), index: zeroIndex
+          error: trackedError || failure || (stateName === 'error' ? queueErrorFromLines(segment) : ''),
+          completionReason: queueItemListValue(job, 'item_completion_reasons', zeroIndex, job.completion_reason || ''),
+          recoveryReason: queueItemListValue(job, 'item_recovery_reasons', zeroIndex, job.recovery_reason || ''),
+          failureKind: queueItemListValue(job, 'item_failure_kinds', zeroIndex, ''),
+          index: zeroIndex
         });
       });
       return;
@@ -1828,8 +1866,14 @@ function queueItemsFromJobs(jobs, nowMs=Date.now()) {
         etaSeconds,
         updatedAt: activeTransfer ? trackedUpdatedAt : null,
         extra: activeTransfer ? [processedLabel, speedLabel, formatRemainingDuration(etaSeconds)].filter(Boolean).join(' · ') : '',
+        historicalProgress: activeTransfer ? null : (hasStructuredProgress ? structuredProgress : null),
+        historicalProcessedSeconds: activeTransfer ? null : trackedProcessedSeconds,
         detailLogs: segment,
-        error: stateName === 'error' ? queueErrorFromLines(segment.length ? segment : logs) : '', index: zeroIndex
+        error: stateName === 'error' ? queueErrorFromLines(segment.length ? segment : logs) : '',
+        completionReason: queueItemListValue(job, 'item_completion_reasons', zeroIndex, job.completion_reason || ''),
+        recoveryReason: queueItemListValue(job, 'item_recovery_reasons', zeroIndex, job.recovery_reason || ''),
+        failureKind: queueItemListValue(job, 'item_failure_kinds', zeroIndex, ''),
+        index: zeroIndex
       });
     });
   });
@@ -1901,15 +1945,88 @@ function distinguishQueueItems(items) {
   });
 }
 
+function queueRecoveryPresentation(item) {
+  const type = item.job?.type === 'youtube_upload' ? 'upload' : item.job?.type === 'recording' ? 'recording' : 'download';
+  const reason = String(item.recoveryReason || item.completionReason || '');
+  const uncertainUpload = type === 'upload' && (reason === 'upload_status_unknown' || item.failureKind === 'uncertain');
+  if (uncertainUpload) return {
+    status:'Upload status uncertain',
+    support:'The dashboard restarted while YouTube may have been processing this upload. Check YouTube Studio before uploading it again.',
+    reviewRequired:true,
+  };
+  if (item.state !== 'interrupted') return {
+    status:({running:item.operation, cancelling:'Cancelling...', waiting:'Queued', completed:'Completed', error:'Failed', cancelled:'Cancelled'})[item.state] || 'Queued',
+    support:'', reviewRequired:false,
+  };
+  if (type === 'download') return {
+    status:'Download interrupted',
+    support: reason === 'restart_before_start'
+      ? 'The dashboard restarted before this download started.'
+      : 'The dashboard restarted while this download was running.',
+    reviewRequired:false,
+  };
+  if (type === 'upload') return {
+    status:'Upload interrupted',
+    support: reason === 'restart_before_start'
+      ? 'The dashboard restarted before the YouTube upload started.'
+      : 'The dashboard restarted before this upload finished.',
+    reviewRequired:false,
+  };
+  return {
+    status:'Recording interrupted',
+    support: reason === 'restart_before_start'
+      ? 'The dashboard restarted before recording started.'
+      : 'The dashboard restarted while this recording was active.',
+    reviewRequired:false,
+  };
+}
+
+function queueJobTypeLabel(item) {
+  return item.job?.type === 'youtube_upload' ? 'YouTube upload' : item.job?.type === 'recording' ? 'Recording' : 'Download';
+}
+
+function queueTechnicalDetailsHtml(item, itemId, detailId, detailOpen, error) {
+  const itemLogs = Array.isArray(item.detailLogs) ? item.detailLogs : [];
+  const logText = itemLogs.length
+    ? itemLogs.slice(-120).join('\n')
+    : item.state === 'interrupted'
+      ? 'Detailed process log was not retained across restart.'
+      : 'No item-specific technical log is available.';
+  const values = [
+    ['Job ID', item.job.id],
+    ['Item ID', itemId],
+    ['Type', queueJobTypeLabel(item)],
+    ['Created', item.job.created_at || item.job.created || ''],
+    ['Started', item.job.started_at || ''],
+    ['Finished / interrupted', item.job.finished_at || ''],
+    ['Completion reason', item.completionReason || ''],
+    ['Recovery reason', item.recoveryReason || ''],
+  ];
+  const retryJobId = String(item.capabilities?.retry_job_id || '');
+  if (retryJobId) values.push(['Retry job', retryJobId]);
+  if (item.job?.retry_of?.job_id) values.push(['Retry of', `Job ${item.job.retry_of.job_id}`]);
+  if (item.job?.type === 'recording') {
+    if (item.job.origin) values.push(['Origin', item.job.origin]);
+    if (item.job.attempt) values.push(['Attempt', item.job.attempt]);
+  }
+  const historicalProgress = Number(item.historicalProgress);
+  if (item.historicalProgress !== null && item.historicalProgress !== '' && Number.isFinite(historicalProgress)) {
+    values.push(['Last recorded progress', `${Math.max(0, Math.min(100, historicalProgress)).toFixed(1).replace(/\.0$/, '')}%`]);
+  }
+  const historicalSeconds = Number(item.historicalProcessedSeconds);
+  if (item.historicalProcessedSeconds !== null && Number.isFinite(historicalSeconds) && historicalSeconds > 0) {
+    values.push([item.job?.type === 'recording' ? 'Last recorded duration' : 'Last processed duration', formatProcessedDuration(historicalSeconds)]);
+  }
+  const grid = values.filter(([, value]) => value !== null && value !== undefined && String(value).trim()).map(([label, value]) => `<div><span class="muted">${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('');
+  return `<details class="technical-details queue-row-details" data-queue-detail-id="${escapeHtml(detailId)}"${detailOpen}><summary>${item.state === 'error' ? 'View error' : 'Technical details'}</summary><div class="job-detail-grid">${grid}</div>${error}<pre>${escapeHtml(logText)}</pre></details>`;
+}
+
 function renderQueueVodItem(item, compact=false) {
   const capabilities = item.capabilities || {};
   const itemId = item.itemId || `${item.job.id}-item-${item.index + 1}`;
   const identity = [item.streamer, item.date].filter(Boolean).join(' · ');
-  const status = ({running:item.operation, cancelling:'Cancelling...', waiting:'Queued', completed:'Completed', error:'Failed', cancelled:'Cancelled', interrupted:'Interrupted'})[item.state] || 'Queued';
-  const itemLogs = Array.isArray(item.detailLogs) ? item.detailLogs : [];
-  const logText = itemLogs.length
-    ? itemLogs.slice(-120).join('\n')
-    : 'No item-specific technical log is available.';
+  const presentation = queueRecoveryPresentation(item);
+  const status = presentation.status;
   const activeTransfer = item.state === 'running' || item.state === 'cancelling';
   const progress = activeTransfer ? renderProgressBar(item.operation, item.progress, item.extra) : '';
   const progressDetails = activeTransfer && !progress && item.extra
@@ -1917,29 +2034,34 @@ function renderQueueVodItem(item, compact=false) {
     : '';
   const detailId = queueItemKey(item);
   const detailOpen = queueDetailOpenState[detailId] ? ' open' : '';
-  const error = item.error ? `<div class="queue-item-error">${escapeHtml(queueErrorSummary(item.error, item.operation))}</div>` : '';
+  const error = item.state === 'error' && item.error ? `<div class="queue-item-error">${escapeHtml(queueErrorSummary(item.error, item.operation))}</div>` : '';
   const actionButtons = [];
-  if (capabilities.can_cancel) actionButtons.push(`<button type="button" class="danger-outline queue-item-action" data-queue-action="cancel" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}">Cancel</button>`);
-  if (capabilities.can_stop_after_current) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="stop" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}">Stop after current</button>`);
-  if (capabilities.can_remove) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="remove" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}">Remove from Queue</button>`);
-  if (capabilities.can_retry) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="retry" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}">Retry</button>`);
+  const accessibleTitle = String(item.title || item.job.label || queueJobTypeLabel(item));
+  if (capabilities.can_cancel) actionButtons.push(`<button type="button" class="danger-outline queue-item-action" data-queue-action="cancel" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Cancel ${escapeHtml(accessibleTitle)}">Cancel</button>`);
+  if (capabilities.can_stop_after_current) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="stop" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Stop Queue after ${escapeHtml(accessibleTitle)}">Stop after current</button>`);
+  if (capabilities.can_remove) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="remove" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Remove ${escapeHtml(accessibleTitle)} from Queue">Remove from Queue</button>`);
+  if (capabilities.can_retry) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="retry" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Retry ${escapeHtml(status)}: ${escapeHtml(accessibleTitle)}">Retry</button>`);
   if (item.state === 'error' && !item.resolved && capabilities.can_resolve !== false) actionButtons.push(`<button type="button" class="quiet-button queue-resolve-error" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}">Mark as resolved</button>`);
-  const retryBlock = capabilities.retry_block_reason ? `<div class="queue-item-note muted">${escapeHtml(capabilities.retry_block_reason)}</div>` : '';
+  const retryJobId = String(capabilities.retry_job_id || '');
+  const retryRelationship = retryJobId ? `<div class="queue-item-note queue-retry-relationship">Retry started as Job ${escapeHtml(retryJobId)}</div>` : '';
+  const reviewRequired = presentation.reviewRequired ? '<div class="queue-review-required" role="note">Review required</div>' : '';
+  const support = presentation.support ? `<div class="queue-item-support">${escapeHtml(presentation.support)}</div>` : '';
   const actions = actionButtons.length ? `<div class="queue-item-actions">${actionButtons.join('')}</div>` : '';
+  const attention = item.state === 'interrupted' ? 'has-attention' : item.state === 'error' ? 'has-error' : '';
+  const pillClass = item.state === 'error' ? 'bad' : item.state === 'interrupted' ? 'attention' : item.state === 'completed' ? 'good' : activeTransfer ? 'accent' : 'muted';
+  const details = queueTechnicalDetailsHtml(item, itemId, detailId, detailOpen, error);
   if (compact) {
-    return `<article class="queue-vod-item compact ${item.state === 'error' ? 'has-error' : ''}">
-      <div class="queue-row-identity"><strong>${escapeHtml(item.streamer || 'Unknown streamer')}</strong><span>${escapeHtml(item.date || 'Unknown date')}</span></div>
+    return `<article class="queue-vod-item compact ${attention} ${presentation.reviewRequired ? 'is-uncertain' : ''}">
+      <div class="queue-row-identity"><strong>${escapeHtml(item.streamer || (item.job?.type === 'recording' ? 'Twitch recording' : 'Unknown streamer'))}</strong><span>${escapeHtml(item.date || queueJobTypeLabel(item))}</span></div>
       <div class="queue-row-title">${escapeHtml(item.title || item.job.label)}</div>
       ${item.distinguishingLabel ? `<div class="queue-row-disambiguator muted">${escapeHtml(item.distinguishingLabel)}</div>` : ''}
-      <span class="pill ${item.state === 'error' || item.state === 'interrupted' ? 'bad' : item.state === 'completed' ? 'good' : 'muted'}">${escapeHtml(status)}</span>
-      ${retryBlock}${actions}
-      <details class="technical-details queue-row-details" data-queue-detail-id="${escapeHtml(detailId)}"${detailOpen}><summary>${item.state === 'error' ? 'View error' : 'Technical details'}</summary><div class="job-detail-grid"><div><span class="muted">Job ID</span><strong>${escapeHtml(item.job.id)}</strong></div><div><span class="muted">Item ID</span><strong>${escapeHtml(itemId)}</strong></div><div><span class="muted">Operation</span><strong>${escapeHtml(item.operation)}</strong></div></div>${error}<pre>${escapeHtml(logText)}</pre></details>
+      <span class="pill ${pillClass}">${escapeHtml(status)}</span>
+      ${support}${reviewRequired}${retryRelationship}${actions}${details}
     </article>`;
   }
-  return `<article class="queue-vod-item ${compact ? 'compact' : ''} ${item.state === 'error' ? 'has-error' : ''}">
-    <div class="queue-vod-main"><div class="queue-vod-copy">${identity ? `<div class="queue-vod-identity">${escapeHtml(identity)}</div>` : ''}<strong>${escapeHtml(item.title || item.job.label)}</strong></div><span class="pill ${item.state === 'error' || item.state === 'interrupted' ? 'bad' : item.state === 'completed' ? 'good' : activeTransfer ? 'accent' : 'muted'}">${escapeHtml(status)}</span></div>
-    ${error}${retryBlock}${progress}${progressDetails}${actions}
-    <details class="technical-details" data-queue-detail-id="${escapeHtml(detailId)}"${detailOpen}><summary>Technical details</summary><div class="job-detail-grid"><div><span class="muted">Job ID</span><strong>${escapeHtml(item.job.id)}</strong></div><div><span class="muted">Item ID</span><strong>${escapeHtml(itemId)}</strong></div><div><span class="muted">Operation</span><strong>${escapeHtml(item.operation)}</strong></div></div><pre>${escapeHtml(logText)}</pre></details>
+  return `<article class="queue-vod-item ${attention} ${presentation.reviewRequired ? 'is-uncertain' : ''}">
+    <div class="queue-vod-main"><div class="queue-vod-copy">${identity ? `<div class="queue-vod-identity">${escapeHtml(identity)}</div>` : ''}<strong>${escapeHtml(item.title || item.job.label)}</strong></div><span class="pill ${pillClass}">${escapeHtml(status)}</span></div>
+    ${support}${error}${reviewRequired}${retryRelationship}${progress}${progressDetails}${actions}${details}
   </article>`;
 }
 
@@ -1962,7 +2084,7 @@ function renderQueueGroup(id, items, emptyMessage, compact=false) {
     cancel: ['/api/jobs/cancel-item', 'Cancelling...'],
     stop: ['/api/jobs/stop-after-current', 'Queue will stop after the current item.'],
     remove: ['/api/jobs/remove-item', 'Removed from Queue. The local file was not deleted.'],
-    retry: ['/api/jobs/retry-item', 'Fresh retry added to the Queue.'],
+    retry: ['/api/jobs/retry-item', 'Starting a fresh retry...'],
   };
   box.querySelectorAll('.queue-item-action').forEach(button => button.addEventListener('click', async () => {
     const action = button.dataset.queueAction;
@@ -1971,13 +2093,29 @@ function renderQueueGroup(id, items, emptyMessage, compact=false) {
     button.disabled = true;
     showToast(route[1]);
     try {
-      await api(route[0], {method:'POST', body:JSON.stringify({job_id:button.dataset.jobId, item_id:button.dataset.itemId})});
+      const result = await api(route[0], {method:'POST', body:JSON.stringify({job_id:button.dataset.jobId, item_id:button.dataset.itemId})});
+      if (action === 'retry' && result.retry_job_id) showToast(`Retry started as Job ${result.retry_job_id}.`);
       await pollJobs();
     } catch (error) {
       button.disabled = false;
-      showToast(error.message, 'bad');
+      showToast(friendlyQueueActionError(error), 'bad');
     }
   }));
+}
+
+function friendlyQueueActionError(error) {
+  const messages = {
+    review_required:'Check YouTube Studio before uploading this video again.',
+    source_missing:'Source video is no longer available.',
+    source_changed:'Source video changed since this upload was queued.',
+    unsafe_source_path:'Source video can no longer be used safely.',
+    recording_retry_unsupported:'Historical recordings cannot be retried.',
+    already_retried:'A retry has already been started for this item.',
+    not_retryable:'This Queue item cannot be retried.',
+    persistence_unavailable:'Job history persistence is unavailable. No durable change was made.',
+    persistence_validation_failed:'Job history could not be saved safely. No durable change was made.',
+  };
+  return messages[String(error?.reason || '')] || String(error?.message || 'The Queue action could not be completed.');
 }
 
 function renderQueueLaneControls(queueControls={}) {
@@ -2009,25 +2147,69 @@ function renderQueueLaneControls(queueControls={}) {
   }));
 }
 
-function renderVodQueue(jobs, queueControls={}) {
+function queueHistoryTimestamp(item) {
+  const values = [item.job?.finished_at, item.job?.updated_at, item.job?.created_at, item.job?.created];
+  for (const value of values) {
+    const parsed = Date.parse(String(value || '').replace(' ', 'T'));
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
+
+function queueHistoryNewest(items) {
+  return (items || []).slice().sort((left, right) => {
+    const byTime = queueHistoryTimestamp(right) - queueHistoryTimestamp(left);
+    if (byTime) return byTime;
+    const leftId = Number(left.job?.id);
+    const rightId = Number(right.job?.id);
+    if (Number.isFinite(leftId) && Number.isFinite(rightId) && rightId !== leftId) return rightId - leftId;
+    const byJob = String(right.job?.id || '').localeCompare(String(left.job?.id || ''), undefined, {numeric:true});
+    return byJob || Number(right.index || 0) - Number(left.index || 0);
+  });
+}
+
+function renderQueuePersistenceStatus(status={}) {
+  const box = $('queuePersistenceWarning');
+  if (!box) return;
+  if (!status.enabled || (!status.current_degraded && !status.history_degraded)) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+  if (status.current_degraded && status.history_degraded) {
+    box.innerHTML = '<strong>Job history persistence degraded</strong><span>Current work can continue, but recent history may not survive a restart. Some saved job history could not be restored.</span>';
+  } else if (status.current_degraded) {
+    box.innerHTML = '<strong>Job history persistence degraded</strong><span>Current work can continue, but recent job history may not survive a restart.</span>';
+  } else {
+    box.innerHTML = '<strong>Some saved job history could not be restored.</strong><span>Current downloads and uploads can continue normally.</span>';
+  }
+  box.classList.remove('hidden');
+}
+
+function renderVodQueue(jobs, queueControls={}, persistenceStatus={}) {
   const items = queueItemsFromJobs(jobs);
   const running = items.filter(item => item.state === 'running' || item.state === 'cancelling');
   const waiting = items.filter(item => item.state === 'waiting');
-  const errors = distinguishQueueItems(items.filter(item => (item.state === 'error' || item.state === 'interrupted') && !item.resolved));
-  const completed = distinguishQueueItems(items.filter(item => item.state === 'completed').reverse());
-  const cancelled = distinguishQueueItems(items.filter(item => item.state === 'cancelled').reverse());
+  const errors = distinguishQueueItems(queueHistoryNewest(items.filter(item => (item.state === 'error' || item.state === 'interrupted') && !item.resolved)));
+  const completed = distinguishQueueItems(queueHistoryNewest(items.filter(item => item.state === 'completed')));
+  const cancelled = distinguishQueueItems(queueHistoryNewest(items.filter(item => item.state === 'cancelled')));
   renderQueueGroup('queueRunning', running, 'No downloads or uploads are currently running.');
   renderQueueGroup('queueWaiting', waiting, 'Nothing is waiting.', true);
-  renderQueueGroup('queueErrors', errors, 'No errors.', true);
-  renderQueueGroup('queueCompleted', completed, 'Nothing completed in this session.', true);
-  renderQueueGroup('queueCancelled', cancelled, 'Nothing cancelled in this session.', true);
+  renderQueueGroup('queueErrors', errors, 'No jobs need attention.', true);
+  renderQueueGroup('queueCompleted', completed, 'No completed jobs.', true);
+  renderQueueGroup('queueCancelled', cancelled, 'No cancelled jobs.', true);
   renderQueueLaneControls(queueControls);
+  renderQueuePersistenceStatus(persistenceStatus);
   renderOverallRunningEstimate(running);
   if ($('queueActive')) $('queueActive').textContent = String(running.length);
   if ($('queueWaitingCount')) $('queueWaitingCount').textContent = String(waiting.length);
   if ($('queueFailed')) $('queueFailed').textContent = String(errors.length);
   if ($('queueDone')) $('queueDone').textContent = String(completed.length);
   if ($('queueCancelledCount')) $('queueCancelledCount').textContent = String(cancelled.length);
+  if ($('clearCompletedJobs')) {
+    $('clearCompletedJobs').disabled = completed.length === 0;
+    $('clearCompletedJobs').classList.toggle('hidden', completed.length === 0);
+  }
   if ($('queueCancelledSection')) $('queueCancelledSection').classList.toggle('hidden', cancelled.length === 0);
   if ($('queueErrorsSection')) $('queueErrorsSection').classList.toggle('hidden', errors.length === 0);
   return {items, running, waiting, errors, completed, cancelled};
@@ -2040,7 +2222,7 @@ async function pollJobs() {
   collectOpenStates();
   const box = $('jobs');
   updateQueueSummary(data.jobs || []);
-  renderVodQueue(data.jobs || [], data.queue_controls || {});
+  renderVodQueue(data.jobs || [], data.queue_controls || {}, data.persistence_status || {});
   updateLiveRecordingJobs(data.jobs || []);
   if (!data.jobs.length) {
     box.textContent = 'No downloads in this session yet.';
@@ -2647,4 +2829,28 @@ document.addEventListener('DOMContentLoaded', function() {
       toggle.textContent = 'Menu';
     }));
   }
+});
+
+document.addEventListener('DOMContentLoaded', function() {
+  const clearButton = document.getElementById('clearCompletedJobs');
+  const dialog = document.getElementById('clearCompletedDialog');
+  const confirmButton = document.getElementById('confirmClearCompletedJobs');
+  if (clearButton && dialog) clearButton.addEventListener('click', () => {
+    if (typeof dialog.showModal === 'function') dialog.showModal();
+    else dialog.setAttribute('open', '');
+  });
+  if (confirmButton && dialog) confirmButton.addEventListener('click', async () => {
+    confirmButton.disabled = true;
+    try {
+      const result = await api('/api/jobs/clear-completed', {method:'POST', body:'{}'});
+      if (typeof dialog.close === 'function') dialog.close();
+      else dialog.removeAttribute('open');
+      showToast(`${result.cleared_jobs || 0} completed job${result.cleared_jobs === 1 ? '' : 's'} removed from Dashboard history.`);
+      await pollJobs();
+    } catch (error) {
+      showToast(friendlyQueueActionError(error), 'bad');
+    } finally {
+      confirmButton.disabled = false;
+    }
+  });
 });

@@ -140,8 +140,10 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
         recording_stop = self.client.post(
             "/api/live/record/1/stop"
         )
+        clear_history = self.client.post("/api/jobs/clear-completed")
         self.assertEqual(recording_start.status_code, 401)
         self.assertEqual(recording_stop.status_code, 401)
+        self.assertEqual(clear_history.status_code, 401)
 
     def test_successful_login_rotates_session_state_and_sets_secure_cookie_flags(self):
         response, pre_login_token = self.login()
@@ -230,8 +232,13 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
             "/api/live/record/1/stop",
             headers={"Origin": self.ORIGIN},
         )
+        clear_history = self.client.post(
+            "/api/jobs/clear-completed",
+            headers={"Origin": self.ORIGIN},
+        )
         self.assertEqual(recording_start.status_code, 403)
         self.assertEqual(recording_stop.status_code, 403)
+        self.assertEqual(clear_history.status_code, 403)
 
     def test_invalid_csrf_token_is_rejected(self):
         self.assertEqual(self.login()[0].status_code, 302)

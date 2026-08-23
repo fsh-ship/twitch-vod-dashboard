@@ -2009,11 +2009,41 @@ def api_download():
 def api_jobs():
     manager = _job_manager_for_compatibility()
     jobs_snapshot = manager.snapshot_jobs(reverse=True)
+    persistence = manager.persistence_status()
     return jsonify({
         "jobs": jobs_snapshot,
         "queue_controls": manager.queue_controls_snapshot(),
         "persistence": "process-local",
+        "persistence_status": {
+            "enabled": bool(persistence.get("enabled")),
+            "healthy": (
+                bool(persistence.get("healthy"))
+                if persistence.get("healthy") is not None
+                else None
+            ),
+            "current_degraded": bool(
+                persistence.get("enabled")
+                and persistence.get("healthy") is False
+            ),
+            "history_degraded": bool(persistence.get("load_degraded")),
+        },
     })
+
+
+@app.post("/api/jobs/clear-completed")
+def api_clear_completed_jobs():
+    manager = _job_manager_for_compatibility()
+    try:
+        result = manager.clear_completed_history()
+    except dashboard_jobs.JobPersistenceRequiredError as exc:
+        return jsonify({
+            "error": (
+                "Completed history could not be cleared because job history "
+                "persistence is unavailable."
+            ),
+            "reason": exc.code,
+        }), 409
+    return jsonify({"ok": True, **result})
 
 
 def _queue_action_identity() -> tuple[str, str]:
