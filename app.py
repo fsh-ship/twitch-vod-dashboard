@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 
 from vod_dashboard import dashboard_state
+from vod_dashboard import auto_recorder as dashboard_auto_recorder
 from vod_dashboard import local_vods as dashboard_local_vods
 from vod_dashboard import jobs as dashboard_jobs
 from vod_dashboard import media as dashboard_media
@@ -475,14 +476,19 @@ def build_download_command(urls: List[str], settings: Dict[str, Any]) -> tuple[L
 
 
 def build_live_recording_command(
-    streamer: str, settings: Dict[str, Any]
+    streamer: str, settings: Dict[str, Any], *, attempt: int = 1
 ) -> List[str]:
+    kwargs: Dict[str, Any] = {
+        "download_directory": download_path(settings),
+        "command_factory": ytdlp_base_command,
+        "cookie_args_factory": ytdlp_cookie_args,
+    }
+    if attempt != 1:
+        kwargs["attempt"] = attempt
     return dashboard_twitch.build_live_recording_command(
         streamer,
         settings,
-        download_directory=download_path(settings),
-        command_factory=ytdlp_base_command,
-        cookie_args_factory=ytdlp_cookie_args,
+        **kwargs,
     )
 
 
@@ -844,7 +850,7 @@ def create_recording_job(
         live_started_at=live_metadata.get("started_at"),
         quality=str(resolved_settings.get("quality") or "source/best"),
         output_name=dashboard_twitch.live_recording_output_template(
-            streamer
+            streamer, attempt=attempt
         ),
         origin=origin,
         attempt=attempt,
@@ -947,6 +953,58 @@ def run_recording_job(job_id: str) -> None:
     dashboard_jobs.run_recording_job(
         job_id, _job_manager_for_compatibility(), dependencies
     )
+
+
+def persist_manual_recording_stop(job: Mapping[str, Any]) -> bool:
+    """Best-effort durable suppression after an accepted recording stop."""
+    streamer = dashboard_settings.canonical_streamer_login(
+        job.get("streamer")
+    )
+    stream_id = dashboard_auto_recorder.normalize_auto_recorder_stream_id(
+        job.get("stream_id")
+    )
+    if not streamer or not stream_id:
+        return False
+    try:
+        settings = load_settings()
+        configured = {
+            dashboard_settings.canonical_streamer_login(value)
+            for value in read_streamers(settings)
+        }
+        profile = dashboard_settings.streamer_profile_for(
+            settings, streamer
+        )
+        if (
+            str(job.get("origin") or "") != "auto"
+            and not (
+                streamer in configured
+                and profile.get("auto_record") is True
+            )
+        ):
+            return False
+        attempt = job.get("attempt")
+        if (
+            isinstance(attempt, bool)
+            or not isinstance(attempt, int)
+            or attempt < 0
+        ):
+            attempt = 0
+        store = dashboard_auto_recorder.AutoRecorderStateStore.from_dashboard_dir(
+            DEFAULT_DASHBOARD_DIR, log=log_line
+        )
+        store.set_handled(
+            streamer,
+            stream_id,
+            "manual_stop",
+            attempts=attempt,
+            job_id=str(job.get("id") or "") or None,
+        )
+        return True
+    except Exception:
+        log_line(
+            "Auto recorder manual-stop suppression could not be persisted."
+        )
+        return False
 
 
 
@@ -1654,6 +1712,7 @@ def api_stop_live_recording(job_id: str):
         job.get("state") == "completed"
         and job.get("completion_reason") == "stopped_by_user"
     ):
+        persist_manual_recording_stop(job)
         return jsonify(_recording_api_payload(job)), 200
     if job.get("state") in {"completed", "failed"}:
         return jsonify(
@@ -1669,6 +1728,7 @@ def api_stop_live_recording(job_id: str):
             current.get("state") == "completed"
             and current.get("completion_reason") == "stopped_by_user"
         ):
+            persist_manual_recording_stop(current)
             return jsonify(_recording_api_payload(current)), 200
         return jsonify(
             {
@@ -1677,8 +1737,9 @@ def api_stop_live_recording(job_id: str):
             }
         ), 409
 
-    manager.start_recording_termination(job_id)
     current = manager.get_job(job_id) or job
+    persist_manual_recording_stop(current)
+    manager.start_recording_termination(job_id)
     return jsonify(_recording_api_payload(current)), 202
 
 

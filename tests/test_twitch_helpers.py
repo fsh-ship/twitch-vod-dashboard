@@ -694,6 +694,23 @@ class YtDlpIntegrationHelperTests(unittest.TestCase):
                     download_directory=self.download_dir,
                 )
 
+    def test_live_recording_retry_uses_distinct_deterministic_output(self):
+        first = twitch.live_recording_output_template("nika_livetv")
+        retry = twitch.live_recording_output_template(
+            "nika_livetv", attempt=2
+        )
+        self.assertNotEqual(first, retry)
+        self.assertNotIn("RETRY", first)
+        self.assertIn(" - RETRY 2.%(ext)s", retry)
+
+        command = twitch.build_live_recording_command(
+            "nika_livetv",
+            self.settings,
+            attempt=2,
+            download_directory=self.download_dir,
+        )
+        self.assertEqual(command[command.index("-o") + 1], retry)
+
     def test_source_fallback_deduplication_and_malformed_output(self):
         first = SimpleNamespace(
             returncode=1, stdout="", stderr="first source failed"

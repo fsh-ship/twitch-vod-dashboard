@@ -39,6 +39,11 @@ from vod_dashboard import runtime as runtime_helpers  # noqa: E402
 from vod_dashboard import settings as settings_helpers  # noqa: E402
 from vod_dashboard import twitch as twitch_helpers  # noqa: E402
 from vod_dashboard import youtube as youtube_helpers  # noqa: E402
+from vod_dashboard.auto_recorder import (  # noqa: E402
+    AutoRecorderStatePersistenceError,
+    AutoRecorderStateStore,
+)
+from vod_dashboard.auto_recording import AutoRecorderCoordinator  # noqa: E402
 
 
 def tearDownModule():
@@ -94,6 +99,21 @@ DEFAULT_SETTINGS_KEYS = {
     "youtube_upload_history",
     "youtube_uploaded_files",
 }
+
+
+class ControlledSuppressionStore(AutoRecorderStateStore):
+    def __init__(self, *args, failures=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.failures = failures
+
+    def set_handled(self, *args, **kwargs):
+        if self.failures is None or self.failures > 0:
+            if self.failures is not None:
+                self.failures -= 1
+            raise AutoRecorderStatePersistenceError(
+                "simulated suppression write failure"
+            )
+        return super().set_handled(*args, **kwargs)
 
 
 class IsolatedDashboardTestCase(unittest.TestCase):
@@ -1539,7 +1559,11 @@ class TwitchContractTests(IsolatedDashboardTestCase):
 
     def test_stop_recording_api_terminal_semantics_are_stable(self):
         manager = dashboard._job_manager_for_compatibility()
-        stopped_id = manager.create_recording_job("nika_livetv")
+        stopped_id = manager.create_recording_job(
+            "nika_livetv",
+            stream_id="stopped-stream",
+            origin="auto",
+        )
         stopped_claim = manager.claim_recording_job(stopped_id)
         manager.finalize_recording_job(
             stopped_id,
@@ -1554,7 +1578,11 @@ class TwitchContractTests(IsolatedDashboardTestCase):
             headers=self.csrf_headers,
         )
 
-        natural_id = manager.create_recording_job("nika_livetv")
+        natural_id = manager.create_recording_job(
+            "nika_livetv",
+            stream_id="natural-stream",
+            origin="auto",
+        )
         natural_claim = manager.claim_recording_job(natural_id)
         manager.finalize_recording_job(
             natural_id,
@@ -1591,6 +1619,306 @@ class TwitchContractTests(IsolatedDashboardTestCase):
         self.assertEqual(natural.get_json()["error"], "recording_not_stoppable")
         self.assertEqual(failed.status_code, 409)
         self.assertEqual(failed.get_json()["error"], "recording_not_stoppable")
+        session = dashboard.dashboard_auto_recorder.AutoRecorderStateStore.from_dashboard_dir(
+            self.runtime_dir
+        ).get_session("nika_livetv")
+        self.assertEqual(session["stream_id"], "stopped-stream")
+        self.assertEqual(session["reason"], "manual_stop")
+
+    def test_manual_stop_suppresses_manual_origin_auto_enabled_stream(self):
+        manager = dashboard._job_manager_for_compatibility()
+        job_id = manager.create_recording_job(
+            "nika_livetv",
+            stream_id="stream-ABC",
+            origin="manual",
+            attempt=1,
+        )
+        claimed = manager.claim_recording_job(job_id)
+        settings = self.settings(
+            auto_recorder_enabled=False,
+            streamer_profiles={
+                "nika_livetv": {"auto_record": True}
+            },
+        )
+        with mock.patch.object(
+            dashboard, "load_settings", return_value=settings
+        ), mock.patch.object(
+            dashboard,
+            "read_streamers",
+            return_value=["nika_livetv"],
+        ), mock.patch.object(
+            manager, "start_recording_termination", return_value=False
+        ):
+            response = self.client.post(
+                f"/api/live/record/{job_id}/stop",
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 202)
+        state = dashboard.dashboard_auto_recorder.AutoRecorderStateStore.from_dashboard_dir(
+            self.runtime_dir
+        ).get_session("nika_livetv")
+        self.assertEqual(state["stream_id"], "stream-ABC")
+        self.assertEqual(state["disposition"], "handled")
+        self.assertEqual(state["reason"], "manual_stop")
+        manager.finalize_recording_job(
+            job_id,
+            claimed["item_id"],
+            state="failed",
+            returncode=-2,
+            completion_reason="stop_incomplete",
+        )
+
+    def test_stop_response_survives_manual_stop_persistence_failure(self):
+        manager = dashboard._job_manager_for_compatibility()
+        job_id = manager.create_recording_job(
+            "nika_livetv",
+            stream_id="stream-ABC",
+            origin="auto",
+        )
+        claimed = manager.claim_recording_job(job_id)
+        broken_store = mock.Mock()
+        broken_store.set_handled.side_effect = (
+            dashboard.dashboard_auto_recorder.AutoRecorderStatePersistenceError(
+                "SECRET"
+            )
+        )
+        with mock.patch.object(
+            dashboard.dashboard_auto_recorder.AutoRecorderStateStore,
+            "from_dashboard_dir",
+            return_value=broken_store,
+        ), mock.patch.object(
+            dashboard, "load_settings", return_value=self.settings()
+        ), mock.patch.object(
+            dashboard, "read_streamers", return_value=[]
+        ), mock.patch.object(
+            manager, "start_recording_termination", return_value=False
+        ):
+            response = self.client.post(
+                f"/api/live/record/{job_id}/stop",
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json()["state"], "stopping")
+        self.assertTrue(manager.jobs[job_id]["stop_requested"])
+        manager.finalize_recording_job(
+            job_id,
+            claimed["item_id"],
+            state="failed",
+            returncode=-2,
+            completion_reason="stop_incomplete",
+        )
+
+    def test_manual_stop_immediately_suppresses_auto_origin_recording(self):
+        manager = dashboard._job_manager_for_compatibility()
+        job_id = manager.create_recording_job(
+            "nika_livetv",
+            stream_id="stream-AUTO",
+            origin="auto",
+        )
+        claimed = manager.claim_recording_job(job_id)
+        with mock.patch.object(
+            dashboard, "load_settings", return_value=self.settings(
+                auto_recorder_enabled=False
+            )
+        ), mock.patch.object(
+            dashboard, "read_streamers", return_value=[]
+        ), mock.patch.object(
+            manager, "start_recording_termination", return_value=False
+        ):
+            response = self.client.post(
+                f"/api/live/record/{job_id}/stop",
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 202)
+        session = dashboard.dashboard_auto_recorder.AutoRecorderStateStore.from_dashboard_dir(
+            self.runtime_dir
+        ).get_session("nika_livetv")
+        self.assertEqual(session["stream_id"], "stream-AUTO")
+        self.assertEqual(session["reason"], "manual_stop")
+        manager.finalize_recording_job(
+            job_id,
+            claimed["item_id"],
+            state="failed",
+            returncode=-2,
+            completion_reason="stop_incomplete",
+        )
+
+    def test_failed_stop_suppression_is_recovered_before_auto_decision(self):
+        settings = self.settings(
+            auto_recorder_enabled=True,
+            streamer_profiles={
+                "auto_streamer": {"auto_record": True},
+                "manual_streamer": {"auto_record": True},
+            },
+        )
+        for origin, terminal_reason in (
+            ("auto", "stop_incomplete"),
+            ("manual", "stop_failed"),
+        ):
+            with self.subTest(origin=origin):
+                streamer = f"{origin}_streamer"
+                stream_id = f"stream-{origin}"
+                manager = dashboard._job_manager_for_compatibility()
+                state_path = self.runtime_dir / f"state-{origin}.json"
+                store = ControlledSuppressionStore(
+                    state_path, failures=0
+                )
+                job_id = manager.create_recording_job(
+                    streamer,
+                    stream_id=stream_id,
+                    origin=origin,
+                )
+                if origin == "auto":
+                    store.set_recording(
+                        streamer,
+                        stream_id,
+                        job_id=job_id,
+                        attempts=1,
+                    )
+                else:
+                    store.set_pending(streamer, stream_id)
+                store.failures = 1
+                claimed = manager.claim_recording_job(job_id)
+                with mock.patch.object(
+                    dashboard, "load_settings", return_value=settings
+                ), mock.patch.object(
+                    dashboard,
+                    "read_streamers",
+                    return_value=[streamer],
+                ), mock.patch.object(
+                    AutoRecorderStateStore,
+                    "from_dashboard_dir",
+                    return_value=store,
+                ), mock.patch.object(
+                    manager,
+                    "start_recording_termination",
+                    return_value=False,
+                ):
+                    stopped = self.client.post(
+                        f"/api/live/record/{job_id}/stop",
+                        headers=self.csrf_headers,
+                    )
+
+                self.assertEqual(stopped.status_code, 202)
+                self.assertEqual(stopped.get_json()["state"], "stopping")
+                self.assertEqual(
+                    store.get_session(streamer)["disposition"],
+                    "recording" if origin == "auto" else "pending",
+                )
+
+                starter = mock.Mock()
+                coordinator = AutoRecorderCoordinator(
+                    settings_provider=lambda: settings,
+                    streamer_provider=lambda _settings: [streamer],
+                    live_status_checker=lambda login, _settings: {
+                        "state": "live",
+                        "streamer": login,
+                        "stream_id": stream_id,
+                    },
+                    state_store=store,
+                    recording_starter=starter,
+                    recording_jobs_provider=manager.snapshot_jobs,
+                )
+                recovered = coordinator.run_once()
+                session = store.get_session(streamer)
+
+                self.assertEqual(recovered["action"], "manual_stop")
+                self.assertEqual(session["disposition"], "handled")
+                self.assertEqual(session["reason"], "manual_stop")
+                starter.assert_not_called()
+
+                manager.finalize_recording_job(
+                    job_id,
+                    claimed["item_id"],
+                    state="failed",
+                    returncode=-2,
+                    completion_reason=terminal_reason,
+                )
+                after_terminal = coordinator.run_once()
+                self.assertEqual(
+                    store.get_session(streamer)["reason"],
+                    "manual_stop",
+                )
+                self.assertEqual(
+                    after_terminal["outcomes"][0]["decision"],
+                    "already_handled",
+                )
+                starter.assert_not_called()
+                with dashboard.job_lock:
+                    dashboard.jobs.pop(job_id, None)
+
+    def test_unpersisted_stop_intent_fails_closed_for_all_candidates(self):
+        settings = self.settings(
+            auto_recorder_enabled=True,
+            streamer_profiles={
+                "a": {"auto_record": True},
+                "b": {"auto_record": True},
+            },
+        )
+        manager = dashboard._job_manager_for_compatibility()
+        store = ControlledSuppressionStore(
+            self.runtime_dir / "state-always-fails.json", failures=0
+        )
+        store.set_pending("a", "stream-A")
+        store.failures = None
+        job_id = manager.create_recording_job(
+            "a", stream_id="stream-A", origin="auto"
+        )
+        claimed = manager.claim_recording_job(job_id)
+        with mock.patch.object(
+            dashboard, "load_settings", return_value=settings
+        ), mock.patch.object(
+            dashboard, "read_streamers", return_value=["a", "b"]
+        ), mock.patch.object(
+            AutoRecorderStateStore,
+            "from_dashboard_dir",
+            return_value=store,
+        ), mock.patch.object(
+            manager, "start_recording_termination", return_value=False
+        ):
+            stopped = self.client.post(
+                f"/api/live/record/{job_id}/stop",
+                headers=self.csrf_headers,
+            )
+
+        checker = mock.Mock(
+            side_effect=lambda streamer, _settings: {
+                "state": "live",
+                "streamer": streamer,
+                "stream_id": "stream-A" if streamer == "a" else "stream-B",
+            }
+        )
+        starter = mock.Mock()
+        coordinator = AutoRecorderCoordinator(
+            settings_provider=lambda: settings,
+            streamer_provider=lambda _settings: ["a", "b"],
+            live_status_checker=checker,
+            state_store=store,
+            recording_starter=starter,
+            recording_jobs_provider=manager.snapshot_jobs,
+        )
+        result = coordinator.run_once()
+
+        self.assertEqual(stopped.status_code, 202)
+        self.assertEqual(result["action"], "state_persistence_failed")
+        self.assertEqual(result["reason"], "state_persistence_failed")
+        self.assertNotIn("simulated", json.dumps(result))
+        checker.assert_not_called()
+        starter.assert_not_called()
+        self.assertEqual(
+            store.get_session("a")["disposition"], "pending"
+        )
+        self.assertIsNone(store.get_session("b"))
+        manager.finalize_recording_job(
+            job_id,
+            claimed["item_id"],
+            state="failed",
+            returncode=-2,
+            completion_reason="stop_failed",
+        )
 
     def test_jobs_api_exposes_safe_recording_fields_not_process_state(self):
         manager = dashboard._job_manager_for_compatibility()

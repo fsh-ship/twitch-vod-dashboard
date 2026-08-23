@@ -319,7 +319,7 @@ class DownloadWorkerDependencies:
 class RecordingWorkerDependencies:
     load_settings: Callable[[], Dict[str, Any]]
     append_log: Callable[[str, str], None]
-    build_recording_command: Callable[[str, Dict[str, Any]], list[str]]
+    build_recording_command: Callable[..., list[str]]
     download_directory: Callable[[Dict[str, Any]], Path]
     resolve_completed_output: Callable[[Any, Dict[str, Any]], str]
     output_marker: str
@@ -1717,7 +1717,9 @@ def run_recording_job(
         settings["quality"] = str(
             job.get("quality") or settings.get("quality") or "source/best"
         )
-        command = dependencies.build_recording_command(streamer, settings)
+        command = dependencies.build_recording_command(
+            streamer, settings, attempt=int(job.get("attempt") or 1)
+        )
         dependencies.append_log(job_id, f"Recording started for {streamer}.")
         process = dependencies.popen(
             command,

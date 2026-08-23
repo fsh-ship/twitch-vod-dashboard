@@ -411,18 +411,31 @@ def run_ytdlp_live_status(
     }
 
 
-def live_recording_output_template(streamer: str) -> str:
+def live_recording_output_template(streamer: str, *, attempt: int = 1) -> str:
     """Return the fixed, server-controlled relative output template."""
     canonical_login = _canonical_live_streamer_login(streamer)
     if canonical_login != str(streamer or "").strip():
         raise ValueError("A normalized Twitch streamer login is required.")
-    return f"{canonical_login}/{LIVE_RECORDING_FILENAME_TEMPLATE}"
+    if (
+        isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or attempt < 1
+        or attempt > 1000
+    ):
+        raise ValueError("A valid recording attempt is required.")
+    filename = LIVE_RECORDING_FILENAME_TEMPLATE
+    if attempt > 1:
+        filename = filename.replace(
+            ".%(ext)s", f" - RETRY {attempt}.%(ext)s"
+        )
+    return f"{canonical_login}/{filename}"
 
 
 def build_live_recording_command(
     streamer: str,
     settings: Dict[str, Any],
     *,
+    attempt: int = 1,
     download_directory: Path,
     command_factory: Optional[Callable[[], List[str]]] = None,
     cookie_args_factory: Optional[
@@ -430,7 +443,9 @@ def build_live_recording_command(
     ] = None,
 ) -> List[str]:
     """Build one read-only-input Twitch live-recording command."""
-    output_template = live_recording_output_template(streamer)
+    output_template = live_recording_output_template(
+        streamer, attempt=attempt
+    )
     base_command, cookie_arguments = _command_parts(
         settings, command_factory, cookie_args_factory
     )

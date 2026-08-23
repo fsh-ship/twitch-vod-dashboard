@@ -910,7 +910,7 @@ class RecordingWorkerTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def create_job(self):
+    def create_job(self, *, attempt=1):
         return self.manager.create_recording_job(
             "nika_livetv",
             stream_id="987654321",
@@ -918,6 +918,8 @@ class RecordingWorkerTests(unittest.TestCase):
             live_started_at="2026-08-23T18:00:00Z",
             quality="1080p60/source/best",
             output_name="nika_livetv/live-template.%(ext)s",
+            origin="auto" if attempt > 1 else "manual",
+            attempt=attempt,
         )
 
     def dependencies(
@@ -929,9 +931,10 @@ class RecordingWorkerTests(unittest.TestCase):
     ):
         process_calls = []
 
-        def build_command(streamer, settings):
+        def build_command(streamer, settings, *, attempt=1):
             self.assertEqual(streamer, "nika_livetv")
             self.assertEqual(settings["quality"], "1080p60/source/best")
+            self.assertEqual(attempt, self.manager.jobs[job_id]["attempt"])
             return ["python", "-m", "yt_dlp", streamer]
 
         def resolve_output(raw, _settings):
@@ -1009,6 +1012,15 @@ class RecordingWorkerTests(unittest.TestCase):
         self.assertNotIn("shell", kwargs)
         for key, value in download_process_group_options().items():
             self.assertEqual(kwargs[key], value)
+
+    def test_retry_attempt_reaches_recording_command_builder(self):
+        job_id = self.create_job(attempt=2)
+        dependencies, process_calls = self.dependencies(
+            job_id, [], returncode=9
+        )
+        run_recording_job(job_id, self.manager, dependencies)
+        self.assertEqual(self.manager.jobs[job_id]["attempt"], 2)
+        self.assertEqual(len(process_calls), 1)
 
     def test_nonzero_returncode_fails_and_releases_process_reference(self):
         job_id = self.create_job()
