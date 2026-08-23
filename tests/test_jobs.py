@@ -1944,6 +1944,42 @@ class AppJobCompatibilityTests(unittest.TestCase):
             ["PLAYLIST_A", "PLAYLIST_B"],
         )
 
+    def test_live_recording_upload_freezes_streamer_profile_playlist(self):
+        configured = {
+            "youtube_playlist_id": "GLOBAL",
+            "streamer_profiles": {
+                "nika_livetv": {"youtube_playlist_id": "NIKA_PLAYLIST"}
+            },
+            "youtube_uploaded_files": [],
+        }
+        metadata = {
+            "streamer": "nika_livetv",
+            "date_de": "23.08.2026",
+            "title": "The actual broadcast title",
+            "vod_id": "",
+            "size_bytes": 100,
+            "size_gb": 0.0,
+        }
+        with mock.patch.object(
+            dashboard, "load_settings", return_value=configured
+        ), mock.patch.object(
+            dashboard,
+            "safe_local_video_path",
+            side_effect=lambda raw, _settings: Path(raw),
+        ), mock.patch.object(
+            dashboard, "local_video_metadata_payload", return_value=metadata
+        ), mock.patch.object(
+            dashboard.JOB_MANAGER, "start_worker"
+        ):
+            job_id = dashboard.create_upload_job(
+                ["C:/media/live-recording.mp4"]
+            )
+
+        item = dashboard.jobs[job_id]["item_metadata"][0]
+        self.assertEqual(item["streamer"], "nika_livetv")
+        self.assertEqual(item["vod_id"], "")
+        self.assertEqual(item["youtube_playlist_id"], "NIKA_PLAYLIST")
+
     def test_create_upload_job_freezes_explicit_no_playlist_per_item(self):
         configured = {
             "youtube_playlist_id": "GLOBAL",

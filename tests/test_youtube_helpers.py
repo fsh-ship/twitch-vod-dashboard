@@ -262,6 +262,115 @@ class LocalYouTubeHelperTests(unittest.TestCase):
                 )
                 self.assertEqual(metadata["streamer"], expected)
 
+    def test_live_recording_uses_broadcast_title_without_vod_id(self):
+        video = self.make_video(
+            "20260823 - Nika - LIVE - Nika (live) [9876543210].mp4",
+            folder="nika_livetv",
+        )
+        live_info = {
+            "id": "9876543210",
+            "title": "Nika (live)",
+            "description": "The actual broadcast title",
+            "uploader_id": "nika_livetv",
+            "uploader": "Nika",
+            "channel": "Nika",
+            "upload_date": "20260823",
+            "duration": 90,
+            "webpage_url": "https://www.twitch.tv/nika_livetv",
+            "original_url": "https://www.twitch.tv/nika_livetv",
+            "is_live": True,
+            "live_status": "is_live",
+        }
+        self.write_info(video, live_info)
+
+        metadata = self.metadata(video)
+
+        self.assertEqual(metadata["title"], "The actual broadcast title")
+        self.assertEqual(metadata["streamer"], "nika_livetv")
+        self.assertEqual(metadata["vod_id"], "")
+        self.assertEqual(metadata["url"], "https://www.twitch.tv/nika_livetv")
+        self.assertNotIn("/videos/9876543210", metadata["url"])
+
+    def test_live_recording_preserves_source_url_without_synthesizing(self):
+        video = self.make_video(
+            "20260823 - Nika - LIVE - Nika (live) [9876543210].mp4",
+            folder="nika_livetv",
+        )
+        base_info = {
+            "id": "9876543210",
+            "title": "Nika (live)",
+            "description": "Broadcast title",
+            "uploader_id": "nika_livetv",
+            "upload_date": "20260823",
+            "is_live": True,
+            "live_status": "is_live",
+        }
+
+        with self.subTest("original URL is retained"):
+            metadata = self.metadata(
+                video,
+                info_loader=lambda _path: {
+                    **base_info,
+                    "original_url": "https://www.twitch.tv/nika_livetv",
+                },
+            )
+            self.assertEqual(
+                metadata["url"], "https://www.twitch.tv/nika_livetv"
+            )
+
+        with self.subTest("missing source URL stays empty"):
+            metadata = self.metadata(
+                video, info_loader=lambda _path: dict(base_info)
+            )
+            self.assertEqual(metadata["url"], "")
+            self.assertEqual(metadata["vod_id"], "")
+
+    def test_normal_twitch_vod_keeps_existing_title_id_and_url_behavior(self):
+        video = self.make_video()
+        self.write_info(video)
+
+        metadata = self.metadata(video)
+
+        self.assertEqual(metadata["title"], "A Great Stream")
+        self.assertEqual(metadata["vod_id"], "1234567890")
+        self.assertEqual(
+            metadata["url"], "https://www.twitch.tv/videos/1234567890"
+        )
+
+    def test_live_recording_can_be_prepared_with_live_metadata(self):
+        video = self.make_video(
+            "20260823 - Nika - LIVE - Nika (live) [9876543210].mp4",
+            folder="nika_livetv",
+        )
+        live_info = {
+            "id": "9876543210",
+            "title": "Nika (live)",
+            "description": "The actual broadcast title",
+            "uploader_id": "nika_livetv",
+            "upload_date": "20260823",
+            "duration": 90,
+            "webpage_url": "https://www.twitch.tv/nika_livetv",
+            "is_live": True,
+            "live_status": "is_live",
+        }
+        self.write_info(video, live_info)
+        settings = {**self.settings, "manual_upload_rename_video": False}
+
+        prepared = self.prepare(video, settings)
+        persisted = json.loads(
+            prepared.with_suffix(".youtube.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(prepared, video)
+        self.assertEqual(
+            persisted["title"],
+            "nika_livetv VOD - 23.08.2026 - The actual broadcast title",
+        )
+        self.assertEqual(persisted["meta"]["vod_id"], "")
+        self.assertEqual(
+            persisted["meta"]["url"], "https://www.twitch.tv/nika_livetv"
+        )
+
     def test_metadata_and_templates_preserve_date_de_compatibility(self):
         video = self.make_video()
         self.write_info(video)

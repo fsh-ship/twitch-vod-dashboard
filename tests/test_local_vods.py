@@ -98,6 +98,25 @@ class LocalVodServiceTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    @staticmethod
+    def live_info_payload(**updates):
+        payload = {
+            "id": "9876543210",
+            "title": "Nika (live)",
+            "description": "The actual broadcast title",
+            "uploader_id": "nika_livetv",
+            "uploader": "Nika",
+            "channel": "Nika",
+            "upload_date": "20260823",
+            "duration": 90,
+            "webpage_url": "https://www.twitch.tv/nika_livetv",
+            "original_url": "https://www.twitch.tv/nika_livetv",
+            "is_live": True,
+            "live_status": "is_live",
+        }
+        payload.update(updates)
+        return payload
+
     def metadata_loader(self, path, settings):
         return youtube.metadata_from_path(
             path,
@@ -219,6 +238,34 @@ class LocalVodServiceTests(unittest.TestCase):
         self.assertEqual(payload["status"], "Ready")
         self.assertIsInstance(payload["size_bytes"], int)
         self.assertIsInstance(payload["size_gb"], float)
+
+    def test_finished_live_recording_is_ready_with_its_exact_info_sidecar(self):
+        video = self.make_video(
+            "nika_livetv/20260823 - Nika - LIVE - Nika (live) "
+            "[9876543210].mp4"
+        )
+        info_path = video.with_suffix(".info.json")
+        info_path.write_text(
+            json.dumps(self.live_info_payload(), ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        result = self.enumerate()
+
+        self.assertEqual(len(result["videos"]), 1)
+        payload = result["videos"][0]
+        self.assertEqual(payload["path"], str(video))
+        self.assertEqual(payload["status"], "Ready")
+        self.assertEqual(payload["streamer"], "nika_livetv")
+        self.assertEqual(payload["title"], "The actual broadcast title")
+        self.assertEqual(payload["vod_id"], "")
+        self.assertEqual(
+            payload["youtube_title"],
+            "nika_livetv VOD - 23.08.2026 - The actual broadcast title",
+        )
+        self.assertIn(
+            info_path.resolve(), self.policy.local_video_sidecars(video)
+        )
 
     def test_queue_keeps_original_title_and_displays_sanitized_youtube_title(self):
         video = self.make_video(
@@ -345,6 +392,17 @@ class LocalVodServiceTests(unittest.TestCase):
         result = self.enumerate()
 
         self.assertEqual([item["path"] for item in result["videos"]], [str(ready)])
+
+    def test_live_recording_part_file_is_not_discovered(self):
+        partial = self.make_video(
+            "nika_livetv/20260823 - Nika - LIVE - Nika (live) "
+            "[9876543210].part.mp4"
+        )
+        partial.with_suffix(".info.json").write_text(
+            json.dumps(self.live_info_payload()), encoding="utf-8"
+        )
+
+        self.assertEqual(self.enumerate()["videos"], [])
 
     def test_missing_uploaded_file_is_archive_only_and_not_uploadable(self):
         missing = (self.media_root / "Example" / "removed.mp4").resolve()

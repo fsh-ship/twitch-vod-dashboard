@@ -791,6 +791,13 @@ def parse_info_json(
     return {}
 
 
+def _is_live_recording_info(info: Dict[str, Any]) -> bool:
+    """Identify metadata captured while a source was actively live."""
+
+    live_status = str(info.get("live_status") or "").strip().lower()
+    return info.get("is_live") is True or live_status == "is_live"
+
+
 def metadata_from_path(
     path: Path,
     settings: Dict[str, Any],
@@ -812,8 +819,9 @@ def metadata_from_path(
         )
     )
     filename_title = title_builder(path)
-    vod_id = str(info.get("id") or "")
-    if not vod_id:
+    is_live_recording = _is_live_recording_info(info)
+    vod_id = "" if is_live_recording else str(info.get("id") or "")
+    if not vod_id and not is_live_recording:
         match = re.search(r"\[(\d{6,})\]", filename_title) or re.search(
             r"videos[\\/](\d{6,})", str(path)
         )
@@ -833,6 +841,8 @@ def metadata_from_path(
         except Exception:
             streamer = ""
     title = str(info.get("title") or filename_title)
+    if is_live_recording:
+        title = str(info.get("description") or title).strip() or title
     date_raw = entry_date_parser(info)
     if not date_raw:
         match = re.search(
