@@ -817,40 +817,121 @@ def resolve_completed_recording_output(
     return path.relative_to(policy.media_root).as_posix()
 
 
+class RecordingStartError(RuntimeError):
+    """A stable internal recording-start failure for HTTP or future callers."""
+
+    def __init__(self, reason: str, streamer: str = "") -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.streamer = streamer
+
+
 def create_recording_job(
-    streamer: str, live_metadata: Dict[str, Any]
+    streamer: str,
+    live_metadata: Mapping[str, Any],
+    *,
+    settings: Optional[Dict[str, Any]] = None,
+    origin: str = "manual",
+    attempt: int = 1,
 ) -> str:
-    """Create and start one internal recording; no HTTP route exposes this."""
-    if not isinstance(live_metadata, dict):
-        raise RuntimeError("Live Twitch metadata is required.")
+    """Construct and start an already-validated internal recording job."""
+    resolved_settings = settings if settings is not None else load_settings()
+    manager = _job_manager_for_compatibility()
+    job_id = manager.create_recording_job(
+        streamer,
+        stream_id=str(live_metadata.get("stream_id") or ""),
+        title=str(live_metadata.get("title") or ""),
+        live_started_at=live_metadata.get("started_at"),
+        quality=str(resolved_settings.get("quality") or "source/best"),
+        output_name=dashboard_twitch.live_recording_output_template(
+            streamer
+        ),
+        origin=origin,
+        attempt=attempt,
+        counter_getter=lambda: job_counter,
+        counter_setter=_set_job_counter,
+    )
+    manager.start_worker(run_recording_job, job_id)
+    return job_id
+
+
+def start_live_recording(
+    streamer: Any,
+    *,
+    live_metadata: Optional[Mapping[str, Any]] = None,
+    origin: str = "manual",
+    attempt: int = 1,
+) -> str:
+    """Validate, reserve, and start one manual or future automatic recording."""
     canonical_login = dashboard_settings.canonical_streamer_login(streamer)
     if not canonical_login:
-        raise RuntimeError("A valid Twitch streamer is required.")
+        raise RecordingStartError("invalid_streamer")
+
+    try:
+        normalized_origin, normalized_attempt = (
+            dashboard_jobs.validate_recording_job_metadata(origin, attempt)
+        )
+    except dashboard_jobs.RecordingJobMetadataError as exc:
+        raise RecordingStartError(exc.reason, canonical_login) from exc
+
     settings = load_settings()
     configured_logins = {
         dashboard_settings.canonical_streamer_login(name)
         for name in read_streamers(settings)
     }
     if canonical_login not in configured_logins:
-        raise RuntimeError("The Twitch streamer is not configured.")
-    if str(live_metadata.get("state") or "") != "live":
-        raise RuntimeError("The Twitch streamer is not currently live.")
+        raise RecordingStartError(
+            "streamer_not_configured", canonical_login
+        )
 
     manager = _job_manager_for_compatibility()
-    job_id = manager.create_recording_job(
-        canonical_login,
-        stream_id=str(live_metadata.get("stream_id") or ""),
-        title=str(live_metadata.get("title") or ""),
-        live_started_at=live_metadata.get("started_at"),
-        quality=str(settings.get("quality") or "source/best"),
-        output_name=dashboard_twitch.live_recording_output_template(
-            canonical_login
+    if manager.has_pending_or_active_recording():
+        raise RecordingStartError("recording_conflict", canonical_login)
+
+    resolved_live_metadata = live_metadata
+    if resolved_live_metadata is None:
+        try:
+            resolved_live_metadata = run_ytdlp_live_status(
+                canonical_login, settings
+            )
+        except Exception as exc:
+            log_line(f"Recording live check failed for {canonical_login}.")
+            raise RecordingStartError(
+                "live_status_unavailable", canonical_login
+            ) from exc
+    if not isinstance(resolved_live_metadata, Mapping):
+        raise RecordingStartError(
+            "live_status_unavailable", canonical_login
+        )
+    if str(resolved_live_metadata.get("state") or "") != "live":
+        raise RecordingStartError("streamer_not_live", canonical_login)
+
+    safe_live_metadata = {
+        "stream_id": str(resolved_live_metadata.get("stream_id") or ""),
+        "title": str(resolved_live_metadata.get("title") or ""),
+        "started_at": (
+            str(resolved_live_metadata.get("started_at"))
+            if resolved_live_metadata.get("started_at") is not None
+            else None
         ),
-        counter_getter=lambda: job_counter,
-        counter_setter=_set_job_counter,
-    )
-    manager.start_worker(run_recording_job, job_id)
-    return job_id
+    }
+    try:
+        return create_recording_job(
+            canonical_login,
+            safe_live_metadata,
+            settings=settings,
+            origin=normalized_origin,
+            attempt=normalized_attempt,
+        )
+    except dashboard_jobs.RecordingConflictError as exc:
+        raise RecordingStartError(
+            "recording_conflict", canonical_login
+        ) from exc
+    except Exception as exc:
+        log_line(f"Recording job creation failed for {canonical_login}.")
+        raise RecordingStartError(
+            "recording_start_failed", canonical_login
+        ) from exc
 
 
 def run_recording_job(job_id: str) -> None:
@@ -1524,45 +1605,35 @@ def api_start_live_recording():
     if set(data) - {"streamer"}:
         return jsonify({"error": "unsupported_recording_parameters"}), 400
 
+    try:
+        job_id = start_live_recording(data.get("streamer"))
+    except RecordingStartError as exc:
+        status_codes = {
+            "invalid_streamer": 400,
+            "streamer_not_configured": 404,
+            "streamer_not_live": 409,
+            "recording_conflict": 409,
+            "live_status_unavailable": 502,
+            "recording_start_failed": 500,
+        }
+        public_reason = (
+            exc.reason
+            if exc.reason in status_codes
+            else "recording_start_failed"
+        )
+        payload = {"error": public_reason}
+        if public_reason in {
+            "streamer_not_configured",
+            "streamer_not_live",
+            "live_status_unavailable",
+        }:
+            payload["streamer"] = exc.streamer
+        return jsonify(payload), status_codes[public_reason]
+
+    manager = _job_manager_for_compatibility()
     canonical_login = dashboard_settings.canonical_streamer_login(
         data.get("streamer")
     )
-    if not canonical_login:
-        return jsonify({"error": "invalid_streamer"}), 400
-    settings = load_settings()
-    configured_logins = {
-        dashboard_settings.canonical_streamer_login(streamer)
-        for streamer in read_streamers(settings)
-    }
-    if canonical_login not in configured_logins:
-        return jsonify(
-            {"error": "streamer_not_configured", "streamer": canonical_login}
-        ), 404
-
-    manager = _job_manager_for_compatibility()
-    if manager.has_pending_or_active_recording():
-        return jsonify({"error": "recording_conflict"}), 409
-
-    try:
-        live_metadata = run_ytdlp_live_status(canonical_login, settings)
-    except Exception as exc:
-        log_line(f"Recording live check failed for {canonical_login}: {exc}")
-        return jsonify(
-            {"error": "live_status_unavailable", "streamer": canonical_login}
-        ), 502
-    if live_metadata.get("state") != "live":
-        return jsonify(
-            {"error": "streamer_not_live", "streamer": canonical_login}
-        ), 409
-
-    try:
-        job_id = create_recording_job(canonical_login, live_metadata)
-    except RuntimeError as exc:
-        if "already queued or active" in str(exc):
-            return jsonify({"error": "recording_conflict"}), 409
-        log_line(f"Recording job creation failed for {canonical_login}: {exc}")
-        return jsonify({"error": "recording_start_failed"}), 500
-
     job = manager.get_job(job_id) or {
         "id": job_id,
         "state": "queued",

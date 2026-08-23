@@ -1141,11 +1141,12 @@ class TwitchContractTests(IsolatedDashboardTestCase):
         self.assertNotIn("secret.invalid", serialized)
         self.assertNotIn("DO-NOT-LEAK", serialized)
 
-    def test_internal_recording_creation_uses_allowlist_and_starts_worker(self):
+    def test_shared_recording_start_uses_supplied_safe_metadata_without_lookup(self):
         (self.runtime_dir / "streamer.txt").write_text(
             "Nika_LiveTV\n", encoding="utf-8"
         )
         manager = mock.Mock()
+        manager.has_pending_or_active_recording.return_value = False
         manager.create_recording_job.return_value = "recording-7"
         configured = self.settings(quality="1080p60/source/best")
         live_metadata = {
@@ -1162,9 +1163,12 @@ class TwitchContractTests(IsolatedDashboardTestCase):
             dashboard,
             "_job_manager_for_compatibility",
             return_value=manager,
-        ):
-            job_id = dashboard.create_recording_job(
-                "@NIKA_LIVETV", live_metadata
+        ), mock.patch.object(dashboard, "run_ytdlp_live_status") as live_check:
+            job_id = dashboard.start_live_recording(
+                "@NIKA_LIVETV",
+                live_metadata=live_metadata,
+                origin="auto",
+                attempt=1,
             )
 
         self.assertEqual(job_id, "recording-7")
@@ -1175,24 +1179,71 @@ class TwitchContractTests(IsolatedDashboardTestCase):
         self.assertEqual(kwargs["stream_id"], "987654321")
         self.assertEqual(kwargs["title"], "Actual stream title")
         self.assertEqual(kwargs["quality"], "1080p60/source/best")
+        self.assertEqual(kwargs["origin"], "auto")
+        self.assertEqual(kwargs["attempt"], 1)
         self.assertNotIn("manifest_url", kwargs)
         self.assertNotIn("signed.invalid", json.dumps(kwargs, default=str))
+        live_check.assert_not_called()
         manager.start_worker.assert_called_once_with(
             dashboard.run_recording_job, "recording-7"
         )
 
-    def test_internal_recording_creation_rejects_unconfigured_or_offline(self):
+    def test_shared_recording_start_preserves_explicit_higher_attempt(self):
         (self.runtime_dir / "streamer.txt").write_text(
             "nika_livetv\n", encoding="utf-8"
         )
-        with self.assertRaisesRegex(RuntimeError, "not configured"):
-            dashboard.create_recording_job(
-                "other_streamer", {"state": "live"}
+        manager = dashboard._job_manager_for_compatibility()
+        with mock.patch.object(manager, "start_worker"):
+            job_id = dashboard.start_live_recording(
+                "nika_livetv",
+                live_metadata={"state": "live", "stream_id": "stream-1"},
+                origin="auto",
+                attempt=4,
             )
-        with self.assertRaisesRegex(RuntimeError, "not currently live"):
-            dashboard.create_recording_job(
-                "nika_livetv", {"state": "offline"}
+
+        self.assertEqual(manager.jobs[job_id]["origin"], "auto")
+        self.assertEqual(manager.jobs[job_id]["attempt"], 4)
+
+    def test_shared_recording_start_rejects_invalid_internal_metadata(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "nika_livetv\n", encoding="utf-8"
+        )
+        cases = (
+            ({"origin": "scheduled"}, "invalid_origin"),
+            ({"attempt": 0}, "invalid_attempt"),
+            ({"attempt": 1001}, "invalid_attempt"),
+            ({"attempt": "2"}, "invalid_attempt"),
+        )
+        with mock.patch.object(dashboard, "run_ytdlp_live_status") as live_check:
+            for kwargs, expected_reason in cases:
+                with self.subTest(kwargs=kwargs), self.assertRaises(
+                    dashboard.RecordingStartError
+                ) as raised:
+                    dashboard.start_live_recording(
+                        "nika_livetv",
+                        live_metadata={"state": "live"},
+                        **kwargs,
+                    )
+                self.assertEqual(raised.exception.reason, expected_reason)
+        live_check.assert_not_called()
+        self.assertEqual(dashboard.jobs, {})
+
+    def test_shared_recording_start_rejects_unconfigured_or_offline(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "nika_livetv\n", encoding="utf-8"
+        )
+        with self.assertRaises(dashboard.RecordingStartError) as unconfigured:
+            dashboard.start_live_recording(
+                "other_streamer", live_metadata={"state": "live"}
             )
+        with self.assertRaises(dashboard.RecordingStartError) as offline:
+            dashboard.start_live_recording(
+                "nika_livetv", live_metadata={"state": "offline"}
+            )
+        self.assertEqual(
+            unconfigured.exception.reason, "streamer_not_configured"
+        )
+        self.assertEqual(offline.exception.reason, "streamer_not_live")
 
     def test_recording_output_resolution_is_relative_complete_and_contained(self):
         recording = self.media_root / "nika_livetv" / "recording.mp4"
@@ -1259,6 +1310,8 @@ class TwitchContractTests(IsolatedDashboardTestCase):
         self.assertEqual(job["title"], "Actual stream title")
         self.assertEqual(job["live_started_at"], "2026-08-23T18:00:00Z")
         self.assertEqual(job["quality"], self.settings()["quality"])
+        self.assertEqual(job["origin"], "manual")
+        self.assertEqual(job["attempt"], 1)
         start_worker.assert_called_once_with(
             dashboard.run_recording_job, "1"
         )
@@ -1293,7 +1346,7 @@ class TwitchContractTests(IsolatedDashboardTestCase):
             side_effect=RuntimeError(
                 "https://signed.invalid/master.m3u8?token=DO-NOT-LEAK"
             ),
-        ), mock.patch.object(dashboard, "log_line"):
+        ), mock.patch.object(dashboard, "log_line") as log:
             response = self.client.post(
                 "/api/live/record",
                 json={"streamer": "nika_livetv"},
@@ -1301,9 +1354,18 @@ class TwitchContractTests(IsolatedDashboardTestCase):
             )
 
         self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.get_json()["error"], "live_status_unavailable"
+        )
         serialized = json.dumps(response.get_json())
         self.assertNotIn("signed.invalid", serialized)
         self.assertNotIn("DO-NOT-LEAK", serialized)
+        self.assertNotIn(
+            "signed.invalid", json.dumps(log.call_args_list, default=str)
+        )
+        self.assertNotIn(
+            "DO-NOT-LEAK", json.dumps(log.call_args_list, default=str)
+        )
 
     def test_start_recording_api_validates_allowlist_and_input_surface(self):
         (self.runtime_dir / "streamer.txt").write_text(
@@ -1332,11 +1394,68 @@ class TwitchContractTests(IsolatedDashboardTestCase):
         )
 
         self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(invalid.get_json()["error"], "invalid_streamer")
         self.assertEqual(missing.status_code, 404)
+        self.assertEqual(
+            missing.get_json()["error"], "streamer_not_configured"
+        )
         self.assertEqual(extra.status_code, 400)
+        self.assertEqual(
+            extra.get_json()["error"],
+            "unsupported_recording_parameters",
+        )
         serialized = json.dumps(extra.get_json())
         self.assertNotIn("attacker.invalid", serialized)
         self.assertNotIn("SECRET", serialized)
+
+    def test_start_recording_api_rejects_internal_only_fields(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "nika_livetv\n", encoding="utf-8"
+        )
+        internal_fields = {
+            "origin": "auto",
+            "attempt": 2,
+            "live_metadata": {"state": "live", "stream_id": "injected"},
+        }
+        with mock.patch.object(dashboard, "run_ytdlp_live_status") as live_check:
+            for field, value in internal_fields.items():
+                with self.subTest(field=field):
+                    response = self.client.post(
+                        "/api/live/record",
+                        json={"streamer": "nika_livetv", field: value},
+                        headers=self.csrf_headers,
+                    )
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(
+                        response.get_json()["error"],
+                        "unsupported_recording_parameters",
+                    )
+        live_check.assert_not_called()
+        self.assertEqual(dashboard.jobs, {})
+
+    def test_start_recording_api_maps_job_start_failure_to_generic_500(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "nika_livetv\n", encoding="utf-8"
+        )
+        with mock.patch.object(
+            dashboard,
+            "run_ytdlp_live_status",
+            return_value={"state": "live", "stream_id": "stream-1"},
+        ), mock.patch.object(
+            dashboard,
+            "create_recording_job",
+            side_effect=RuntimeError("sensitive worker failure"),
+        ), mock.patch.object(dashboard, "log_line"):
+            response = self.client.post(
+                "/api/live/record",
+                json={"streamer": "nika_livetv"},
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            response.get_json(), {"error": "recording_start_failed"}
+        )
 
     def test_start_recording_api_rejects_second_recording_before_live_check(self):
         (self.runtime_dir / "streamer.txt").write_text(
@@ -1354,6 +1473,26 @@ class TwitchContractTests(IsolatedDashboardTestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.get_json()["error"], "recording_conflict")
         live_check.assert_not_called()
+
+    def test_internal_auto_start_respects_existing_recording_lane(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "nika_livetv\n", encoding="utf-8"
+        )
+        manager = dashboard._job_manager_for_compatibility()
+        manager.create_recording_job("nika_livetv")
+
+        with mock.patch.object(dashboard, "run_ytdlp_live_status") as live_check:
+            with self.assertRaises(dashboard.RecordingStartError) as raised:
+                dashboard.start_live_recording(
+                    "nika_livetv",
+                    live_metadata={"state": "live", "stream_id": "stream-2"},
+                    origin="auto",
+                    attempt=1,
+                )
+
+        self.assertEqual(raised.exception.reason, "recording_conflict")
+        live_check.assert_not_called()
+        self.assertEqual(len(manager.jobs), 1)
 
     def test_stop_recording_api_is_fast_idempotent_and_recording_only(self):
         manager = dashboard._job_manager_for_compatibility()
@@ -1460,6 +1599,8 @@ class TwitchContractTests(IsolatedDashboardTestCase):
             title="Safe title",
             stream_id="987654321",
         )
+        download_id = manager.create_download_job(["vod"], "Download")
+        upload_id = manager.create_upload_job(["video.mp4"], "Upload")
         response = self.client.get("/api/jobs")
 
         self.assertEqual(response.status_code, 200)
@@ -1476,8 +1617,20 @@ class TwitchContractTests(IsolatedDashboardTestCase):
             "output_complete",
             "output_path",
             "completion_reason",
+            "origin",
+            "attempt",
         ):
             self.assertIn(key, recording)
+        self.assertEqual(recording["origin"], "manual")
+        self.assertEqual(recording["attempt"], 1)
+        non_recording = {
+            job["id"]: job
+            for job in response.get_json()["jobs"]
+            if job["id"] in {download_id, upload_id}
+        }
+        for job in non_recording.values():
+            self.assertNotIn("origin", job)
+            self.assertNotIn("attempt", job)
         serialized = json.dumps(recording)
         self.assertNotIn("_recording_process", serialized)
         self.assertNotIn("signed", serialized)

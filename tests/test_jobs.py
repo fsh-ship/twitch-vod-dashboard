@@ -16,6 +16,7 @@ from vod_dashboard.jobs import (
     RECORDING_STOP_RESULT_GRACEFUL,
     RECORDING_STOP_RESULT_KILLED,
     RECORDING_TERMINATE_TIMEOUT_SECONDS,
+    RecordingConflictError,
     RecordingWorkerDependencies,
     UploadWorkerDependencies,
     ffmpeg_download_metrics,
@@ -159,6 +160,8 @@ class JobManagerTests(unittest.TestCase):
 
         self.assertEqual(job["type"], "recording")
         self.assertEqual(job["streamer"], "nika_livetv")
+        self.assertEqual(job["origin"], "manual")
+        self.assertEqual(job["attempt"], 1)
         self.assertEqual(job["stream_id"], "987654321")
         self.assertEqual(job["title"], "Actual stream title")
         self.assertEqual(job["live_started_at"], "2026-08-23T18:00:00Z")
@@ -179,6 +182,58 @@ class JobManagerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "already queued or active"):
             manager.create_recording_job("another_streamer")
+
+    def test_recording_origin_and_attempt_are_validated_and_frozen(self):
+        manager = self.manager()
+        job_id = manager.create_recording_job(
+            "nika_livetv", origin="auto", attempt=3
+        )
+
+        self.assertEqual(manager.jobs[job_id]["origin"], "auto")
+        self.assertEqual(manager.jobs[job_id]["attempt"], 3)
+        invalid_cases = (
+            ({"origin": "scheduled"}, "invalid_origin"),
+            ({"attempt": 0}, "invalid_attempt"),
+            ({"attempt": 1001}, "invalid_attempt"),
+            ({"attempt": True}, "invalid_attempt"),
+            ({"attempt": "2"}, "invalid_attempt"),
+        )
+        for kwargs, expected in invalid_cases:
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(
+                ValueError, expected
+            ):
+                manager.create_recording_job("other_streamer", **kwargs)
+
+    def test_concurrent_recording_creation_reserves_exactly_one_job(self):
+        manager = self.manager()
+        barrier = threading.Barrier(2)
+        created = []
+        conflicts = []
+        result_lock = threading.Lock()
+
+        def create_one(streamer):
+            barrier.wait()
+            try:
+                job_id = manager.create_recording_job(streamer)
+            except RecordingConflictError as exc:
+                with result_lock:
+                    conflicts.append(exc)
+            else:
+                with result_lock:
+                    created.append(job_id)
+
+        threads = [
+            threading.Thread(target=create_one, args=(streamer,))
+            for streamer in ("first_streamer", "second_streamer")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(len(manager.jobs), 1)
 
     def test_upload_jobs_store_their_explicit_playlist_independently(self):
         manager = self.manager()

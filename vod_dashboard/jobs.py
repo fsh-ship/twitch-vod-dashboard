@@ -30,6 +30,8 @@ RECORDING_STOP_RESULT_TERMINATED = "terminated"
 RECORDING_STOP_RESULT_KILLED = "killed"
 RECORDING_STOP_RESULT_ALREADY_EXITED = "already_exited"
 RECORDING_STOP_RESULT_FAILED = "failed"
+RECORDING_ORIGINS = frozenset({"manual", "auto"})
+MAX_RECORDING_ATTEMPT = 1000
 ITEM_STATES = {
     "queued",
     "running",
@@ -68,6 +70,34 @@ _CLASSIC_DOWNLOAD_RE = re.compile(
     r"(?:.*?\bETA\s+([^\s]+))?",
     re.IGNORECASE,
 )
+
+
+class RecordingConflictError(RuntimeError):
+    """Raised when the exclusive recording lane is already reserved."""
+
+
+class RecordingJobMetadataError(ValueError):
+    """Raised for invalid internal recording origin/attempt metadata."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def validate_recording_job_metadata(
+    origin: Any, attempt: Any
+) -> tuple[str, int]:
+    normalized_origin = str(origin or "").strip()
+    if normalized_origin not in RECORDING_ORIGINS:
+        raise RecordingJobMetadataError("invalid_origin")
+    if (
+        isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or attempt < 1
+        or attempt > MAX_RECORDING_ATTEMPT
+    ):
+        raise RecordingJobMetadataError("invalid_attempt")
+    return normalized_origin, attempt
 
 
 def _clock_value_seconds(value: Any) -> Optional[float]:
@@ -435,6 +465,8 @@ class JobManager:
         live_started_at: Optional[str] = None,
         quality: str = "source/best",
         output_name: str = "",
+        origin: str = "manual",
+        attempt: int = 1,
         counter_getter: Optional[CounterGetter] = None,
         counter_setter: Optional[CounterSetter] = None,
     ) -> str:
@@ -442,12 +474,15 @@ class JobManager:
         canonical_login = str(streamer or "").strip()
         if not canonical_login:
             raise ValueError("A Twitch streamer is required.")
+        normalized_origin, normalized_attempt = (
+            validate_recording_job_metadata(origin, attempt)
+        )
         with self.lock:
             for existing in self.jobs.values():
                 if existing.get("type") != "recording":
                     continue
                 if existing.get("state") in {"queued", "running", "stopping"}:
-                    raise RuntimeError(
+                    raise RecordingConflictError(
                         "A Twitch recording is already queued or active."
                     )
 
@@ -459,6 +494,8 @@ class JobManager:
                 "label": f"Live recording: {canonical_login}",
                 "type": "recording",
                 "streamer": canonical_login,
+                "origin": normalized_origin,
+                "attempt": normalized_attempt,
                 "stream_id": str(stream_id or "").strip(),
                 "title": str(title or "").strip(),
                 "live_started_at": live_started_at,
