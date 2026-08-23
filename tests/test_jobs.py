@@ -89,6 +89,10 @@ class JobManagerTests(unittest.TestCase):
                 "status": "wartet",
                 "state": "queued",
                 "created": "2026-08-11 12:34:56",
+                "created_at": "2026-08-11T12:34:56Z",
+                "updated_at": "2026-08-11T12:34:56Z",
+                "started_at": None,
+                "finished_at": None,
                 "urls": urls,
                 "total_urls": 1,
                 "item_ids": ["1-item-1"],
@@ -103,8 +107,12 @@ class JobManagerTests(unittest.TestCase):
                 "item_total_duration_seconds": [None],
                 "item_resolved": [False],
                 "item_failure_kinds": [""],
+                "item_completion_reasons": [""],
+                "item_recovery_reasons": [""],
                 "item_retry_job_ids": [""],
                 "stop_after_current": False,
+                "completion_reason": "",
+                "recovery_reason": "",
                 "log": [],
                 "returncode": None,
             },
@@ -123,6 +131,10 @@ class JobManagerTests(unittest.TestCase):
                 "status": "wartet",
                 "state": "queued",
                 "created": "2026-08-11 12:34:56",
+                "created_at": "2026-08-11T12:34:56Z",
+                "updated_at": "2026-08-11T12:34:56Z",
+                "started_at": None,
+                "finished_at": None,
                 "urls": ["C:/media/vod.mp4"],
                 "item_ids": ["1-item-1"],
                 "item_states": ["queued"],
@@ -136,9 +148,13 @@ class JobManagerTests(unittest.TestCase):
                 "item_errors": [""],
                 "item_resolved": [False],
                 "item_failure_kinds": [""],
+                "item_completion_reasons": [""],
+                "item_recovery_reasons": [""],
                 "item_retry_job_ids": [""],
                 "item_metadata": [{}],
                 "stop_after_current": False,
+                "completion_reason": "",
+                "recovery_reason": "",
                 "log": [],
                 "returncode": None,
                 "type": "youtube_upload",
@@ -173,8 +189,10 @@ class JobManagerTests(unittest.TestCase):
         self.assertEqual(job["recorded_seconds"], 0.0)
         self.assertEqual(job["completion_reason"], "")
         self.assertEqual(job["state"], "queued")
-        self.assertEqual(job["created_at"], "2026-08-11 12:34:56")
-        self.assertEqual(job["updated_at"], "2026-08-11 12:34:56")
+        self.assertEqual(job["created_at"], "2026-08-11T12:34:56Z")
+        self.assertEqual(job["updated_at"], "2026-08-11T12:34:56Z")
+        self.assertIsNone(job["started_at"])
+        self.assertIsNone(job["finished_at"])
 
     def test_second_pending_recording_is_rejected(self):
         manager = self.manager()

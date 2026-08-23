@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import math
 import os
 from pathlib import Path
@@ -15,6 +15,13 @@ import threading
 import time
 from typing import Any, Callable, Dict, MutableMapping, Optional
 
+from vod_dashboard.job_store import (
+    JobStore,
+    JobStoreError,
+    JobStorePersistenceError,
+    JobStoreValidationError,
+)
+
 
 Job = Dict[str, Any]
 LogCallback = Callable[[str], None]
@@ -23,6 +30,7 @@ CounterSetter = Callable[[int], None]
 
 UPLOAD_SPEED_EMA_ALPHA = 0.3
 MIN_UPLOAD_ETA_SPEED_BPS = 1024.0
+PROGRESS_PERSIST_INTERVAL_SECONDS = 60.0
 RECORDING_GRACEFUL_STOP_TIMEOUT_SECONDS = 30.0
 RECORDING_TERMINATE_TIMEOUT_SECONDS = 15.0
 RECORDING_STOP_RESULT_GRACEFUL = "graceful"
@@ -82,6 +90,14 @@ class RecordingJobMetadataError(ValueError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class JobPersistenceRequiredError(RuntimeError):
+    """Stable internal failure for a required durable-state boundary."""
+
+    def __init__(self, code: str = "persistence_unavailable") -> None:
+        super().__init__("Required job persistence is unavailable.")
+        self.code = code
 
 
 def validate_recording_job_metadata(
@@ -349,12 +365,26 @@ class JobManager:
         counter: int = 0,
         now: Optional[Callable[[], datetime]] = None,
         clock: Optional[Callable[[], float]] = None,
+        job_store: Optional[JobStore] = None,
+        media_root: Optional[Path] = None,
     ) -> None:
         self.jobs = registry if registry is not None else {}
         self.lock = lock if lock is not None else threading.Lock()
         self.counter = counter
         self._now = now or datetime.now
         self._clock = clock or time.time
+        self.job_store = job_store
+        self._media_root = Path(media_root) if media_root is not None else None
+        self._persistence_revision = 0
+        self._last_persistence_result_revision = -1
+        self._last_progress_persist_at: Dict[str, float] = {}
+        self._persistence_health: Dict[str, Any] = {
+            "enabled": job_store is not None,
+            "healthy": None if job_store is None else True,
+            "last_save_at": None,
+            "last_successful_revision": None,
+            "last_error_code": "",
+        }
         self._upload_measurements: Dict[tuple[str, int], Dict[str, Any]] = {}
         self._condition = threading.Condition(self.lock)
         self._lane_paused = {"download": False, "youtube_upload": False}
@@ -386,6 +416,10 @@ class JobManager:
         """Honor app-level aliases that legacy callers may replace."""
         if registry is default.jobs and lock is default.lock:
             return default
+        if default.job_store is not None:
+            # A second manager over aliases would race whole-registry snapshots
+            # through one store. Reuse the authoritative persistent manager.
+            return default
         return cls(registry=registry, lock=lock, counter=counter)
 
     def _next_job_id(
@@ -402,6 +436,194 @@ class JobManager:
 
     def _created_at(self) -> str:
         return self._now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _utc_timestamp(self) -> str:
+        value = self._now()
+        if value.tzinfo is None or value.utcoffset() is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return (
+            value.astimezone(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+
+    def _mark_dirty_locked(
+        self,
+        job: Optional[Job] = None,
+        *,
+        timestamp: Optional[str] = None,
+        started: bool = False,
+    ) -> None:
+        if job is not None:
+            value = timestamp or self._utc_timestamp()
+            job["updated_at"] = value
+            if started and not job.get("started_at"):
+                job["started_at"] = value
+            if job.get("state") in TERMINAL_ITEM_STATES and not job.get(
+                "finished_at"
+            ):
+                job["finished_at"] = value
+        self._persistence_revision += 1
+
+    def _snapshot_for_persistence_locked(self) -> Optional[Dict[str, Any]]:
+        if self.job_store is None:
+            return None
+        return {
+            "jobs": deepcopy(list(self.jobs.values())),
+            "next_job_id": self.counter + 1,
+            "revision": self._persistence_revision,
+        }
+
+    @staticmethod
+    def _persistence_error_code(exc: Exception) -> str:
+        if isinstance(exc, JobStoreValidationError):
+            return "persistence_validation_failed"
+        if isinstance(exc, (JobStorePersistenceError, JobStoreError)):
+            return "persistence_unavailable"
+        return "persistence_unavailable"
+
+    def _record_persistence_result(
+        self,
+        *,
+        healthy: bool,
+        revision: Optional[int] = None,
+        error_code: str = "",
+    ) -> None:
+        with self.lock:
+            effective_revision = (
+                -1 if revision is None else int(revision)
+            )
+            if effective_revision < self._last_persistence_result_revision:
+                return
+            self._last_persistence_result_revision = effective_revision
+            self._persistence_health["healthy"] = healthy
+            self._persistence_health["last_error_code"] = error_code
+            if healthy and self.job_store is not None:
+                status_method = getattr(self.job_store, "status", None)
+                status = status_method() if callable(status_method) else {}
+                self._persistence_health["last_save_at"] = status.get(
+                    "last_save_at"
+                )
+                current = self._persistence_health.get(
+                    "last_successful_revision"
+                )
+                if revision is not None and (
+                    current is None or revision > current
+                ):
+                    self._persistence_health[
+                        "last_successful_revision"
+                    ] = revision
+
+    def _persist_snapshot(
+        self, snapshot: Optional[Dict[str, Any]], *, required: bool
+    ) -> bool:
+        if snapshot is None or self.job_store is None:
+            return True
+        try:
+            result = self.job_store.save(
+                snapshot["jobs"],
+                snapshot["next_job_id"],
+                snapshot["revision"],
+                media_root=self._media_root,
+            )
+        except Exception as exc:
+            code = self._persistence_error_code(exc)
+            self._record_persistence_result(
+                healthy=False,
+                revision=int(snapshot["revision"]),
+                error_code=code,
+            )
+            if required:
+                raise JobPersistenceRequiredError(code) from exc
+            return False
+        self._record_persistence_result(
+            healthy=True,
+            revision=int(getattr(result, "revision", snapshot["revision"])),
+        )
+        return True
+
+    def _persist_required(self, snapshot: Optional[Dict[str, Any]]) -> None:
+        self._persist_snapshot(snapshot, required=True)
+
+    def _persist_best_effort(
+        self, snapshot: Optional[Dict[str, Any]]
+    ) -> bool:
+        return self._persist_snapshot(snapshot, required=False)
+
+    def _progress_snapshot_locked(
+        self, job: Job
+    ) -> Optional[Dict[str, Any]]:
+        self._mark_dirty_locked(job)
+        if self.job_store is None:
+            return None
+        current = float(self._clock())
+        job_id = str(job.get("id") or "")
+        previous = self._last_progress_persist_at.get(job_id)
+        if previous is not None and current - previous < (
+            PROGRESS_PERSIST_INTERVAL_SECONDS
+        ):
+            return None
+        self._last_progress_persist_at[job_id] = current
+        return self._snapshot_for_persistence_locked()
+
+    def persistence_status(self) -> Dict[str, Any]:
+        """Return safe internal persistence health without paths or errors."""
+        with self.lock:
+            return deepcopy(self._persistence_health)
+
+    def _mark_required_failure(
+        self, job_id: str, item_id: Optional[str] = None
+    ) -> None:
+        """Bound one failed required save without recursively saving it."""
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if job is None:
+                return
+            self._ensure_control_lists_locked(job)
+            indexes: list[int]
+            if item_id is None:
+                indexes = [
+                    index
+                    for index, state in enumerate(job["item_states"])
+                    if state not in TERMINAL_ITEM_STATES
+                ]
+            else:
+                index = self._item_index_locked(job, item_id)
+                indexes = [] if index is None else [index]
+            for index in indexes:
+                self._set_item_state_locked(
+                    job, index, "failed", failure_kind="known"
+                )
+                job["item_completion_reasons"][index] = (
+                    "persistence_unavailable"
+                )
+                job["item_recovery_reasons"][index] = (
+                    "persistence_unavailable"
+                )
+            lane = self._lane_for_job(job)
+            if item_id is not None and self._lane_active.get(lane) == (
+                str(job_id),
+                str(item_id),
+            ):
+                self._lane_active[lane] = None
+            job["completion_reason"] = "persistence_unavailable"
+            job["recovery_reason"] = "persistence_unavailable"
+            self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            self._condition.notify_all()
+
+    def _handle_creation_persistence_failure(
+        self, job_id: str, exc: JobPersistenceRequiredError
+    ) -> None:
+        if exc.code != "persistence_validation_failed":
+            self._mark_required_failure(job_id)
+            return
+        # An unsafe snapshot must not poison every later whole-registry save.
+        # The high-water counter remains consumed even though the invalid job
+        # is removed from runtime state.
+        with self.lock:
+            self.jobs.pop(str(job_id), None)
+            self._mark_dirty_locked()
 
     @staticmethod
     def _lane_for_job(job: Job) -> str:
@@ -429,12 +651,17 @@ class JobManager:
         with self.lock:
             job_id = self._next_job_id(counter_getter, counter_setter)
             item_ids = self._item_ids(job_id, len(urls))
+            durable_now = self._utc_timestamp()
             self.jobs[job_id] = {
                 "id": job_id,
                 "label": label,
                 "status": "wartet",
                 "state": "queued",
                 "created": self._created_at(),
+                "created_at": durable_now,
+                "updated_at": durable_now,
+                "started_at": None,
+                "finished_at": None,
                 "urls": urls,
                 "total_urls": len(urls),
                 "item_ids": item_ids,
@@ -449,11 +676,22 @@ class JobManager:
                 "item_total_duration_seconds": [None for _ in urls],
                 "item_resolved": [False for _ in urls],
                 "item_failure_kinds": ["" for _ in urls],
+                "item_completion_reasons": ["" for _ in urls],
+                "item_recovery_reasons": ["" for _ in urls],
                 "item_retry_job_ids": ["" for _ in urls],
                 "stop_after_current": False,
+                "completion_reason": "",
+                "recovery_reason": "",
                 "log": [],
                 "returncode": None,
             }
+            self._mark_dirty_locked(timestamp=durable_now)
+            snapshot = self._snapshot_for_persistence_locked()
+        try:
+            self._persist_required(snapshot)
+        except JobPersistenceRequiredError as exc:
+            self._handle_creation_persistence_failure(job_id, exc)
+            raise
         return job_id
 
     def create_recording_job(
@@ -489,6 +727,12 @@ class JobManager:
             job_id = self._next_job_id(counter_getter, counter_setter)
             item_id = self._item_ids(job_id, 1)[0]
             created_at = self._created_at()
+            durable_now = self._utc_timestamp()
+            durable_output_name = str(output_name or "").strip()
+            if self.job_store is not None and not durable_output_name:
+                durable_output_name = (
+                    f"{canonical_login}/live-recording.%(ext)s"
+                )
             self.jobs[job_id] = {
                 "id": job_id,
                 "label": f"Live recording: {canonical_login}",
@@ -500,14 +744,16 @@ class JobManager:
                 "title": str(title or "").strip(),
                 "live_started_at": live_started_at,
                 "quality": str(quality or "source/best").strip(),
-                "output_name": str(output_name or "").strip(),
+                "output_name": durable_output_name,
                 "output_path": None,
                 "output_complete": False,
                 "status": "wartet",
                 "state": "queued",
                 "created": created_at,
-                "created_at": created_at,
-                "updated_at": created_at,
+                "created_at": durable_now,
+                "updated_at": durable_now,
+                "started_at": None,
+                "finished_at": None,
                 "urls": [canonical_login],
                 "total_urls": 1,
                 "item_ids": [item_id],
@@ -515,13 +761,23 @@ class JobManager:
                 "item_statuses": ["wartet"],
                 "item_resolved": [False],
                 "item_failure_kinds": [""],
+                "item_completion_reasons": [""],
+                "item_recovery_reasons": [""],
                 "item_retry_job_ids": [""],
                 "recorded_seconds": 0.0,
                 "stop_requested": False,
                 "completion_reason": "",
+                "recovery_reason": "",
                 "log": [],
                 "returncode": None,
             }
+            self._mark_dirty_locked(timestamp=durable_now)
+            snapshot = self._snapshot_for_persistence_locked()
+        try:
+            self._persist_required(snapshot)
+        except JobPersistenceRequiredError as exc:
+            self._handle_creation_persistence_failure(job_id, exc)
+            raise
         return job_id
 
     def create_upload_job(
@@ -538,12 +794,17 @@ class JobManager:
         with self.lock:
             job_id = self._next_job_id(counter_getter, counter_setter)
             item_ids = self._item_ids(job_id, len(paths))
+            durable_now = self._utc_timestamp()
             job = {
                 "id": job_id,
                 "label": label,
                 "status": "wartet",
                 "state": "queued",
                 "created": self._created_at(),
+                "created_at": durable_now,
+                "updated_at": durable_now,
+                "started_at": None,
+                "finished_at": None,
                 "urls": paths,
                 "item_ids": item_ids,
                 "item_states": ["queued" for _ in paths],
@@ -557,9 +818,13 @@ class JobManager:
                 "item_errors": ["" for _ in paths],
                 "item_resolved": [False for _ in paths],
                 "item_failure_kinds": ["" for _ in paths],
+                "item_completion_reasons": ["" for _ in paths],
+                "item_recovery_reasons": ["" for _ in paths],
                 "item_retry_job_ids": ["" for _ in paths],
                 "item_metadata": list(item_metadata or [{} for _ in paths]),
                 "stop_after_current": False,
+                "completion_reason": "",
+                "recovery_reason": "",
                 "log": [],
                 "returncode": None,
                 "type": "youtube_upload",
@@ -567,6 +832,13 @@ class JobManager:
             if playlist_id is not None:
                 job["playlist_id"] = str(playlist_id or "").strip()
             self.jobs[job_id] = job
+            self._mark_dirty_locked(timestamp=durable_now)
+            snapshot = self._snapshot_for_persistence_locked()
+        try:
+            self._persist_required(snapshot)
+        except JobPersistenceRequiredError as exc:
+            self._handle_creation_persistence_failure(job_id, exc)
+            raise
         return job_id
 
     def append_job_log(
@@ -576,6 +848,8 @@ class JobManager:
         log_callback: Optional[LogCallback] = None,
     ) -> bool:
         """Append one entry, retaining exactly the newest 500 entries."""
+        progress_changed = False
+        snapshot = None
         with self.lock:
             job = self.jobs.get(job_id)
             if not job:
@@ -591,12 +865,19 @@ class JobManager:
                     for index, status in enumerate(statuses):
                         if status == "l\u00e4uft" and index < len(progress):
                             if index >= len(uploaded) or uploaded[index] is None:
-                                progress[index] = max(
+                                value = max(
                                     0, min(100, int(match.group(1)))
                                 )
+                                progress_changed = progress[index] != value
+                                progress[index] = value
                             break
             elif job.get("type") != "recording":
-                self._update_download_progress_from_log(job, text)
+                progress_changed = self._update_download_progress_from_log(
+                    job, text
+                )
+            if progress_changed:
+                snapshot = self._progress_snapshot_locked(job)
+        self._persist_best_effort(snapshot)
         if log_callback is not None:
             log_callback(f"Job {job_id}: {text.rstrip()}")
         return True
@@ -625,14 +906,14 @@ class JobManager:
             result[key] = values
         return result
 
-    def _update_download_progress_from_log(self, job: Job, text: str) -> None:
+    def _update_download_progress_from_log(self, job: Job, text: str) -> bool:
         statuses = job.get("item_statuses")
         if not isinstance(statuses, list):
-            return
+            return False
         try:
             index = statuses.index("l\u00e4uft")
         except ValueError:
-            return
+            return False
         metrics = self._download_metric_lists(job)
 
         marker_match = re.search(
@@ -648,7 +929,7 @@ class JobManager:
             metrics["item_total_duration_seconds"][index] = (
                 duration if math.isfinite(duration) and duration > 0 else None
             )
-            return
+            return True
 
         duration = metrics["item_total_duration_seconds"][index]
         ffmpeg = ffmpeg_download_metrics(text, duration)
@@ -676,11 +957,11 @@ class JobManager:
                 else None
             )
             metrics["item_updated_at"][index] = float(self._clock())
-            return
+            return True
 
         classic = _CLASSIC_DOWNLOAD_RE.search(str(text or ""))
         if not classic:
-            return
+            return False
         metrics["item_progress"][index] = max(
             0.0, min(100.0, round(float(classic.group(1)), 1))
         )
@@ -693,6 +974,7 @@ class JobManager:
             int(math.ceil(eta)) if eta is not None and eta > 0 else None
         )
         metrics["item_updated_at"][index] = float(self._clock())
+        return True
 
     def update_job(self, job_id: str, **changes: Any) -> bool:
         """Apply a generic state transition under the registry lock."""
@@ -701,6 +983,9 @@ class JobManager:
             if not job:
                 return False
             job.update(changes)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+        self._persist_best_effort(snapshot)
         return True
 
     def _ensure_control_lists_locked(self, job: Job) -> None:
@@ -734,13 +1019,22 @@ class JobManager:
             job["item_states"] = states
         elif len(states) < count:
             states.extend("queued" for _ in range(count - len(states)))
-        for key in ("item_failure_kinds", "item_retry_job_ids"):
+        for key in (
+            "item_failure_kinds",
+            "item_completion_reasons",
+            "item_recovery_reasons",
+            "item_retry_job_ids",
+        ):
             values = job.get(key)
             if not isinstance(values, list):
                 job[key] = ["" for _ in range(count)]
             elif len(values) < count:
                 values.extend("" for _ in range(count - len(values)))
         job.setdefault("stop_after_current", False)
+        job.setdefault("completion_reason", "")
+        job.setdefault("recovery_reason", "")
+        job.setdefault("started_at", None)
+        job.setdefault("finished_at", None)
 
     def _item_index_locked(self, job: Job, item_id: str) -> Optional[int]:
         self._ensure_control_lists_locked(job)
@@ -765,6 +1059,11 @@ class JobManager:
         job["item_failure_kinds"][index] = (
             str(failure_kind or "") if state == "failed" else ""
         )
+        if state in TERMINAL_ITEM_STATES:
+            job["item_completion_reasons"][index] = state
+        else:
+            job["item_completion_reasons"][index] = ""
+            job["item_recovery_reasons"][index] = ""
 
     def _recompute_job_state_locked(self, job: Job) -> None:
         self._ensure_control_lists_locked(job)
@@ -926,7 +1225,9 @@ class JobManager:
                     (str(job_id), str(item_id)), threading.Event()
                 )
                 self._recompute_job_state_locked(job)
-                return {
+                self._mark_dirty_locked(job, started=True)
+                snapshot = self._snapshot_for_persistence_locked()
+                claimed = {
                     "job_id": str(job_id),
                     "item_id": str(item_id),
                     "index": index,
@@ -934,6 +1235,13 @@ class JobManager:
                     "value": job["urls"][index],
                     "lane": lane,
                 }
+                break
+        try:
+            self._persist_required(snapshot)
+        except JobPersistenceRequiredError:
+            self._mark_required_failure(str(job_id), str(item_id))
+            raise
+        return claimed
 
     def finish_claimed_item(
         self,
@@ -962,7 +1270,10 @@ class JobManager:
                 self._lane_active[lane] = None
             self._download_processes.pop((str(job_id), str(item_id)), None)
             self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
             self._condition.notify_all()
+        self._persist_best_effort(snapshot)
         return True
 
     def remove_queued_item(self, job_id: str, item_id: str) -> bool:
@@ -980,7 +1291,10 @@ class JobManager:
                 return False
             self._set_item_state_locked(job, index, "cancelled")
             self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
             self._condition.notify_all()
+        self._persist_best_effort(snapshot)
         return True
 
     def request_cancel_item(self, job_id: str, item_id: str) -> Optional[str]:
@@ -997,13 +1311,40 @@ class JobManager:
             if state not in {"running", "cancelling"}:
                 return None
             self._set_item_state_locked(job, index, "cancelling")
+            self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            lane = self._lane_for_job(job)
+            self._condition.notify_all()
+        try:
+            self._persist_required(snapshot)
+        except JobPersistenceRequiredError:
+            with self._condition:
+                current = self.jobs.get(job_id)
+                current_index = (
+                    self._item_index_locked(current, item_id)
+                    if current is not None
+                    else None
+                )
+                if (
+                    current is not None
+                    and current_index is not None
+                    and current["item_states"][current_index] == "cancelling"
+                ):
+                    self._set_item_state_locked(
+                        current, current_index, "running"
+                    )
+                    self._recompute_job_state_locked(current)
+                    self._mark_dirty_locked(current)
+                    self._condition.notify_all()
+            raise
+        with self._condition:
             event = self._cancel_events.setdefault(
                 (str(job_id), str(item_id)), threading.Event()
             )
             event.set()
-            self._recompute_job_state_locked(job)
             self._condition.notify_all()
-            return self._lane_for_job(job)
+        return lane
 
     def is_cancel_requested(self, job_id: str, item_id: str) -> bool:
         with self.lock:
@@ -1039,8 +1380,9 @@ class JobManager:
             )
             self._lane_active["recording"] = (str(job_id), item_id)
             self._recompute_job_state_locked(job)
-            job["updated_at"] = self._created_at()
-            return {
+            self._mark_dirty_locked(job, started=True)
+            snapshot = self._snapshot_for_persistence_locked()
+            claimed = {
                 "job_id": str(job_id),
                 "item_id": item_id,
                 "index": 0,
@@ -1048,6 +1390,12 @@ class JobManager:
                 "value": job["streamer"],
                 "lane": "recording",
             }
+        try:
+            self._persist_required(snapshot)
+        except JobPersistenceRequiredError:
+            self._mark_required_failure(str(job_id), item_id)
+            raise
+        return claimed
 
     def is_recording_active(self) -> bool:
         with self.lock:
@@ -1101,16 +1449,33 @@ class JobManager:
                 return True
             if state not in {"queued", "running", "stopping"}:
                 return False
+            previous_state = state
+            previous_stop_requested = bool(job.get("stop_requested"))
+            job["stop_requested"] = True
+            self._set_item_state_locked(job, 0, "stopping")
+            self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            self._condition.notify_all()
+        try:
+            self._persist_required(snapshot)
+        except JobPersistenceRequiredError:
+            with self._condition:
+                current = self.jobs.get(str(job_id))
+                if current is not None and current.get("state") == "stopping":
+                    current["stop_requested"] = previous_stop_requested
+                    self._set_item_state_locked(current, 0, previous_state)
+                    self._recompute_job_state_locked(current)
+                    self._mark_dirty_locked(current)
+                    self._condition.notify_all()
+            raise
+        with self._condition:
             event = self._recording_stop_events.setdefault(
                 str(job_id), threading.Event()
             )
             event.set()
-            job["stop_requested"] = True
-            self._set_item_state_locked(job, 0, "stopping")
-            self._recompute_job_state_locked(job)
-            job["updated_at"] = self._created_at()
             self._condition.notify_all()
-            return True
+        return True
 
     def start_recording_termination(
         self,
@@ -1231,8 +1596,9 @@ class JobManager:
                 return False
             previous = float(job.get("recorded_seconds") or 0.0)
             job["recorded_seconds"] = round(max(previous, value), 3)
-            job["updated_at"] = self._created_at()
-            return True
+            snapshot = self._progress_snapshot_locked(job)
+        self._persist_best_effort(snapshot)
+        return True
 
     def finalize_recording_job(
         self,
@@ -1264,7 +1630,9 @@ class JobManager:
             job["completion_reason"] = str(completion_reason or "")
             job["output_path"] = str(output_path) if output_path else None
             job["output_complete"] = bool(output_path and state == "completed")
-            job["updated_at"] = self._created_at()
+            job["item_completion_reasons"][index] = str(
+                completion_reason or ""
+            )
             if self._lane_active["recording"] == (
                 str(job_id),
                 str(item_id),
@@ -1276,8 +1644,11 @@ class JobManager:
             self._recording_stop_results.pop(str(job_id), None)
             self._recording_termination_done.pop(str(job_id), None)
             self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
             self._condition.notify_all()
-            return True
+        self._persist_best_effort(snapshot)
+        return True
 
     def register_download_process(
         self, job_id: str, item_id: str, process: Any
@@ -1353,7 +1724,10 @@ class JobManager:
             if index is None:
                 return False
             job["item_retry_job_ids"][index] = str(retry_job_id or "")
-            return True
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+        self._persist_best_effort(snapshot)
+        return True
 
     def get_job(self, job_id: str) -> Optional[Job]:
         """Return a detached snapshot of one job."""
@@ -1390,11 +1764,19 @@ class JobManager:
         with self.lock:
             job = self.jobs[job_id]
             job["status"] = "läuft"
-            return list(job["urls"])
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            urls = list(job["urls"])
+        self._persist_best_effort(snapshot)
+        return urls
 
     def set_returncode(self, job_id: str, returncode: int) -> None:
         with self.lock:
-            self.jobs[job_id]["returncode"] = returncode
+            job = self.jobs[job_id]
+            job["returncode"] = returncode
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+        self._persist_best_effort(snapshot)
 
     def set_download_item_status(
         self, job_id: str, item_number: int, status: str
@@ -1423,11 +1805,15 @@ class JobManager:
             ):
                 metrics[key][index] = None
             metrics["item_speed_label"][index] = ""
+            self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+        self._persist_best_effort(snapshot)
         return True
 
     def fail_unfinished_download_items(self, job_id: str) -> None:
         """Mark active and queued items failed after an unexpected worker exit."""
-        with self.lock:
+        with self._condition:
             job = self.jobs.get(job_id)
             if job is None:
                 return
@@ -1447,6 +1833,17 @@ class JobManager:
                     ):
                         metrics[key][index] = None
                     metrics["item_speed_label"][index] = ""
+            for lane, active in self._lane_active.items():
+                if active is not None and active[0] == str(job_id):
+                    self._lane_active[lane] = None
+            for key in list(self._download_processes):
+                if key[0] == str(job_id):
+                    self._download_processes.pop(key, None)
+            self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            self._condition.notify_all()
+        self._persist_best_effort(snapshot)
 
     def set_upload_item_status(
         self,
@@ -1478,6 +1875,7 @@ class JobManager:
             state = LEGACY_TO_ITEM_STATE.get(status, status)
             if state not in ITEM_STATES:
                 return False
+            previous_state = job["item_states"][index]
             self._set_item_state_locked(job, index, state)
             progresses[index] = progress
             errors[index] = str(error or "")
@@ -1508,6 +1906,13 @@ class JobManager:
                     if isinstance(total_bytes, int) and total_bytes > 0:
                         job["item_bytes_uploaded"][index] = total_bytes
                 self._upload_measurements.pop(measurement_key, None)
+            self._recompute_job_state_locked(job)
+            if state == previous_state:
+                snapshot = self._progress_snapshot_locked(job)
+            else:
+                self._mark_dirty_locked(job)
+                snapshot = self._snapshot_for_persistence_locked()
+        self._persist_best_effort(snapshot)
         return True
 
     def update_active_upload_progress(
@@ -1618,11 +2023,13 @@ class JobManager:
                 "bytes_uploaded": float(uploaded),
                 "smoothed_speed": smoothed_speed,
             }
+            snapshot = self._progress_snapshot_locked(job)
+        self._persist_best_effort(snapshot)
         return True
 
     def fail_unfinished_upload_items(self, job_id: str, error: str) -> None:
         """Fail upload items that never started after a job-level failure."""
-        with self.lock:
+        with self._condition:
             job = self.jobs.get(job_id)
             if job is None:
                 return
@@ -1643,6 +2050,14 @@ class JobManager:
                     if index < len(etas):
                         etas[index] = None
                     self._upload_measurements.pop((str(job_id), index), None)
+            for lane, active in self._lane_active.items():
+                if active is not None and active[0] == str(job_id):
+                    self._lane_active[lane] = None
+            self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            self._condition.notify_all()
+        self._persist_best_effort(snapshot)
 
     def resolve_error(self, job_id: str, item_number: int) -> bool:
         """Dismiss one failed item while retaining its failure and diagnostics."""
@@ -1665,6 +2080,9 @@ class JobManager:
             ):
                 return False
             resolved[index] = True
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+        self._persist_best_effort(snapshot)
         return True
 
     def resolve_error_by_id(self, job_id: str, item_id: str) -> bool:
@@ -1692,8 +2110,15 @@ class JobManager:
 
     def finish_job(self, job_id: str, returncode: int, status: str) -> None:
         with self.lock:
-            self.jobs[job_id]["returncode"] = returncode
-            self.jobs[job_id]["status"] = status
+            job = self.jobs[job_id]
+            job["returncode"] = returncode
+            self._recompute_job_state_locked(job)
+            if status == "fehler":
+                job["state"] = "failed"
+            job["status"] = status
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+        self._persist_best_effort(snapshot)
 
     def start_worker(
         self,
@@ -1735,7 +2160,10 @@ def run_recording_job(
     dependencies: RecordingWorkerDependencies,
 ) -> None:
     """Run one Twitch livestream in its dedicated process-local lane."""
-    claimed = manager.claim_recording_job(job_id)
+    try:
+        claimed = manager.claim_recording_job(job_id)
+    except JobPersistenceRequiredError:
+        return
     if claimed is None:
         return
     item_id = str(claimed["item_id"])
@@ -2245,12 +2673,17 @@ def run_upload_job(
         )
     failed = 0
     uploaded = 0
+    service_checked = False
     try:
-        dependencies.get_youtube_service(settings, interactive=False)
         while True:
             claimed = manager.claim_next_item(job_id)
             if claimed is None:
                 break
+            if not service_checked:
+                dependencies.get_youtube_service(
+                    settings, interactive=False
+                )
+                service_checked = True
             item_number = int(claimed["item_number"])
             item_id = str(claimed["item_id"])
             raw = str(claimed["value"])
