@@ -62,6 +62,7 @@ class AutoVodCoordinator:
         clock: Optional[Callable[[], datetime]] = None,
         jobs_provider: Optional[Callable[[], Iterable[Mapping[str, Any]]]] = None,
         worker_starter: Optional[Callable[[str], Any]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._settings_provider = settings_provider
         self._streamer_provider = streamer_provider
@@ -73,6 +74,7 @@ class AutoVodCoordinator:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._jobs_provider = jobs_provider or self._default_jobs
         self._worker_starter = worker_starter or self._default_worker_starter
+        self._should_stop = should_stop or (lambda: False)
 
     def _default_jobs(self) -> Iterable[Mapping[str, Any]]:
         return list(getattr(self._job_manager, "jobs", {}).values())
@@ -206,6 +208,9 @@ class AutoVodCoordinator:
         except (AutoVodStateError, ValueError):
             result.update({"state_healthy": False, "action": "state_unhealthy", "error_count": 1, "errors": [{"code": "state_unhealthy"}]})
             return result
+        if self._should_stop():
+            result["action"] = "shutdown_requested"
+            return result
         archive_ids = {str(value) for value in self._archive_ids_provider(settings)}
         jobs = list(self._jobs_provider())
         errors: list[Dict[str, str]] = []
@@ -258,6 +263,10 @@ class AutoVodCoordinator:
                     candidates.append(vod_id)
             created_streamer = 0
             for vod_id in candidates:
+                if self._should_stop():
+                    result["action"] = "shutdown_requested"
+                    stop_scheduling = True
+                    break
                 if created_total >= MAX_NEW_JOBS_PER_CYCLE or created_streamer >= MAX_NEW_JOBS_PER_STREAMER:
                     result["action"] = "queue_limited"
                     break
@@ -293,6 +302,10 @@ class AutoVodCoordinator:
                     except AutoVodStateError:
                         result["action"] = "state_persistence_failed"; errors.append({"streamer": streamer, "code": "state_persistence_failed"}); stop_scheduling = True; break
                     try:
+                        if self._should_stop():
+                            result["action"] = "shutdown_requested"
+                            stop_scheduling = True
+                            break
                         self._worker_starter(job_id)
                     except Exception:
                         fail_unfinished = getattr(

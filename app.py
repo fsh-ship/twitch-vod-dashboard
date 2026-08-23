@@ -22,6 +22,9 @@ from vod_dashboard import dashboard_state
 from vod_dashboard import auto_recorder as dashboard_auto_recorder
 from vod_dashboard import auto_recording as dashboard_auto_recording
 from vod_dashboard import auto_recording_runtime as dashboard_auto_runtime
+from vod_dashboard import auto_vod as dashboard_auto_vod
+from vod_dashboard import auto_vod_coordinator as dashboard_auto_vod_coordinator
+from vod_dashboard import auto_vod_runtime as dashboard_auto_vod_runtime
 from vod_dashboard import local_vods as dashboard_local_vods
 from vod_dashboard import jobs as dashboard_jobs
 from vod_dashboard import job_store as dashboard_job_store
@@ -119,6 +122,8 @@ AUTO_RECORDER_MONITOR_LOCK = threading.Lock()
 AUTO_RECORDER_MONITOR: Optional[
     dashboard_auto_runtime.AutoRecorderMonitor
 ] = None
+AUTO_VOD_MONITOR_LOCK = threading.Lock()
+AUTO_VOD_MONITOR: Optional[dashboard_auto_vod_runtime.AutoVodMonitor] = None
 WORKER_RUNTIME_LOCK = threading.RLock()
 WORKER_RUNTIME_RESULT: Optional[Dict[str, Any]] = None
 log_file_lock = dashboard_runtime.log_file_lock
@@ -817,9 +822,39 @@ def start_auto_recorder_monitor() -> dashboard_auto_runtime.AutoRecorderMonitor:
         return AUTO_RECORDER_MONITOR
 
 
+def create_auto_vod_monitor() -> dashboard_auto_vod_runtime.AutoVodMonitor:
+    """Construct the production Auto VOD monitor without starting it."""
+    stop_event = threading.Event()
+    coordinator = dashboard_auto_vod_coordinator.AutoVodCoordinator(
+        settings_provider=load_settings,
+        streamer_provider=lambda settings: read_streamers(dict(settings)),
+        state_store=dashboard_auto_vod.AutoVodStateStore.from_dashboard_dir(
+            DEFAULT_DASHBOARD_DIR
+        ),
+        job_manager=JOB_MANAGER,
+        archive_ids_provider=lambda settings: archive_ids(dict(settings)),
+        worker_target=run_download_job,
+        discovery=dashboard_twitch.discover_streamer_vods,
+        jobs_provider=lambda: _job_manager_for_compatibility().snapshot_jobs(),
+        should_stop=stop_event.is_set,
+    )
+    return dashboard_auto_vod_runtime.AutoVodMonitor(
+        coordinator, settings_provider=load_settings, stop_event=stop_event, log=log_line
+    )
+
+
+def start_auto_vod_monitor() -> dashboard_auto_vod_runtime.AutoVodMonitor:
+    global AUTO_VOD_MONITOR
+    with AUTO_VOD_MONITOR_LOCK:
+        if AUTO_VOD_MONITOR is None:
+            AUTO_VOD_MONITOR = create_auto_vod_monitor()
+        AUTO_VOD_MONITOR.start()
+        return AUTO_VOD_MONITOR
+
+
 def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
     """Idempotently activate durable production state, then Auto Recorder."""
-    global AUTO_RECORDER_MONITOR, WORKER_RUNTIME_RESULT
+    global AUTO_RECORDER_MONITOR, AUTO_VOD_MONITOR, WORKER_RUNTIME_RESULT
     try:
         supported_worker_count = int(worker_count) == 1
     except (TypeError, ValueError, OverflowError):
@@ -867,6 +902,7 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             return dict(WORKER_RUNTIME_RESULT)
 
         monitor_started = False
+        auto_vod_monitor_started = False
         monitor_reason = ""
         try:
             with AUTO_RECORDER_MONITOR_LOCK:
@@ -881,6 +917,17 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             app.logger.error(
                 "Auto recorder monitor startup failed (monitor_start_failed)."
             )
+
+        try:
+            with AUTO_VOD_MONITOR_LOCK:
+                if AUTO_VOD_MONITOR is None:
+                    AUTO_VOD_MONITOR = create_auto_vod_monitor()
+                auto_vod_monitor = AUTO_VOD_MONITOR
+            auto_vod_monitor.start()
+            auto_vod_monitor_started = True
+        except Exception:
+            monitor_reason = monitor_reason or "auto_vod_monitor_start_failed"
+            app.logger.error("Auto VOD monitor startup failed (auto_vod_monitor_start_failed).")
 
         degraded = bool(
             store_construction_failed or restore.degraded or monitor_reason
@@ -901,6 +948,7 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             "reconciled_item_count": restore.reconciled_item_count,
             "source": restore.source,
             "monitor_started": monitor_started,
+            "auto_vod_monitor_started": auto_vod_monitor_started,
         }
         app.logger.info(
             "Worker runtime initialized: loaded=%d discarded=%d "
@@ -921,6 +969,32 @@ def wake_auto_recorder_monitor() -> bool:
     with AUTO_RECORDER_MONITOR_LOCK:
         monitor = AUTO_RECORDER_MONITOR
     return monitor.wake() if monitor is not None else False
+
+
+def wake_auto_vod_monitor() -> bool:
+    with AUTO_VOD_MONITOR_LOCK:
+        monitor = AUTO_VOD_MONITOR
+    return monitor.wake() if monitor is not None else False
+
+
+def _configured_auto_vod_streamers(
+    settings: Mapping[str, Any], streamers: Optional[Iterable[Any]] = None
+) -> set[str]:
+    configured = streamers if streamers is not None else read_streamers(dict(settings))
+    profiles = dashboard_settings.normalize_streamer_profiles(settings.get("streamer_profiles"))
+    return {
+        login for raw_login in configured
+        if (login := dashboard_settings.canonical_streamer_login(raw_login))
+        and profiles.get(login, {}).get("auto_vod_download") is True
+    }
+
+
+def _wake_auto_vod_after_save(reason: str) -> bool:
+    try:
+        return wake_auto_vod_monitor()
+    except Exception:
+        app.logger.warning("Auto VOD monitor wake failed after %s.", reason)
+        return False
 
 
 def _configured_auto_record_streamers(
@@ -1031,6 +1105,27 @@ def stop_auto_recorder_monitor(timeout: float = 5.0) -> bool:
     return True if monitor is None else monitor.stop(timeout=timeout)
 
 
+def stop_auto_vod_monitor(timeout: float = 5.0) -> bool:
+    with AUTO_VOD_MONITOR_LOCK:
+        monitor = AUTO_VOD_MONITOR
+    return True if monitor is None else monitor.stop(timeout=timeout)
+
+
+def auto_vod_monitor_snapshot() -> Dict[str, Any]:
+    with AUTO_VOD_MONITOR_LOCK:
+        monitor = AUTO_VOD_MONITOR
+    return {
+        "running": False,
+        "thread_alive": False,
+        "in_progress": False,
+        "last_started_at": None,
+        "last_finished_at": None,
+        "last_result": None,
+        "next_check_at": None,
+        "wake_pending": False,
+    } if monitor is None else monitor.snapshot()
+
+
 def auto_recorder_monitor_snapshot() -> Dict[str, Any]:
     """Return internal runtime status without exposing a public endpoint."""
     with AUTO_RECORDER_MONITOR_LOCK:
@@ -1055,6 +1150,7 @@ def auto_recorder_monitor_snapshot() -> Dict[str, Any]:
 
 def shutdown_worker_runtime() -> bool:
     """Stop new work, clean up owned processes, then flush durable state."""
+    auto_vod_stopped = stop_auto_vod_monitor(timeout=5.0)
     monitor_stopped = stop_auto_recorder_monitor(timeout=5.0)
     manager = _job_manager_for_compatibility()
     manager.begin_shutdown()
@@ -1797,16 +1893,24 @@ def api_settings():
     before_watched = _configured_auto_record_streamers(
         before, configured_streamers
     )
+    before_auto_vod = _configured_auto_vod_streamers(before, configured_streamers)
     saved = save_settings(request.json or {})
     after_watched = _configured_auto_record_streamers(
         saved, configured_streamers
     )
+    after_auto_vod = _configured_auto_vod_streamers(saved, configured_streamers)
     if (
         (before.get("auto_recorder_enabled") is True)
         != (saved.get("auto_recorder_enabled") is True)
         or before_watched != after_watched
     ):
         _wake_auto_recorder_after_save("settings save")
+    if (
+        (before.get("auto_vod_enabled") is True) != (saved.get("auto_vod_enabled") is True)
+        or before.get("auto_vod_poll_minutes") != saved.get("auto_vod_poll_minutes")
+        or before_auto_vod != after_auto_vod
+    ):
+        _wake_auto_vod_after_save("settings save")
     saved["_settings_file"] = str(SETTINGS_FILE)
     saved["_saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return jsonify(saved)
@@ -1891,9 +1995,11 @@ def api_streamers():
     if isinstance(names, str):
         names = names.splitlines()
     settings = load_settings()
+    before_streamers = read_streamers(settings)
     before_watched = _configured_auto_record_streamers(
-        settings, read_streamers(settings)
+        settings, before_streamers
     )
+    before_auto_vod = _configured_auto_vod_streamers(settings, before_streamers)
     profiles_supplied = "streamer_profiles" in data
     if profiles_supplied:
         settings = save_settings({
@@ -1901,8 +2007,11 @@ def api_streamers():
         })
     streamers = write_streamers(names, settings)
     after_watched = _configured_auto_record_streamers(settings, streamers)
+    after_auto_vod = _configured_auto_vod_streamers(settings, streamers)
     if before_watched != after_watched:
         _wake_auto_recorder_after_save("streamer save")
+    if before_auto_vod != after_auto_vod or before_streamers != streamers:
+        _wake_auto_vod_after_save("streamer save")
     payload = {
         "streamers": streamers,
         "streamer_file": str(FIXED_STREAMER_FILE),
