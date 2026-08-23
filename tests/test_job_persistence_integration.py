@@ -178,6 +178,9 @@ class JobPersistenceIntegrationTests(unittest.TestCase):
                 "last_save_at": None,
                 "last_successful_revision": None,
                 "last_error_code": "",
+                "load_degraded": False,
+                "load_source": "",
+                "load_reason": "",
             },
         )
 

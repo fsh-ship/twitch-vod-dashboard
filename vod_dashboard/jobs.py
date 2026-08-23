@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, MutableMapping, Optional
 from vod_dashboard.job_store import (
     JobStore,
     JobStoreError,
+    JobStoreLoadResult,
     JobStorePersistenceError,
     JobStoreValidationError,
 )
@@ -98,6 +99,28 @@ class JobPersistenceRequiredError(RuntimeError):
     def __init__(self, code: str = "persistence_unavailable") -> None:
         super().__init__("Required job persistence is unavailable.")
         self.code = code
+
+
+class JobRestoreError(RuntimeError):
+    """Stable internal contract error for an invalid restore invocation."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__("Job restore could not be started.")
+        self.code = code
+
+
+@dataclass(frozen=True)
+class JobRestoreResult:
+    """Safe diagnostics for one explicit restore/reconciliation operation."""
+
+    enabled: bool
+    loaded_count: int
+    discarded_count: int
+    reconciled_job_count: int
+    reconciled_item_count: int
+    degraded: bool
+    source: str
+    reason: str
 
 
 def validate_recording_job_metadata(
@@ -371,6 +394,7 @@ class JobManager:
         self.jobs = registry if registry is not None else {}
         self.lock = lock if lock is not None else threading.Lock()
         self.counter = counter
+        self._counter_floor = 0
         self._now = now or datetime.now
         self._clock = clock or time.time
         self.job_store = job_store
@@ -384,7 +408,12 @@ class JobManager:
             "last_save_at": None,
             "last_successful_revision": None,
             "last_error_code": "",
+            "load_degraded": False,
+            "load_source": "",
+            "load_reason": "",
         }
+        self._restore_in_progress = False
+        self._restore_result: Optional[JobRestoreResult] = None
         self._upload_measurements: Dict[tuple[str, int], Dict[str, Any]] = {}
         self._condition = threading.Condition(self.lock)
         self._lane_paused = {"download": False, "youtube_upload": False}
@@ -428,8 +457,14 @@ class JobManager:
         counter_setter: Optional[CounterSetter] = None,
     ) -> str:
         if counter_getter is not None:
-            self.counter = counter_getter()
+            self.counter = (
+                max(self._counter_floor, counter_getter())
+                if self._counter_floor
+                else counter_getter()
+            )
         self.counter += 1
+        if self._counter_floor:
+            self._counter_floor = self.counter
         if counter_setter is not None:
             counter_setter(self.counter)
         return str(self.counter)
@@ -515,16 +550,25 @@ class JobManager:
                     ] = revision
 
     def _persist_snapshot(
-        self, snapshot: Optional[Dict[str, Any]], *, required: bool
+        self,
+        snapshot: Optional[Dict[str, Any]],
+        *,
+        required: bool,
+        force: bool = False,
     ) -> bool:
         if snapshot is None or self.job_store is None:
             return True
         try:
+            save_kwargs: Dict[str, Any] = {
+                "media_root": self._media_root
+            }
+            if force:
+                save_kwargs["force"] = True
             result = self.job_store.save(
                 snapshot["jobs"],
                 snapshot["next_job_id"],
                 snapshot["revision"],
-                media_root=self._media_root,
+                **save_kwargs,
             )
         except Exception as exc:
             code = self._persistence_error_code(exc)
@@ -546,9 +590,11 @@ class JobManager:
         self._persist_snapshot(snapshot, required=True)
 
     def _persist_best_effort(
-        self, snapshot: Optional[Dict[str, Any]]
+        self, snapshot: Optional[Dict[str, Any]], *, force: bool = False
     ) -> bool:
-        return self._persist_snapshot(snapshot, required=False)
+        return self._persist_snapshot(
+            snapshot, required=False, force=force
+        )
 
     def _progress_snapshot_locked(
         self, job: Job
@@ -570,6 +616,283 @@ class JobManager:
         """Return safe internal persistence health without paths or errors."""
         with self.lock:
             return deepcopy(self._persistence_health)
+
+    @staticmethod
+    def _restored_created_display(value: str) -> str:
+        candidate = str(value or "")
+        try:
+            parsed = datetime.fromisoformat(
+                candidate[:-1] + "+00:00"
+                if candidate.endswith("Z")
+                else candidate
+            )
+        except ValueError:
+            return candidate
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+    @classmethod
+    def _runtime_job_from_durable(cls, durable: Job) -> Job:
+        """Rebuild display-only fields without creating runtime ownership."""
+        job = deepcopy(durable)
+        states = list(job.get("item_states") or [])
+        count = len(states)
+        job["created"] = cls._restored_created_display(
+            str(job.get("created_at") or "")
+        )
+        job["status"] = ITEM_STATE_TO_LEGACY.get(
+            str(job.get("state") or ""), "fehler"
+        )
+        job["item_statuses"] = [
+            ITEM_STATE_TO_LEGACY.get(state, "fehler") for state in states
+        ]
+        job["log"] = []
+        job["stop_after_current"] = False
+
+        if job.get("type") == "download":
+            job["item_speed_multiplier"] = [None for _ in range(count)]
+            job["item_speed_label"] = ["" for _ in range(count)]
+            job["item_eta_seconds"] = [None for _ in range(count)]
+            job["item_updated_at"] = [None for _ in range(count)]
+        elif job.get("type") == "youtube_upload":
+            job["item_bytes_per_second"] = [None for _ in range(count)]
+            job["item_eta_seconds"] = [None for _ in range(count)]
+            job["item_updated_at"] = [None for _ in range(count)]
+            job["item_errors"] = ["" for _ in range(count)]
+        else:
+            job["urls"] = [str(job.get("streamer") or "")]
+            job["total_urls"] = 1
+        return job
+
+    def _reconcile_restored_job(
+        self, job: Job, reconciliation_time: str
+    ) -> int:
+        """Convert stale process-owned states to deterministic interruption."""
+        self._ensure_control_lists_locked(job)
+        reconciled = 0
+        reasons: list[str] = []
+        job_type = str(job.get("type") or "download")
+        for index, state in enumerate(list(job["item_states"])):
+            if state in TERMINAL_ITEM_STATES:
+                continue
+            if state == "queued":
+                reason = "restart_before_start"
+                failure_kind = ""
+            elif job_type == "youtube_upload":
+                reason = "upload_status_unknown"
+                failure_kind = "uncertain"
+            else:
+                reason = "restart_interrupted"
+                failure_kind = ""
+            job["item_states"][index] = "interrupted"
+            job["item_statuses"][index] = ITEM_STATE_TO_LEGACY[
+                "interrupted"
+            ]
+            job["item_completion_reasons"][index] = reason
+            job["item_recovery_reasons"][index] = reason
+            job["item_failure_kinds"][index] = failure_kind
+            job["item_resolved"][index] = False
+            item_updated = job.get("item_updated_at")
+            if isinstance(item_updated, list) and index < len(item_updated):
+                item_updated[index] = None
+            reasons.append(reason)
+            reconciled += 1
+
+        if not reconciled:
+            return 0
+        if job_type == "recording":
+            job["output_complete"] = False
+        self._recompute_job_state_locked(job)
+        reason = next(
+            (
+                value
+                for value in (
+                    "upload_status_unknown",
+                    "restart_interrupted",
+                    "restart_before_start",
+                )
+                if value in reasons
+            ),
+            "restart_interrupted",
+        )
+        job["completion_reason"] = reason
+        job["recovery_reason"] = reason
+        job["updated_at"] = reconciliation_time
+        job["finished_at"] = reconciliation_time
+        return reconciled
+
+    def _reset_runtime_ownership_locked(self) -> None:
+        self._upload_measurements.clear()
+        self._last_progress_persist_at.clear()
+        for lane in self._lane_paused:
+            self._lane_paused[lane] = False
+            self._lane_stop_after_current[lane] = False
+        for lane in self._lane_active:
+            self._lane_active[lane] = None
+        self._cancel_events.clear()
+        self._download_processes.clear()
+        self._recording_processes.clear()
+        self._recording_stop_events.clear()
+        self._recording_termination_started.clear()
+        self._recording_stop_results.clear()
+        self._recording_termination_done.clear()
+
+    def _record_load_health_locked(
+        self, load_result: JobStoreLoadResult
+    ) -> None:
+        self._persistence_health["healthy"] = bool(load_result.healthy)
+        self._persistence_health["last_error_code"] = str(
+            load_result.reason or ""
+        )
+        self._persistence_health["last_save_at"] = load_result.state.get(
+            "saved_at"
+        )
+        self._persistence_health["load_degraded"] = bool(
+            load_result.degraded
+        )
+        self._persistence_health["load_source"] = str(
+            load_result.source or ""
+        )
+        self._persistence_health["load_reason"] = str(
+            load_result.reason or ""
+        )
+
+    def restore_from_store(self) -> JobRestoreResult:
+        """Explicitly restore history and reconcile it without starting work."""
+        with self.lock:
+            if self._restore_result is not None:
+                return self._restore_result
+            if self._restore_in_progress:
+                raise JobRestoreError("restore_in_progress")
+            if self.jobs:
+                raise JobRestoreError("manager_not_empty")
+            self._restore_in_progress = True
+
+        if self.job_store is None:
+            result = JobRestoreResult(
+                enabled=False,
+                loaded_count=0,
+                discarded_count=0,
+                reconciled_job_count=0,
+                reconciled_item_count=0,
+                degraded=False,
+                source="disabled",
+                reason="store_disabled",
+            )
+            with self.lock:
+                self._restore_result = result
+                self._restore_in_progress = False
+            return result
+
+        try:
+            load_result = self.job_store.load()
+        except Exception:
+            result = JobRestoreResult(
+                enabled=True,
+                loaded_count=0,
+                discarded_count=0,
+                reconciled_job_count=0,
+                reconciled_item_count=0,
+                degraded=True,
+                source="empty",
+                reason="load_failed",
+            )
+            with self.lock:
+                self._persistence_health["healthy"] = False
+                self._persistence_health[
+                    "last_error_code"
+                ] = "load_failed"
+                self._persistence_health["load_degraded"] = True
+                self._persistence_health["load_source"] = "empty"
+                self._persistence_health["load_reason"] = "load_failed"
+                self._restore_result = result
+                self._restore_in_progress = False
+            return result
+
+        runtime_jobs = [
+            self._runtime_job_from_durable(job) for job in load_result.jobs
+        ]
+        reconciliation_time: Optional[str] = None
+        reconciled_jobs = 0
+        reconciled_items = 0
+        for job in runtime_jobs:
+            has_nonterminal = any(
+                state not in TERMINAL_ITEM_STATES
+                for state in job.get("item_states") or []
+            )
+            stale_job_state = job.get("state") not in TERMINAL_ITEM_STATES
+            if not has_nonterminal and not stale_job_state:
+                continue
+            if reconciliation_time is None:
+                reconciliation_time = self._utc_timestamp()
+            if has_nonterminal:
+                changed = self._reconcile_restored_job(
+                    job, reconciliation_time
+                )
+                reconciled_items += changed
+            else:
+                self._recompute_job_state_locked(job)
+                job["updated_at"] = reconciliation_time
+                job["finished_at"] = reconciliation_time
+            reconciled_jobs += 1
+
+        status_method = getattr(self.job_store, "status", None)
+        store_status = status_method() if callable(status_method) else {}
+        written_revision = store_status.get("last_written_revision", -1)
+        if isinstance(written_revision, bool) or not isinstance(
+            written_revision, int
+        ):
+            written_revision = -1
+
+        with self._condition:
+            self.jobs.clear()
+            self.jobs.update(
+                (str(job["id"]), job) for job in runtime_jobs
+            )
+            maximum_id = max(
+                (int(job_id) for job_id in self.jobs), default=0
+            )
+            self.counter = max(
+                self.counter,
+                int(load_result.next_job_id) - 1,
+                maximum_id,
+            )
+            self._counter_floor = self.counter
+            self._persistence_revision = max(
+                self._persistence_revision, written_revision
+            )
+            self._last_persistence_result_revision = max(
+                self._last_persistence_result_revision, written_revision
+            )
+            self._reset_runtime_ownership_locked()
+            self._record_load_health_locked(load_result)
+            if reconciled_jobs:
+                self._mark_dirty_locked()
+                snapshot = self._snapshot_for_persistence_locked()
+            else:
+                snapshot = None
+            self._condition.notify_all()
+
+        save_ok = self._persist_best_effort(snapshot, force=True)
+        save_failed = snapshot is not None and not save_ok
+        reason = str(load_result.reason or "")
+        if save_failed:
+            reason = self.persistence_status().get(
+                "last_error_code"
+            ) or "persistence_unavailable"
+        result = JobRestoreResult(
+            enabled=True,
+            loaded_count=len(runtime_jobs),
+            discarded_count=int(load_result.discarded_job_count),
+            reconciled_job_count=reconciled_jobs,
+            reconciled_item_count=reconciled_items,
+            degraded=bool(load_result.degraded or save_failed),
+            source=str(load_result.source or ""),
+            reason=str(reason),
+        )
+        with self.lock:
+            self._restore_result = result
+            self._restore_in_progress = False
+        return result
 
     def _mark_required_failure(
         self, job_id: str, item_id: Optional[str] = None
