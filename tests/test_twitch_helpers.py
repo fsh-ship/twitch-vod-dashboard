@@ -37,6 +37,7 @@ class PureTwitchHelperTests(unittest.TestCase):
                 "sys",
                 "tempfile",
                 "typing",
+                "urllib",
             },
         )
         source = module_path.read_text(encoding="utf-8")

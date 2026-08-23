@@ -521,9 +521,12 @@ class TwitchSearchOrchestrationTests(unittest.TestCase):
             [
                 {
                     "streamer": "missing-module",
-                    "error": "The yt-dlp Python module was not found. Install the dependencies from requirements.txt.",
+                    "error": "Enter a valid Twitch streamer login.",
                 },
-                {"streamer": "broken", "error": "search failed"},
+                {
+                    "streamer": "broken",
+                    "error": "Twitch VOD discovery failed.",
+                },
             ],
         )
         self.assertEqual([item["streamer"] for item in payload["debug"]], ["working"])
@@ -571,6 +574,152 @@ class TwitchSearchOrchestrationTests(unittest.TestCase):
                 ],
             },
         )
+
+
+class TwitchVodDiscoveryTests(unittest.TestCase):
+    @staticmethod
+    def entry(vod_id, title="VOD", upload_date="20260810", **updates):
+        entry = {
+            "id": str(vod_id),
+            "title": title,
+            "upload_date": upload_date,
+            "url": f"https://www.twitch.tv/videos/{vod_id}",
+        }
+        entry.update(updates)
+        return entry
+
+    @staticmethod
+    def source(entries, label="archives"):
+        return [{"_source_url": label, "entries": entries}]
+
+    def discover(self, entries, **kwargs):
+        return twitch.discover_streamer_vods(
+            "Example_Streamer",
+            kwargs.pop("settings", {"enrich_vod_dates": True}),
+            source_runner=kwargs.pop("source_runner", mock.Mock(return_value=self.source(entries))),
+            **kwargs,
+        )
+
+    def test_public_discovery_defaults_to_ten_canonical_newest_first_vods(self):
+        entries = [self.entry(2_854_443_252 - index) for index in range(11)]
+        runner = mock.Mock(return_value=self.source(entries))
+
+        payload = self.discover(entries, source_runner=runner)
+
+        self.assertEqual(payload["streamer"], "example_streamer")
+        self.assertIsNone(payload["error"])
+        self.assertEqual(len(payload["vods"]), 10)
+        self.assertEqual(
+            [item["twitch_vod_id"] for item in payload["vods"]],
+            [str(2_854_443_252 - index) for index in range(10)],
+        )
+        runner.assert_called_once_with(
+            "example_streamer", 10, {"enrich_vod_dates": True}
+        )
+
+    def test_custom_limit_is_bounded_and_ids_are_canonicalized(self):
+        entries = [
+            self.entry("v2854443252", "Prefixed"),
+            self.entry("v2854443252", "Duplicate"),
+            {"id": "v12-not-valid", "title": "Malformed"},
+            self.entry("2854443251", "Second"),
+        ]
+        runner = mock.Mock(return_value=self.source(entries))
+
+        payload = self.discover(entries, limit=999, source_runner=runner)
+
+        runner.assert_called_once_with(
+            "example_streamer", twitch.VOD_DISCOVERY_MAX_LIMIT,
+            {"enrich_vod_dates": True},
+        )
+        self.assertEqual(
+            [item["twitch_vod_id"] for item in payload["vods"]],
+            ["2854443252", "2854443251"],
+        )
+        self.assertEqual(
+            payload["vods"][0]["canonical_url"],
+            "https://www.twitch.tv/videos/2854443252",
+        )
+        self.assertEqual(payload["diagnostics"]["deduped"], 3)
+
+        small = self.discover(
+            entries,
+            limit=1,
+            source_runner=mock.Mock(return_value=self.source(entries)),
+        )
+        self.assertEqual(
+            [item["twitch_vod_id"] for item in small["vods"]],
+            ["2854443252"],
+        )
+
+    def test_discovery_reuses_targeted_date_enrichment_and_keeps_failures(self):
+        dated = self.entry("2854443252", upload_date="20260823")
+        unknown = self.entry("2854443251", title="", upload_date="")
+        failed = self.entry("2854443250", upload_date="")
+        calls = []
+
+        def detail(url, settings):
+            calls.append((url, settings))
+            if url.endswith("2854443250"):
+                raise RuntimeError("private COOKIE=secret signed manifest")
+            return {"release_timestamp": 1_787_507_539, "title": "Recovered"}
+
+        payload = self.discover(
+            [dated, unknown, failed],
+            settings={"enrich_vod_dates": True, "cookie_file": "cookie.txt"},
+            detail_runner=detail,
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(call[1]["cookie_file"] == "cookie.txt" for call in calls))
+        self.assertEqual(payload["vods"][0]["upload_date"], "2026-08-23")
+        self.assertEqual(payload["vods"][1]["upload_date"], "2026-08-23")
+        self.assertEqual(payload["vods"][1]["title"], "Recovered")
+        self.assertIsNone(payload["vods"][2]["upload_date"])
+        self.assertEqual(payload["diagnostics"]["date_metadata_enriched"], 1)
+        self.assertEqual(payload["diagnostics"]["date_enrichment_failed"], 1)
+        self.assertNotIn("COOKIE=secret", str(payload))
+        self.assertNotIn("manifest", str(payload))
+
+    def test_discovery_filters_live_and_non_vod_without_archive_or_date_policy(self):
+        payload = self.discover(
+            [
+                self.entry("2854443252", "Known", upload_date=""),
+                self.entry("2854443251", "Live", is_live=True),
+                {"title": "Channel", "url": "https://www.twitch.tv/example_streamer"},
+                self.entry("2854443250", "Completed", upload_date=""),
+            ],
+            settings={"enrich_vod_dates": False},
+        )
+
+        self.assertEqual(
+            [item["twitch_vod_id"] for item in payload["vods"]],
+            ["2854443252", "2854443250"],
+        )
+        self.assertTrue(all(item["upload_date"] is None for item in payload["vods"]))
+        self.assertEqual(payload["diagnostics"]["skipped_live"], 1)
+        self.assertEqual(payload["diagnostics"]["skipped_by_date"], 0)
+        self.assertNotIn("already_downloaded", str(payload))
+
+    def test_discovery_returns_only_safe_error_codes_and_has_no_flask_or_job_dependency(self):
+        payload = twitch.discover_streamer_vods(
+            "example_streamer",
+            {"cookie_file": "COOKIE-SENTINEL"},
+            source_runner=mock.Mock(
+                side_effect=RuntimeError(
+                    "Authorization: SECRET signed-url manifest.m3u8 command"
+                )
+            ),
+        )
+        invalid = twitch.discover_streamer_vods("not-valid!", {})
+
+        self.assertEqual(payload["error"], {"code": "yt_dlp_failed"})
+        self.assertEqual(invalid["error"], {"code": "invalid_streamer"})
+        self.assertNotIn("COOKIE-SENTINEL", str(payload))
+        self.assertNotIn("SECRET", str(payload))
+        self.assertNotIn("manifest.m3u8", str(payload))
+        self.assertNotIn("JobManager", twitch.discover_streamer_vods.__code__.co_names)
+        self.assertNotIn("Flask", twitch.discover_streamer_vods.__code__.co_names)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -243,6 +244,10 @@ _TWITCH_NOT_LIVE_RE = re.compile(
 LIVE_STATUS_TIMEOUT_SECONDS = 30
 VOD_DETAIL_TIMEOUT_SECONDS = 30
 VOD_DATE_ENRICHMENT_WORKERS = 2
+VOD_DISCOVERY_DEFAULT_LIMIT = 10
+# Matches the existing interactive search ceiling while keeping the new domain
+# primitive bounded. Auto VOD will use its smaller default window of ten.
+VOD_DISCOVERY_MAX_LIMIT = 150
 _TWITCH_QUALITY_RE = re.compile(
     r"(?<!\d)(\d{3,4})p(?:([1-9]\d{1,2}))?\b", re.IGNORECASE
 )
@@ -772,6 +777,235 @@ def _enrich_unknown_vod_dates(
                 )
 
 
+def _bounded_vod_discovery_limit(value: Any) -> int:
+    """Return a small bounded VOD-history window for ID-first discovery."""
+    if isinstance(value, bool):
+        return VOD_DISCOVERY_DEFAULT_LIMIT
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return VOD_DISCOVERY_DEFAULT_LIMIT
+    if limit < 1:
+        return VOD_DISCOVERY_DEFAULT_LIMIT
+    return min(limit, VOD_DISCOVERY_MAX_LIMIT)
+
+
+def _safe_discovery_source(value: Any) -> str:
+    """Keep diagnostics useful without allowing signed/raw source URLs through."""
+    source = str(value or "").strip()
+    if not source:
+        return ""
+    parsed = urlsplit(source)
+    if parsed.scheme or parsed.netloc:
+        host = parsed.netloc.lower()
+        if host in {"twitch.tv", "www.twitch.tv"}:
+            return f"https://www.twitch.tv{parsed.path}"
+        return ""
+    if re.fullmatch(r"[A-Za-z0-9_. -]{1,80}", source):
+        return source
+    return ""
+
+
+def _safe_vod_duration(value: Any) -> Optional[float | int]:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    if duration < 0 or duration > 60 * 60 * 24 * 14:
+        return None
+    return int(duration) if duration.is_integer() else duration
+
+
+def _discovery_error_code(exc: Exception) -> str:
+    if isinstance(exc, FileNotFoundError):
+        return "yt_dlp_unavailable"
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "timeout"
+    return "yt_dlp_failed"
+
+
+def discovery_error_message(code: Any) -> str:
+    """Map safe discovery codes to stable manual-search wording."""
+    return {
+        "invalid_streamer": "Enter a valid Twitch streamer login.",
+        "yt_dlp_unavailable": (
+            "The yt-dlp Python module was not found. "
+            "Install the dependencies from requirements.txt."
+        ),
+        "timeout": "The Twitch VOD discovery timed out.",
+        "yt_dlp_failed": "Twitch VOD discovery failed.",
+    }.get(str(code or ""), "Twitch VOD discovery failed.")
+
+
+def discover_streamer_vods(
+    streamer: Any,
+    settings: Dict[str, Any],
+    *,
+    limit: Any = VOD_DISCOVERY_DEFAULT_LIMIT,
+    source_runner: Optional[
+        Callable[[str, Any, Optional[Dict[str, Any]]], List[Dict[str, Any]]]
+    ] = None,
+    detail_runner: Optional[
+        Callable[[str, Dict[str, Any]], Dict[str, Any]]
+    ] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+    enrichment_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+    exclude_live: bool = True,
+    only_real_vods: bool = True,
+) -> Dict[str, Any]:
+    """Discover recent canonical Twitch archive VOD identities for one streamer.
+
+    This web-framework-free primitive deliberately has no archive, date-range, job, or
+    persistence policy. It preserves the flat-playlist source order and only
+    returns safe VOD metadata keyed by the durable Twitch VOD ID.
+    """
+    canonical_streamer = _canonical_live_streamer_login(streamer)
+    diagnostics: Dict[str, Any] = {
+        "streamer": canonical_streamer,
+        "source": "",
+        "found_raw": 0,
+        "deduped": 0,
+        "kept": 0,
+        "unknown_dates": 0,
+        "date_metadata_enriched": 0,
+        "date_enrichment_failed": 0,
+        "skipped_by_date": 0,
+        "skipped_live": 0,
+        "skipped_nonvod": 0,
+    }
+    if not canonical_streamer:
+        return {
+            "streamer": "",
+            "vods": [],
+            "diagnostics": diagnostics,
+            "error": {"code": "invalid_streamer"},
+        }
+
+    bounded_limit = _bounded_vod_discovery_limit(limit)
+    run_sources = source_runner or run_ytdlp_json_sources
+    run_detail = detail_runner or run_ytdlp_vod_detail
+    try:
+        playlists = run_sources(canonical_streamer, bounded_limit, settings)
+    except Exception as exc:
+        return {
+            "streamer": canonical_streamer,
+            "vods": [],
+            "diagnostics": diagnostics,
+            "error": {"code": _discovery_error_code(exc)},
+        }
+
+    entries: List[Dict[str, Any]] = []
+    source_labels: List[str] = []
+    seen_entry_keys: set[str] = set()
+    for playlist in playlists if isinstance(playlists, list) else []:
+        if not isinstance(playlist, dict):
+            continue
+        source_label = _safe_discovery_source(playlist.get("_source_url"))
+        if source_label:
+            source_labels.append(source_label)
+        raw_entries = playlist.get("entries") or []
+        if not isinstance(raw_entries, list):
+            continue
+        diagnostics["found_raw"] += len(raw_entries)
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = dict(raw_entry)
+            raw_url = normalize_vod_url(entry)
+            vod_id = extract_twitch_vod_id(entry) or vod_id_from_url(raw_url)
+            key = vod_id or raw_url or str(
+                entry.get("id") or entry.get("title") or ""
+            )
+            if key and key in seen_entry_keys:
+                continue
+            if key:
+                seen_entry_keys.add(key)
+            entry["_source_url"] = source_label
+            entries.append(entry)
+
+    diagnostics["source"] = ", ".join(source_labels)
+    diagnostics["deduped"] = len(entries)
+    cache = enrichment_cache if enrichment_cache is not None else {}
+    _enrich_unknown_vod_dates(
+        entries,
+        settings,
+        detail_runner=run_detail,
+        cache=cache,
+        exclude_live=exclude_live,
+        log_callback=log_callback,
+    )
+
+    vods: List[Dict[str, Any]] = []
+    for entry in entries:
+        url = normalize_vod_url(entry)
+        if not url:
+            continue
+        if exclude_live and is_live_or_upcoming_entry(entry):
+            diagnostics["skipped_live"] += 1
+            continue
+        if only_real_vods and not is_real_vod_url(url):
+            rescued_url = canonical_twitch_vod_url(entry)
+            if rescued_url:
+                url = rescued_url
+            else:
+                diagnostics["skipped_nonvod"] += 1
+                continue
+
+        vod_id = extract_twitch_vod_id(entry) or vod_id_from_url(url)
+        canonical_url = canonical_twitch_vod_url(vod_id)
+        if not vod_id or not canonical_url:
+            diagnostics["skipped_nonvod"] += 1
+            continue
+        date_str = entry_date(entry)
+        enriched = False
+        if not date_str and settings.get("enrich_vod_dates", True):
+            detail = cache.get(vod_id)
+            if detail is not None:
+                if exclude_live and detail and is_live_or_upcoming_entry(detail):
+                    diagnostics["skipped_live"] += 1
+                    continue
+                if only_real_vods and detail:
+                    detail_url = normalize_vod_url(detail)
+                    if detail_url and not is_real_vod_url(detail_url):
+                        rescued_url = canonical_twitch_vod_url(detail)
+                        if rescued_url:
+                            canonical_url = rescued_url
+                        else:
+                            diagnostics["skipped_nonvod"] += 1
+                            continue
+                date_str = entry_date(detail)
+                if date_str:
+                    enriched = True
+                    diagnostics["date_metadata_enriched"] += 1
+                    if not entry.get("title") and detail.get("title"):
+                        entry["title"] = detail.get("title")
+                else:
+                    diagnostics["date_enrichment_failed"] += 1
+        if not date_str:
+            diagnostics["unknown_dates"] += 1
+        vods.append(
+            {
+                "streamer": canonical_streamer,
+                "twitch_vod_id": vod_id,
+                "canonical_url": canonical_url,
+                "title": str(entry.get("title") or "Untitled"),
+                "upload_date": date_str,
+                "duration": _safe_vod_duration(entry.get("duration")),
+                "date_enriched": enriched,
+            }
+        )
+        if len(vods) >= bounded_limit:
+            break
+
+    diagnostics["kept"] = len(vods)
+    return {
+        "streamer": canonical_streamer,
+        "vods": vods,
+        "diagnostics": diagnostics,
+        "error": None,
+    }
+
+
 def search_vods(
     streamers: List[str],
     settings: Dict[str, Any],
@@ -801,144 +1035,58 @@ def search_vods(
     enrichment_cache: Dict[str, Dict[str, Any]] = {}
 
     for streamer in streamers:
-        try:
-            playlists = run_sources(streamer, limit, settings)
-            entries: List[Dict[str, Any]] = []
-            source_urls: List[str] = []
-            seen_entry_keys = set()
-            found_raw = 0
-            for playlist in playlists:
-                if not isinstance(playlist, dict):
-                    continue
-                source_url = playlist.get("_source_url", "")
-                if source_url:
-                    source_urls.append(source_url)
-                raw_entries = playlist.get("entries") or []
-                found_raw += len(raw_entries)
-                for raw_entry in raw_entries:
-                    if not isinstance(raw_entry, dict):
-                        continue
-                    entry = dict(raw_entry)
-                    raw_url = normalize_vod_url(entry)
-                    key = (
-                        vod_id_from_url(raw_url)
-                        or raw_url
-                        or str(entry.get("id") or entry.get("title") or "")
-                    )
-                    if key and key in seen_entry_keys:
-                        continue
-                    if key:
-                        seen_entry_keys.add(key)
-                    entry["_source_url"] = source_url
-                    entries.append(entry)
-            _enrich_unknown_vod_dates(
-                entries,
-                settings,
-                detail_runner=run_detail,
-                cache=enrichment_cache,
-                exclude_live=exclude_live,
-                log_callback=log_callback,
-            )
-            kept = 0
-            skipped_by_date = 0
-            unknown_dates = 0
-            date_metadata_enriched = 0
-            date_enrichment_failed = 0
-            skipped_live = 0
-            skipped_nonvod = 0
-            for entry in entries:
-                url = normalize_vod_url(entry)
-                if not url:
-                    continue
-                if exclude_live and is_live_or_upcoming_entry(entry):
-                    skipped_live += 1
-                    continue
-                if only_real_vods and not is_real_vod_url(url):
-                    rescued_url = canonical_twitch_vod_url(entry)
-                    if rescued_url:
-                        url = rescued_url
-                    else:
-                        skipped_nonvod += 1
-                        continue
-                date_str = entry_date(entry)
-                enriched = False
-                if not date_str and settings.get("enrich_vod_dates", True):
-                    vod_id = extract_twitch_vod_id(entry) or vod_id_from_url(url)
-                    detail = enrichment_cache.get(vod_id)
-                    if detail is not None:
-                        if (
-                            exclude_live
-                            and detail
-                            and is_live_or_upcoming_entry(detail)
-                        ):
-                            skipped_live += 1
-                            continue
-                        if only_real_vods and detail:
-                            detail_url = normalize_vod_url(detail)
-                            if detail_url and not is_real_vod_url(detail_url):
-                                rescued_url = canonical_twitch_vod_url(detail)
-                                if rescued_url:
-                                    url = rescued_url
-                                else:
-                                    skipped_nonvod += 1
-                                    continue
-                        date_str = entry_date(detail)
-                        if date_str:
-                            enriched = True
-                            date_metadata_enriched += 1
-                            if not entry.get("title") and detail.get("title"):
-                                entry["title"] = detail.get("title")
-                        else:
-                            date_enrichment_failed += 1
-                if not date_str:
-                    unknown_dates += 1
-                matches_date = in_range(
-                    date_str, start, end, include_unknown
-                )
-                if not matches_date:
-                    skipped_by_date += 1
-                    if strict_date_filter or (
-                        not date_str and not include_unknown
-                    ):
-                        continue
-                vid = vod_id_from_url(url)
-                kept += 1
-                results.append(
-                    {
-                        "streamer": streamer,
-                        "title": entry.get("title") or "Untitled",
-                        "date": date_str or "unknown",
-                        "url": url,
-                        "id": vid,
-                        "already_downloaded": vid in known_vod_ids,
-                        "date_enriched": enriched,
-                        "outside_range": not matches_date,
-                    }
-                )
-            debug.append(
-                {
-                    "streamer": streamer,
-                    "source": ", ".join(source_urls),
-                    "found_raw": found_raw,
-                    "deduped": len(entries),
-                    "kept": kept,
-                    "unknown_dates": unknown_dates,
-                    "date_metadata_enriched": date_metadata_enriched,
-                    "date_enrichment_failed": date_enrichment_failed,
-                    "skipped_by_date": skipped_by_date,
-                    "skipped_live": skipped_live,
-                    "skipped_nonvod": skipped_nonvod,
-                }
-            )
-        except FileNotFoundError:
+        discovery = discover_streamer_vods(
+            streamer,
+            settings,
+            limit=limit,
+            source_runner=run_sources,
+            detail_runner=run_detail,
+            log_callback=log_callback,
+            enrichment_cache=enrichment_cache,
+            exclude_live=exclude_live,
+            only_real_vods=only_real_vods,
+        )
+        error = discovery.get("error")
+        if isinstance(error, dict):
             errors.append(
                 {
                     "streamer": streamer,
-                    "error": "The yt-dlp Python module was not found. Install the dependencies from requirements.txt.",
+                    "error": discovery_error_message(error.get("code")),
                 }
             )
-        except Exception as exc:
-            errors.append({"streamer": streamer, "error": str(exc)})
+            continue
+
+        diagnostic = dict(discovery.get("diagnostics") or {})
+        diagnostic["streamer"] = streamer
+        diagnostic["kept"] = 0
+        for vod in discovery.get("vods") or []:
+            if not isinstance(vod, dict):
+                continue
+            date_str = vod.get("upload_date")
+            matches_date = in_range(
+                date_str, start, end, include_unknown
+            )
+            if not matches_date:
+                diagnostic["skipped_by_date"] += 1
+                if strict_date_filter or (
+                    not date_str and not include_unknown
+                ):
+                    continue
+            vod_id = str(vod.get("twitch_vod_id") or "")
+            diagnostic["kept"] += 1
+            results.append(
+                {
+                    "streamer": streamer,
+                    "title": vod.get("title") or "Untitled",
+                    "date": date_str or "unknown",
+                    "url": vod.get("canonical_url") or "",
+                    "id": vod_id,
+                    "already_downloaded": vod_id in known_vod_ids,
+                    "date_enriched": vod.get("date_enriched") is True,
+                    "outside_range": not matches_date,
+                }
+            )
+        debug.append(diagnostic)
 
     def sort_key(item: Dict[str, Any]) -> tuple[str, str, str]:
         date_value = (
