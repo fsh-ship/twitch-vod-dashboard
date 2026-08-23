@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import re
@@ -970,11 +971,17 @@ def _set_job_counter(value: int) -> None:
     job_counter = value
 
 
-def create_job(urls: List[str], label: str) -> str:
+def create_job(
+    urls: List[str],
+    label: str,
+    *,
+    retry_of: Optional[Dict[str, str]] = None,
+) -> str:
     manager = _job_manager_for_compatibility()
     job_id = manager.create_download_job(
         urls,
         label,
+        retry_of=retry_of,
         counter_getter=lambda: job_counter,
         counter_setter=_set_job_counter,
     )
@@ -1211,6 +1218,8 @@ def create_upload_job(
     label: str = "Local YouTube Upload",
     *,
     playlist_id: Optional[str] = None,
+    frozen_item_metadata: Optional[List[Dict[str, Any]]] = None,
+    retry_of: Optional[Dict[str, str]] = None,
 ) -> str:
     settings = load_settings()
     resolved_playlist_id = str(
@@ -1226,7 +1235,11 @@ def create_upload_job(
     uploaded = set(map(str, settings.get("youtube_uploaded_files") or []))
     clean_paths = []
     item_metadata = []
-    for raw in paths:
+    if frozen_item_metadata is not None and len(frozen_item_metadata) != len(
+        paths
+    ):
+        raise RuntimeError("Frozen upload metadata does not match the files.")
+    for source_index, raw in enumerate(paths):
         p = safe_local_video_path(raw, settings)
         if str(p) in clean_paths:
             continue
@@ -1236,24 +1249,29 @@ def create_upload_job(
         if payload.get("already_uploaded"):
             raise RuntimeError("This VOD is already in uploaded history.")
         clean_paths.append(str(p))
-        streamer = payload.get("streamer") or ""
-        item_playlist_id = (
-            dashboard_settings.resolve_youtube_playlist_for_streamer(
-                settings,
-                streamer,
-                explicit_playlist=playlist_id,
+        if frozen_item_metadata is not None:
+            item_metadata.append(
+                dict(frozen_item_metadata[source_index])
             )
-        )
-        item_metadata.append({
-            "streamer": streamer,
-            "date": payload.get("date_de") or "",
-            "title": payload.get("title") or payload.get("youtube_title") or p.name,
-            "vod_id": payload.get("vod_id") or "",
-            "name": p.name,
-            "size_bytes": payload.get("size_bytes"),
-            "size_gb": payload.get("size_gb"),
-            "youtube_playlist_id": item_playlist_id,
-        })
+        else:
+            streamer = payload.get("streamer") or ""
+            item_playlist_id = (
+                dashboard_settings.resolve_youtube_playlist_for_streamer(
+                    settings,
+                    streamer,
+                    explicit_playlist=playlist_id,
+                )
+            )
+            item_metadata.append({
+                "streamer": streamer,
+                "date": payload.get("date_de") or "",
+                "title": payload.get("title") or payload.get("youtube_title") or p.name,
+                "vod_id": payload.get("vod_id") or "",
+                "name": p.name,
+                "size_bytes": payload.get("size_bytes"),
+                "size_gb": payload.get("size_gb"),
+                "youtube_playlist_id": item_playlist_id,
+            })
     if not clean_paths:
         raise RuntimeError("No valid VOD files were provided for upload.")
     job_id = manager.create_upload_job(
@@ -1261,6 +1279,7 @@ def create_upload_job(
         label,
         playlist_id=resolved_playlist_id,
         item_metadata=item_metadata,
+        retry_of=retry_of,
         counter_getter=lambda: job_counter,
         counter_setter=_set_job_counter,
     )
@@ -2074,6 +2093,143 @@ def api_cancel_queue_item():
     })
 
 
+class RetryActionError(RuntimeError):
+    """Safe client-facing classification for a rejected retry action."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _canonical_retry_download_url(raw: Any) -> str:
+    candidate = str(raw or "").strip()
+    canonical = canonical_twitch_vod_url(candidate)
+    if (
+        not canonical
+        or candidate != canonical
+        or not re.fullmatch(
+            r"https://www\.twitch\.tv/videos/[1-9][0-9]{5,19}",
+            canonical,
+        )
+    ):
+        raise RetryActionError(
+            "unsafe_source_path",
+            "The saved Twitch VOD source is not safe to retry.",
+        )
+    return canonical
+
+
+def _validated_retry_upload_path(
+    raw: Any, settings: Mapping[str, Any]
+) -> Path:
+    policy = dashboard_media.MediaPathPolicy(MEDIA_ROOT)
+    try:
+        candidate = policy.resolve_media_path(raw)
+    except RuntimeError as exc:
+        raise RetryActionError(
+            "unsafe_source_path",
+            "The saved upload source is not safe to retry.",
+        ) from exc
+    if not candidate.exists() or not candidate.is_file():
+        raise RetryActionError(
+            "source_missing",
+            "The upload source file is no longer available.",
+        )
+    try:
+        return policy.safe_local_video_path(
+            raw, settings, must_exist=True
+        )
+    except RuntimeError as exc:
+        raise RetryActionError(
+            "unsafe_source_path",
+            "The saved upload source is not a complete supported video.",
+        ) from exc
+
+
+def _retry_playlist_id(value: Any) -> str:
+    candidate = str(value or "").strip()
+    if candidate and not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", candidate):
+        raise RetryActionError(
+            "not_retryable",
+            "The saved playlist selection is not safe to retry.",
+        )
+    return candidate
+
+
+def _validated_retry_upload_size(raw: Any, path: Path) -> int:
+    source = raw if isinstance(raw, Mapping) else {}
+    expected_size = source.get("size_bytes")
+    try:
+        current_size = path.stat().st_size
+    except OSError as exc:
+        raise RetryActionError(
+            "source_missing",
+            "The upload source file is no longer available.",
+        ) from exc
+    if (
+        isinstance(expected_size, int)
+        and not isinstance(expected_size, bool)
+        and expected_size >= 0
+        and current_size != expected_size
+    ):
+        raise RetryActionError(
+            "source_changed",
+            "The upload source changed after the original job was created.",
+        )
+    return current_size
+
+
+def _frozen_retry_upload_metadata(
+    raw: Any, path: Path
+) -> Dict[str, Any]:
+    source = raw if isinstance(raw, Mapping) else {}
+    expected_size = source.get("size_bytes")
+    current_size = _validated_retry_upload_size(source, path)
+
+    def safe_text(key: str, maximum: int) -> str:
+        value = source.get(key)
+        if not isinstance(value, str):
+            return ""
+        return "".join(
+            character
+            for character in value.strip()[:maximum]
+            if ord(character) >= 32 and ord(character) != 127
+        )
+
+    streamer = dashboard_settings.canonical_streamer_login(
+        source.get("streamer")
+    )
+    vod_id = safe_text("vod_id", 32)
+    if vod_id and not vod_id.isdigit():
+        vod_id = ""
+    size_gb = source.get("size_gb")
+    if (
+        isinstance(size_gb, bool)
+        or not isinstance(size_gb, (int, float))
+        or not math.isfinite(float(size_gb))
+        or size_gb < 0
+    ):
+        size_gb = round(current_size / (1024 ** 3), 3)
+    return {
+        "streamer": streamer,
+        "date": safe_text("date", 64),
+        "title": safe_text("title", 1000) or path.name,
+        "vod_id": vod_id,
+        "name": path.name,
+        "size_bytes": (
+            expected_size
+            if isinstance(expected_size, int)
+            and not isinstance(expected_size, bool)
+            and expected_size >= 0
+            else current_size
+        ),
+        "size_gb": float(size_gb),
+        "youtube_playlist_id": _retry_playlist_id(
+            source.get("youtube_playlist_id")
+        ),
+    }
+
+
 @app.post("/api/jobs/retry-item")
 def api_retry_queue_item():
     job_id, item_id = _queue_action_identity()
@@ -2084,7 +2240,12 @@ def api_retry_queue_item():
     if retry is None:
         return jsonify({"error": "Only a failed Queue item can be retried."}), 409
     if retry.get("blocked"):
-        return jsonify({"error": retry.get("reason"), "outcome_uncertain": True}), 409
+        reason = str(retry.get("reason_code") or "not_retryable")
+        return jsonify({
+            "error": retry.get("reason"),
+            "reason": reason,
+            "outcome_uncertain": reason == "review_required",
+        }), 409
     if not retry.get("reserved"):
         return jsonify({
             "ok": True,
@@ -2094,24 +2255,51 @@ def api_retry_queue_item():
         })
     try:
         if retry.get("type") == "youtube_upload":
+            settings = load_settings()
+            path = _validated_retry_upload_path(retry["value"], settings)
+            _validated_retry_upload_size(
+                retry.get("item_metadata"), path
+            )
+            upload_kwargs: Dict[str, Any] = {
+                "retry_of": {"job_id": job_id, "item_id": item_id}
+            }
+            if retry.get("interrupted"):
+                upload_kwargs.update({
+                    "playlist_id": _retry_playlist_id(
+                        retry.get("playlist_id")
+                    ),
+                    "frozen_item_metadata": [
+                        _frozen_retry_upload_metadata(
+                            retry.get("item_metadata"), path
+                        )
+                    ],
+                })
             retry_job_id = create_upload_job(
-                [str(retry["value"])], "Retry YouTube Upload"
+                [str(path)],
+                "Retry YouTube Upload",
+                **upload_kwargs,
             )
         else:
             retry_job_id = create_job(
-                [str(retry["value"])], "Retry Twitch Download"
+                [_canonical_retry_download_url(retry["value"])],
+                "Retry Twitch Download",
+                retry_of={"job_id": job_id, "item_id": item_id},
             )
-    except RuntimeError as exc:
-        manager.finalize_retry(job_id, item_id, "")
-        return jsonify({"error": str(exc)}), 409
+    except RetryActionError as exc:
+        manager.cancel_retry_reservation(job_id, item_id)
+        return jsonify({"error": str(exc), "reason": exc.reason}), 409
+    except dashboard_jobs.JobPersistenceRequiredError as exc:
+        manager.cancel_retry_reservation(job_id, item_id)
+        return jsonify({"error": str(exc), "reason": exc.code}), 409
+    except RuntimeError:
+        manager.cancel_retry_reservation(job_id, item_id)
+        return jsonify({
+            "error": "The retry job could not be created.",
+            "reason": "not_retryable",
+        }), 409
     except Exception:
-        manager.finalize_retry(job_id, item_id, "")
+        manager.cancel_retry_reservation(job_id, item_id)
         raise
-    manager.finalize_retry(job_id, item_id, retry_job_id)
-    manager.update_job(
-        retry_job_id,
-        retry_of={"job_id": job_id, "item_id": item_id},
-    )
     return jsonify({
         "ok": True,
         "job_id": job_id,

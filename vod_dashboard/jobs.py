@@ -945,8 +945,52 @@ class JobManager:
         # The high-water counter remains consumed even though the invalid job
         # is removed from runtime state.
         with self.lock:
-            self.jobs.pop(str(job_id), None)
+            removed = self.jobs.pop(str(job_id), None)
+            retry_of = (
+                removed.get("retry_of")
+                if isinstance(removed, dict)
+                else None
+            )
+            if isinstance(retry_of, dict):
+                parent = self.jobs.get(str(retry_of.get("job_id") or ""))
+                item_id = str(retry_of.get("item_id") or "")
+                index = (
+                    self._item_index_locked(parent, item_id)
+                    if parent is not None
+                    else None
+                )
+                if (
+                    index is not None
+                    and parent["item_retry_job_ids"][index] == str(job_id)
+                ):
+                    parent["item_retry_job_ids"][index] = ""
             self._mark_dirty_locked()
+
+    def _attach_retry_relationship_locked(
+        self,
+        retry_job: Job,
+        retry_of: Optional[Dict[str, str]],
+    ) -> None:
+        """Attach both sides before the retry job's required creation save."""
+        if retry_of is None:
+            return
+        parent_job_id = str(retry_of.get("job_id") or "")
+        parent_item_id = str(retry_of.get("item_id") or "")
+        parent = self.jobs.get(parent_job_id)
+        if parent is None:
+            raise ValueError("The original retry item no longer exists.")
+        index = self._item_index_locked(parent, parent_item_id)
+        if index is None:
+            raise ValueError("The original retry item no longer exists.")
+        existing = parent["item_retry_job_ids"][index]
+        retry_job_id = str(retry_job["id"])
+        if existing not in {"", "__pending__", retry_job_id}:
+            raise ValueError("The Queue item already has a retry job.")
+        retry_job["retry_of"] = {
+            "job_id": parent_job_id,
+            "item_id": parent_item_id,
+        }
+        parent["item_retry_job_ids"][index] = retry_job_id
 
     @staticmethod
     def _lane_for_job(job: Job) -> str:
@@ -967,6 +1011,7 @@ class JobManager:
         urls: list[str],
         label: str,
         *,
+        retry_of: Optional[Dict[str, str]] = None,
         counter_getter: Optional[CounterGetter] = None,
         counter_setter: Optional[CounterSetter] = None,
     ) -> str:
@@ -975,7 +1020,7 @@ class JobManager:
             job_id = self._next_job_id(counter_getter, counter_setter)
             item_ids = self._item_ids(job_id, len(urls))
             durable_now = self._utc_timestamp()
-            self.jobs[job_id] = {
+            job = {
                 "id": job_id,
                 "label": label,
                 "status": "wartet",
@@ -1008,6 +1053,12 @@ class JobManager:
                 "log": [],
                 "returncode": None,
             }
+            self.jobs[job_id] = job
+            try:
+                self._attach_retry_relationship_locked(job, retry_of)
+            except Exception:
+                self.jobs.pop(job_id, None)
+                raise
             self._mark_dirty_locked(timestamp=durable_now)
             snapshot = self._snapshot_for_persistence_locked()
         try:
@@ -1110,6 +1161,7 @@ class JobManager:
         *,
         playlist_id: Optional[str] = None,
         item_metadata: Optional[list[Dict[str, Any]]] = None,
+        retry_of: Optional[Dict[str, str]] = None,
         counter_getter: Optional[CounterGetter] = None,
         counter_setter: Optional[CounterSetter] = None,
     ) -> str:
@@ -1155,6 +1207,11 @@ class JobManager:
             if playlist_id is not None:
                 job["playlist_id"] = str(playlist_id or "").strip()
             self.jobs[job_id] = job
+            try:
+                self._attach_retry_relationship_locked(job, retry_of)
+            except Exception:
+                self.jobs.pop(job_id, None)
+                raise
             self._mark_dirty_locked(timestamp=durable_now)
             snapshot = self._snapshot_for_persistence_locked()
         try:
@@ -1417,6 +1474,11 @@ class JobManager:
         state = job["item_states"][index]
         failure_kind = job["item_failure_kinds"][index]
         retry_job_id = job["item_retry_job_ids"][index]
+        recovery_reason = str(
+            job["item_recovery_reasons"][index]
+            or job["item_completion_reasons"][index]
+            or ""
+        )
         if job.get("type") == "recording":
             return {
                 "can_cancel": False,
@@ -1427,15 +1489,46 @@ class JobManager:
                 "retry_pending": False,
                 "retry_job_id": "",
                 "retry_block_reason": "",
+                "retry_blocked_reason": "recording_retry_unsupported",
             }
         uncertain = (
             job.get("type") == "youtube_upload"
             and failure_kind == "uncertain"
         )
+        interrupted_download = (
+            job.get("type") == "download"
+            and state == "interrupted"
+            and recovery_reason
+            in {"restart_before_start", "restart_interrupted"}
+        )
+        interrupted_upload = (
+            job.get("type") == "youtube_upload"
+            and state == "interrupted"
+            and recovery_reason == "restart_before_start"
+            and not uncertain
+        )
+        can_retry = (
+            (state == "failed" and not uncertain)
+            or interrupted_download
+            or interrupted_upload
+        ) and not retry_job_id
+        blocked_reason = ""
+        if retry_job_id:
+            blocked_reason = "already_retried"
+        elif job.get("type") == "youtube_upload" and (
+            uncertain
+            or (
+                state == "interrupted"
+                and recovery_reason == "upload_status_unknown"
+            )
+        ):
+            blocked_reason = "review_required"
+        elif state == "interrupted" and not can_retry:
+            blocked_reason = "not_retryable"
         return {
             "can_cancel": state == "running",
             "can_remove": state == "queued",
-            "can_retry": state == "failed" and not retry_job_id and not uncertain,
+            "can_retry": can_retry,
             "can_resolve": state == "failed",
             "can_stop_after_current": state == "running",
             "retry_pending": retry_job_id == "__pending__",
@@ -1445,6 +1538,7 @@ class JobManager:
                 if uncertain
                 else ""
             ),
+            "retry_blocked_reason": blocked_reason,
         }
 
     def queue_controls_snapshot(self) -> Dict[str, Dict[str, bool]]:
@@ -2004,10 +2098,10 @@ class JobManager:
     ) -> Optional[Dict[str, Any]]:
         with self.lock:
             job = self.jobs.get(job_id)
-            if job is None or job.get("type") == "recording":
+            if job is None:
                 return None
             index = self._item_index_locked(job, item_id)
-            if index is None or job["item_states"][index] != "failed":
+            if index is None:
                 return None
             existing = job["item_retry_job_ids"][index]
             if existing:
@@ -2016,25 +2110,59 @@ class JobManager:
                     "retry_job_id": "" if existing == "__pending__" else existing,
                     "pending": existing == "__pending__",
                 }
-            if (
-                job.get("type") == "youtube_upload"
-                and job["item_failure_kinds"][index] == "uncertain"
-            ):
+            capabilities = self._item_capabilities_locked(job, index)
+            if not capabilities["can_retry"]:
+                blocked_reason = capabilities.get(
+                    "retry_blocked_reason"
+                ) or "not_retryable"
+                if blocked_reason not in {
+                    "review_required",
+                    "recording_retry_unsupported",
+                }:
+                    return None
                 return {
                     "reserved": False,
                     "blocked": True,
-                    "reason": self._item_capabilities_locked(job, index)[
-                        "retry_block_reason"
-                    ],
+                    "reason_code": blocked_reason,
+                    "reason": (
+                        capabilities.get("retry_block_reason")
+                        or "This Queue item cannot be retried."
+                    ),
                 }
             job["item_retry_job_ids"][index] = "__pending__"
+            item_metadata = job.get("item_metadata")
             return {
                 "reserved": True,
                 "type": job.get("type") or "download",
                 "value": job["urls"][index],
                 "label": job.get("label") or "Queue retry",
                 "index": index,
+                "interrupted": job["item_states"][index]
+                == "interrupted",
+                "playlist_id": str(job.get("playlist_id") or ""),
+                "item_metadata": deepcopy(
+                    item_metadata[index]
+                    if isinstance(item_metadata, list)
+                    and index < len(item_metadata)
+                    and isinstance(item_metadata[index], dict)
+                    else {}
+                ),
             }
+
+    def cancel_retry_reservation(self, job_id: str, item_id: str) -> bool:
+        """Release only a process-local sentinel, never a durable backlink."""
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return False
+            index = self._item_index_locked(job, item_id)
+            if (
+                index is None
+                or job["item_retry_job_ids"][index] != "__pending__"
+            ):
+                return False
+            job["item_retry_job_ids"][index] = ""
+            return True
 
     def finalize_retry(
         self, job_id: str, item_id: str, retry_job_id: str

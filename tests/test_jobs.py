@@ -766,7 +766,15 @@ class QueueControlManagerTests(unittest.TestCase):
             self.manager.request_stop_after_current(job_id, claimed["item_id"])
         )
         capabilities = self.manager.snapshot_jobs()[0]["item_capabilities"][0]
-        self.assertFalse(any(capabilities.values()))
+        self.assertFalse(capabilities["can_cancel"])
+        self.assertFalse(capabilities["can_remove"])
+        self.assertFalse(capabilities["can_retry"])
+        self.assertFalse(capabilities["can_resolve"])
+        self.assertFalse(capabilities["can_stop_after_current"])
+        self.assertEqual(
+            capabilities["retry_blocked_reason"],
+            "recording_retry_unsupported",
+        )
 
     def test_backend_exposes_only_legal_item_capabilities(self):
         job_id = self.manager.create_download_job(["one"], "Queue")
@@ -2229,33 +2237,46 @@ class AppJobCompatibilityTests(unittest.TestCase):
         create_retry.assert_called_once_with(
             ["https://www.twitch.tv/videos/1234567890"],
             "Retry Twitch Download",
+            retry_of={"job_id": job_id, "item_id": item_id},
         )
         self.assertEqual(dashboard.jobs[job_id]["item_states"], ["failed"])
 
     def test_retry_failed_upload_is_new_session_only_when_outcome_known(self):
-        job_id = dashboard.JOB_MANAGER.create_upload_job(
-            ["C:/media/failed.mp4"], "Upload"
-        )
-        dashboard.JOB_MANAGER.set_upload_item_status(
-            job_id, 1, "fehler", error="quota rejected"
-        )
-        item_id = dashboard.jobs[job_id]["item_ids"][0]
-        client = dashboard.app.test_client()
-        csrf_token = client.get("/api/auth/status").get_json()["csrf_token"]
-
-        with mock.patch.object(
-            dashboard, "create_upload_job", return_value="retry-upload-2"
-        ) as create_retry:
-            response = client.post(
-                "/api/jobs/retry-item",
-                json={"job_id": job_id, "item_id": item_id},
-                headers={"X-CSRF-Token": csrf_token},
+        with tempfile.TemporaryDirectory() as directory:
+            media_root = Path(directory)
+            video = media_root / "failed.mp4"
+            video.write_bytes(b"video")
+            job_id = dashboard.JOB_MANAGER.create_upload_job(
+                [str(video)], "Upload"
             )
+            dashboard.JOB_MANAGER.set_upload_item_status(
+                job_id, 1, "fehler", error="quota rejected"
+            )
+            item_id = dashboard.jobs[job_id]["item_ids"][0]
+            client = dashboard.app.test_client()
+            csrf_token = client.get("/api/auth/status").get_json()["csrf_token"]
+
+            with mock.patch.object(
+                dashboard, "MEDIA_ROOT", media_root
+            ), mock.patch.object(
+                dashboard, "load_settings", return_value={}
+            ), mock.patch.object(
+                dashboard,
+                "create_upload_job",
+                return_value="retry-upload-2",
+            ) as create_retry:
+                response = client.post(
+                    "/api/jobs/retry-item",
+                    json={"job_id": job_id, "item_id": item_id},
+                    headers={"X-CSRF-Token": csrf_token},
+                )
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["fresh_attempt"])
         create_retry.assert_called_once_with(
-            ["C:/media/failed.mp4"], "Retry YouTube Upload"
+            [str(video.resolve())],
+            "Retry YouTube Upload",
+            retry_of={"job_id": job_id, "item_id": item_id},
         )
 
     def test_retry_uncertain_upload_requires_user_verification(self):
