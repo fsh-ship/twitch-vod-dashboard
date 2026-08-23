@@ -116,6 +116,7 @@ async function startSingleVodDownload() {
       strict_date_filter: val('strictDateFilter', false),
       output_template: val('outputTemplate'),
       playlist_end: val('limit', '150'),
+      auto_recorder_enabled: val('autoRecorderEnabled', false),
       youtube_enabled: val('youtubeEnabled', false),
       youtube_auto_upload: val('youtubeAutoUpload', false),
       move_uploaded_vods: val('moveUploadedVods', true),
@@ -177,10 +178,18 @@ async function startSingleVodDownload() {
       if (typeof window.refreshDashboard === 'function') {
         try { await window.refreshDashboard(); } catch(e) {}
       }
+      if (typeof window.refreshAutoRecorderStatus === 'function') {
+        try { await window.refreshAutoRecorderStatus(); } catch(e) {}
+      }
       alert((scope === 'youtube' ? 'YouTube settings' : 'Settings') + ' saved.\n\nFile: ' + (saved._settings_file || 'unknown'));
       return saved;
     } catch (e) {
       console.error(e);
+      const autoRecorder = byId('autoRecorderEnabled');
+      if (autoRecorder && typeof state !== 'undefined' && state?.settings) {
+        autoRecorder.checked = state.settings.auto_recorder_enabled === true;
+        if (typeof updateAutoRecorderSettingCopy === 'function') updateAutoRecorderSettingCopy();
+      }
       setText('settingsSaveStatus', 'Error: ' + e.message);
       alert('Save failed:\n\n' + e.message);
       throw e;
@@ -275,8 +284,10 @@ let liveOfflineExpanded = false;
 let liveStatusLastUpdatedAt = null;
 let liveRecordingJobs = [];
 let liveRecordingActions = new Map();
+let autoRecorderStatusSnapshot = null;
 
 const LIVE_STATUS_CONCURRENCY = 2;
+const AUTO_RECORDER_STATUS_REFRESH_MS = 15000;
 const ACTIVE_RECORDING_STATES = new Set(['queued', 'running', 'stopping']);
 
 const $ = (id) => document.getElementById(id);
@@ -353,6 +364,8 @@ function renderState() {
   $('excludeLiveStreams').checked = state.settings.exclude_live_streams !== false;
   $('onlyRealVodUrls').checked = state.settings.only_real_vod_urls !== false;
   $('outputTemplate').value = state.settings.output_template;
+  $('autoRecorderEnabled').checked = state.settings.auto_recorder_enabled === true;
+  updateAutoRecorderSettingCopy();
   $('youtubeEnabled').checked = !!state.settings.youtube_enabled;
   $('youtubeAutoUpload').checked = !!state.settings.youtube_auto_upload;
   $('moveUploadedVods').checked = state.settings.move_uploaded_vods !== false;
@@ -560,6 +573,11 @@ function streamerProfilePlaylistId(profiles, streamer) {
   return String(profiles?.[login]?.youtube_playlist_id || '').trim();
 }
 
+function streamerProfileAutoRecordEnabled(profiles, streamer) {
+  const login = canonicalStreamerLoginClient(streamer);
+  return !!login && profiles?.[login]?.auto_record === true;
+}
+
 function withStreamerPlaylistSelection(profiles, streamer, playlistId) {
   const updated = cloneStreamerProfiles(profiles);
   const login = canonicalStreamerLoginClient(streamer);
@@ -568,6 +586,18 @@ function withStreamerPlaylistSelection(profiles, streamer, playlistId) {
   const profile = { ...(updated[login] || {}) };
   if (selected) profile.youtube_playlist_id = selected;
   else delete profile.youtube_playlist_id;
+  if (Object.keys(profile).length) updated[login] = profile;
+  else delete updated[login];
+  return updated;
+}
+
+function withStreamerAutoRecordSelection(profiles, streamer, enabled) {
+  const updated = cloneStreamerProfiles(profiles);
+  const login = canonicalStreamerLoginClient(streamer);
+  if (!login) return updated;
+  const profile = { ...(updated[login] || {}) };
+  if (enabled === true) profile.auto_record = true;
+  else delete profile.auto_record;
   if (Object.keys(profile).length) updated[login] = profile;
   else delete updated[login];
   return updated;
@@ -630,6 +660,89 @@ function localUploadRequestPayload(paths) {
     selected?.dataset.playlistMode || 'streamer-default',
     selected?.value || ''
   );
+}
+
+function updateAutoRecorderSettingCopy() {
+  const toggle = $('autoRecorderEnabled');
+  const copy = $('autoRecorderSettingState');
+  if (!toggle || !copy) return;
+  const persisted = state?.settings?.auto_recorder_enabled === true;
+  if (toggle.checked !== persisted) {
+    copy.textContent = toggle.checked
+      ? 'Will enable when settings are saved.'
+      : 'Will pause when settings are saved. Active recordings will continue.';
+    return;
+  }
+  copy.textContent = persisted
+    ? 'Enabled · only selected streamers are monitored.'
+    : 'Paused · streamer selections are preserved.';
+}
+
+function formatAutoRecorderTimestamp(value) {
+  if (!value) return '';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return parsed.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+
+function autoRecorderStatusPresentation(snapshot) {
+  if (!snapshot) {
+    return {kind:'loading', title:'Auto Recorder · Checking…', detail:'Loading monitor status.'};
+  }
+  if (snapshot.unavailable === true) {
+    return {kind:'unavailable', title:'Auto Recorder status unavailable', detail:'Will retry automatically.'};
+  }
+  const watched = Math.max(0, Number(snapshot.watched_count) || 0);
+  const selectedText = `${watched} streamer${watched === 1 ? '' : 's'} selected`;
+  if (snapshot.state_healthy === false || snapshot.phase === 'degraded') {
+    const reason = ['invalid_json', 'invalid_structure', 'unsupported_version'].includes(snapshot.last_error_code)
+      ? 'State file invalid'
+      : ['state_persistence_failed', 'unreadable_state'].includes(snapshot.last_error_code)
+        ? 'State file unavailable'
+        : 'Monitor error';
+    return {kind:'degraded', title:'Auto Recorder · Degraded', detail:`${reason} · automatic recordings are paused for safety.`};
+  }
+  if (snapshot.enabled !== true) {
+    return {kind:'paused', title:'Auto Recorder · Paused', detail:selectedText};
+  }
+  if (snapshot.running !== true) {
+    return {kind:'unavailable', title:'Auto Recorder · Unavailable', detail:'Production monitor is not running.'};
+  }
+  if (snapshot.phase === 'starting') {
+    return {kind:'starting', title:'Auto Recorder · Starting', detail:selectedText};
+  }
+  if (watched === 0) {
+    return {kind:'running', title:'Auto Recorder · Running', detail:'No streamers selected'};
+  }
+  const checkedAt = formatAutoRecorderTimestamp(snapshot.last_check_completed_at);
+  return {
+    kind:'running',
+    title:'Auto Recorder · Running',
+    detail:`Watching ${watched}${checkedAt ? ` · Last checked ${checkedAt}` : ' · Awaiting first check'}`
+  };
+}
+
+function renderAutoRecorderStatus(snapshot=autoRecorderStatusSnapshot) {
+  const box = $('autoRecorderStatus');
+  if (!box) return;
+  const view = autoRecorderStatusPresentation(snapshot);
+  box.className = `auto-recorder-status is-${view.kind}`;
+  box.innerHTML = `<strong>${escapeHtml(view.title)}</strong><span>${escapeHtml(view.detail)}</span>`;
+  if (liveStreamers.length) renderLiveStreams();
+}
+
+async function refreshAutoRecorderStatus() {
+  try {
+    const snapshot = await api('/api/auto-recorder/status');
+    if (!snapshot || typeof snapshot.enabled !== 'boolean' || typeof snapshot.running !== 'boolean') {
+      throw new Error('Invalid Auto Recorder status response.');
+    }
+    autoRecorderStatusSnapshot = snapshot;
+  } catch {
+    autoRecorderStatusSnapshot = {unavailable:true};
+  }
+  renderAutoRecorderStatus();
+  return autoRecorderStatusSnapshot;
 }
 
 function formatRecordingDuration(value) {
@@ -696,6 +809,29 @@ function liveStatusClass(status, recordingJob) {
   return status?.state === 'checking' ? 'checking' : 'offline';
 }
 
+function liveAutoRecordingNote(streamer, status) {
+  if (status?.state !== 'live') return '';
+  if (!streamerProfileAutoRecordEnabled(
+    state?.settings?.streamer_profiles, streamer
+  )) return '';
+  if (state?.settings?.auto_recorder_enabled !== true) {
+    return 'Auto Recording selected · Auto Recorder paused';
+  }
+  if (!autoRecorderStatusSnapshot) {
+    return 'Auto Recording selected · Checking Auto Recorder';
+  }
+  if (
+    autoRecorderStatusSnapshot.state_healthy === false
+    || autoRecorderStatusSnapshot.phase === 'degraded'
+  ) {
+    return 'Auto Recording selected · Auto Recorder degraded';
+  }
+  if (autoRecorderStatusSnapshot.running !== true) {
+    return 'Auto Recording selected · Auto Recorder unavailable';
+  }
+  return 'Auto Recording enabled';
+}
+
 function liveCardStatusLabel(status, job, action) {
   if (action?.phase === 'starting' || job?.state === 'queued') return 'LIVE · STARTING';
   if (action?.phase === 'stopping' || job?.state === 'stopping') return 'LIVE · STOPPING';
@@ -758,6 +894,10 @@ function renderLiveStreamCard(streamer) {
   const refreshNote = status.refreshError
     ? 'Status refresh failed; showing the last confirmed status.'
     : (liveStatusRequests.has(login) ? 'Updating live status…' : '');
+  const autoRecordingNote = liveAutoRecordingNote(login, status);
+  const autoStartedNote = activeHere && job?.origin === 'auto'
+    ? 'Started automatically'
+    : '';
   let actionHtml = '';
   if (activeHere && job.state === 'running') {
     actionHtml = `<button type="button" class="danger-outline live-recording-stop" data-job-id="${escapeHtml(job.id)}" data-streamer="${escapeHtml(login)}" ${action?.phase === 'stopping' ? 'disabled' : ''}>Stop Recording</button>`;
@@ -768,6 +908,8 @@ function renderLiveStreamCard(streamer) {
     title ? `<span class="live-stream-title">${escapeHtml(title)}</span>` : '',
     started ? `<span class="live-stream-time">Live since ${escapeHtml(started)}</span>` : '',
     (activeHere || terminalHere) ? `<span class="live-recording-status">${escapeHtml(recordingStatusText(job))}</span>` : '',
+    autoStartedNote ? `<span class="live-auto-origin-note">${escapeHtml(autoStartedNote)}</span>` : '',
+    autoRecordingNote ? `<span class="live-auto-record-note">${escapeHtml(autoRecordingNote)}</span>` : '',
     action?.message ? `<span class="live-recording-message bad">${escapeHtml(action.message)}</span>` : '',
     startDisabledReason ? `<span class="live-recording-note muted">${escapeHtml(startDisabledReason)}</span>` : '',
     refreshNote ? `<span class="live-status-refresh-note${status.refreshError ? ' is-error' : ''}">${escapeHtml(refreshNote)}</span>` : ''
@@ -1022,7 +1164,10 @@ function renderStreamerEditor() {
     const playlistId = streamerProfilePlaylistId(
       streamerProfileDraft, name
     );
-    return `<div class="streamer-editor-row" data-streamer-index="${index}"><span class="streamer-order">${index + 1}</span><strong>${escapeHtml(name)}</strong><label class="streamer-playlist-field"><span>Default Playlist</span><select class="streamer-playlist-select" data-streamer-login="${escapeHtml(name)}" aria-label="Default YouTube playlist for ${escapeHtml(name)}">${playlistOptionsHtml(playlistId, 'Global Default')}</select></label><div class="streamer-row-actions"><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></div>`;
+    const autoRecord = streamerProfileAutoRecordEnabled(
+      streamerProfileDraft, name
+    );
+    return `<div class="streamer-editor-row" data-streamer-index="${index}"><span class="streamer-order">${index + 1}</span><strong>${escapeHtml(name)}</strong><label class="streamer-playlist-field"><span>Default Playlist</span><select class="streamer-playlist-select" data-streamer-login="${escapeHtml(name)}" aria-label="Default YouTube playlist for ${escapeHtml(name)}">${playlistOptionsHtml(playlistId, 'Global Default')}</select></label><label class="streamer-auto-record-field"><span>Auto Recording</span><span class="switch-control"><input type="checkbox" role="switch" class="streamer-auto-record-toggle" data-streamer-login="${escapeHtml(name)}" aria-label="Enable automatic recording for ${escapeHtml(name)}" ${autoRecord ? 'checked' : ''}><span class="switch-track" aria-hidden="true"></span><span class="switch-value">${autoRecord ? 'On' : 'Off'}</span></span></label><div class="streamer-row-actions"><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></div>`;
   }).join('');
   list.querySelectorAll('.streamer-playlist-select').forEach(select => {
     select.addEventListener('change', () => {
@@ -1031,6 +1176,17 @@ function renderStreamerEditor() {
         select.dataset.streamerLogin,
         select.value
       );
+    });
+  });
+  list.querySelectorAll('.streamer-auto-record-toggle').forEach(toggle => {
+    toggle.addEventListener('change', () => {
+      streamerProfileDraft = withStreamerAutoRecordSelection(
+        streamerProfileDraft,
+        toggle.dataset.streamerLogin,
+        toggle.checked
+      );
+      const value = toggle.closest('.switch-control')?.querySelector('.switch-value');
+      if (value) value.textContent = toggle.checked ? 'On' : 'Off';
     });
   });
   list.querySelectorAll('[data-streamer-action]').forEach(button => button.addEventListener('click', () => {
@@ -1211,6 +1367,7 @@ function gatherSettingsFromForm() {
     strict_date_filter:$('strictDateFilter').checked,
     output_template:$('outputTemplate').value,
     playlist_end:$('limit').value,
+    auto_recorder_enabled:$('autoRecorderEnabled').checked,
     youtube_enabled:$('youtubeEnabled').checked,
     youtube_auto_upload:$('youtubeAutoUpload').checked,
     move_uploaded_vods:$('moveUploadedVods').checked,
@@ -2288,8 +2445,10 @@ $('saveStreamers').addEventListener('click', async () => {
   await loadState();
   if ($('streamerFileInfo')) $('streamerFileInfo').textContent = saved.streamer_file || state.streamer_file_resolved || 'unknown';
   if ($('streamerFileStatus')) $('streamerFileStatus').textContent = `${saved.count || 0} streamers saved`;
+  refreshAutoRecorderStatus().catch(() => {});
   showToast(`${saved.count || 0} streamer${saved.count === 1 ? '' : 's'} saved.`);
 });
+$('autoRecorderEnabled').addEventListener('change', updateAutoRecorderSettingCopy);
 $('saveSettings').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'settings'));
 $('youtubeConnect').addEventListener('click', async () => {
   try {
@@ -2311,11 +2470,13 @@ $('saveYoutubeSettingsBottom').addEventListener('click', (e) => window.vodRobust
 $('refreshLiveStatuses').addEventListener('click', () => refreshLiveStatuses().catch(() => {}));
 
 setInterval(() => pollJobs().catch(() => {}), 5000);
+setInterval(() => refreshAutoRecorderStatus().catch(() => {}), AUTO_RECORDER_STATUS_REFRESH_MS);
 loadState().then(() => {
   setDateRange(7);
   showPage(localStorage.getItem('vodActivePage') || 'dashboard');
   refreshYoutubeStatus();
   refreshDashboard();
+  refreshAutoRecorderStatus();
   loadYoutubePlaylists().catch(() => {});
 }).catch(e => {
   console.error(e);
@@ -2381,6 +2542,7 @@ loadState().then(() => {
 })();
 
 try { window.refreshDashboard = refreshDashboard; } catch(e) {}
+try { window.refreshAutoRecorderStatus = refreshAutoRecorderStatus; } catch(e) {}
 
 document.addEventListener('DOMContentLoaded', function(){ const b=document.getElementById('checkSettingsStatus'); if(b) b.onclick=function(e){ window.vodCheckSettingsStatus(e); return false; }; });
 

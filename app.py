@@ -13,7 +13,7 @@ import webbrowser
 from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 
@@ -814,10 +814,111 @@ def start_auto_recorder_monitor() -> dashboard_auto_runtime.AutoRecorderMonitor:
 
 
 def wake_auto_recorder_monitor() -> bool:
-    """Wake the internal monitor for a future settings/UI integration."""
+    """Wake the internal monitor after relevant persisted settings change."""
     with AUTO_RECORDER_MONITOR_LOCK:
         monitor = AUTO_RECORDER_MONITOR
     return monitor.wake() if monitor is not None else False
+
+
+def _configured_auto_record_streamers(
+    settings: Mapping[str, Any], streamers: Optional[Iterable[Any]] = None
+) -> set[str]:
+    """Return configured logins whose normalized profile opts into recording."""
+    configured = streamers if streamers is not None else read_streamers(dict(settings))
+    profiles = dashboard_settings.normalize_streamer_profiles(
+        settings.get("streamer_profiles")
+    )
+    return {
+        login
+        for raw_login in configured
+        if (login := dashboard_settings.canonical_streamer_login(raw_login))
+        and profiles.get(login, {}).get("auto_record") is True
+    }
+
+
+def _wake_auto_recorder_after_save(reason: str) -> bool:
+    """Best-effort wake with bounded logging; persistence has already succeeded."""
+    try:
+        return wake_auto_recorder_monitor()
+    except Exception as exc:
+        app.logger.warning(
+            "Auto recorder monitor wake failed after %s (%s).",
+            reason,
+            type(exc).__name__,
+        )
+        return False
+
+
+def public_auto_recorder_status(
+    settings: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build the strictly allowlisted Auto Recorder status API payload."""
+    current_settings = dict(settings or load_settings())
+    snapshot = auto_recorder_monitor_snapshot()
+    allowed_phases = {
+        "checking",
+        "degraded",
+        "paused",
+        "sleeping",
+        "starting",
+        "stopped",
+    }
+    allowed_error_codes = {
+        "invalid_json",
+        "invalid_structure",
+        "state_persistence_failed",
+        "status_check_failed",
+        "thread_start_failed",
+        "unexpected_iteration_error",
+        "unreadable_state",
+        "unsupported_version",
+    }
+    phase = str(snapshot.get("phase") or "stopped")
+    if phase not in allowed_phases:
+        phase = "stopped"
+
+    def safe_timestamp(key: str) -> Optional[str]:
+        value = snapshot.get(key)
+        if value is None:
+            return None
+        candidate = str(value)
+        return candidate[:64] if re.fullmatch(r"[0-9T:.+Z-]{1,64}", candidate) else None
+
+    def bounded_count(key: str) -> int:
+        try:
+            return max(0, min(10000, int(snapshot.get(key) or 0)))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    healthy = snapshot.get("state_healthy")
+    if healthy is not True and healthy is not False and healthy is not None:
+        healthy = None
+    running = snapshot.get("running") is True
+    if not running:
+        phase = "stopped"
+    error_code = dashboard_auto_runtime._safe_code(
+        snapshot.get("last_error_code"), ""
+    )
+    if error_code not in allowed_error_codes:
+        error_code = ""
+    return {
+        "enabled": current_settings.get("auto_recorder_enabled") is True,
+        "running": running,
+        "state_healthy": healthy,
+        "phase": phase,
+        "watched_count": len(_configured_auto_record_streamers(current_settings)),
+        "last_check_started_at": safe_timestamp("last_check_started_at"),
+        "last_check_completed_at": safe_timestamp("last_check_completed_at"),
+        "next_check_at": safe_timestamp("next_check_at"),
+        "last_action": dashboard_auto_runtime._safe_action(
+            snapshot.get("last_action")
+        ),
+        "last_action_streamer": dashboard_auto_runtime._safe_streamer(
+            snapshot.get("last_action_streamer")
+        ),
+        "error_count_last_run": bounded_count("error_count_last_run"),
+        "last_error_code": error_code,
+    }
 
 
 def stop_auto_recorder_monitor(timeout: float = 5.0) -> bool:
@@ -1534,10 +1635,29 @@ def api_settings_status():
     return jsonify(info)
 
 
+@app.get("/api/auto-recorder/status")
+def api_auto_recorder_status():
+    return jsonify(public_auto_recorder_status())
+
+
 
 @app.post("/api/settings")
 def api_settings():
+    before = load_settings()
+    configured_streamers = read_streamers(before)
+    before_watched = _configured_auto_record_streamers(
+        before, configured_streamers
+    )
     saved = save_settings(request.json or {})
+    after_watched = _configured_auto_record_streamers(
+        saved, configured_streamers
+    )
+    if (
+        (before.get("auto_recorder_enabled") is True)
+        != (saved.get("auto_recorder_enabled") is True)
+        or before_watched != after_watched
+    ):
+        _wake_auto_recorder_after_save("settings save")
     saved["_settings_file"] = str(SETTINGS_FILE)
     saved["_saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return jsonify(saved)
@@ -1622,12 +1742,18 @@ def api_streamers():
     if isinstance(names, str):
         names = names.splitlines()
     settings = load_settings()
+    before_watched = _configured_auto_record_streamers(
+        settings, read_streamers(settings)
+    )
     profiles_supplied = "streamer_profiles" in data
     if profiles_supplied:
         settings = save_settings({
             "streamer_profiles": data.get("streamer_profiles")
         })
     streamers = write_streamers(names, settings)
+    after_watched = _configured_auto_record_streamers(settings, streamers)
+    if before_watched != after_watched:
+        _wake_auto_recorder_after_save("streamer save")
     payload = {
         "streamers": streamers,
         "streamer_file": str(FIXED_STREAMER_FILE),

@@ -128,6 +128,12 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
         self.assertEqual(live_response.status_code, 401)
         self.assertIn("Authentication", live_response.get_json()["error"])
 
+        auto_recorder_response = self.client.get("/api/auto-recorder/status")
+        self.assertEqual(auto_recorder_response.status_code, 401)
+        self.assertIn(
+            "Authentication", auto_recorder_response.get_json()["error"]
+        )
+
         recording_start = self.client.post(
             "/api/live/record", json={"streamer": "nika_livetv"}
         )

@@ -47,14 +47,33 @@ const setOverride = withStreamerPlaylistSelection(
 const removedOverride = withStreamerPlaylistSelection(
   profiles, '@DigitalGirlUli', ''
 );
+const autoEnabled = withStreamerAutoRecordSelection(
+  withStreamerPlaylistSelection({}, 'DigitalGirlUli', 'PLAYLIST_A'),
+  'DigitalGirlUli', true
+);
+const playlistChangedAfterAuto = withStreamerPlaylistSelection(
+  autoEnabled, 'DigitalGirlUli', 'PLAYLIST_B'
+);
+const autoRemovedAfterPlaylist = withStreamerAutoRecordSelection(
+  playlistChangedAfterAuto, 'DigitalGirlUli', false
+);
+const emptyProfileRemoved = withStreamerAutoRecordSelection(
+  {auto_only:{auto_record:true}}, 'auto_only', false
+);
 process.stdout.write(JSON.stringify({
   clonedProfiles,
   configured: streamerProfilePlaylistId(profiles, 'DigitalGirlUli'),
   inherited: streamerProfilePlaylistId(profiles, 'NoOverride'),
+  autoConfigured: streamerProfileAutoRecordEnabled(profiles, 'DigitalGirlUli'),
+  autoMissing: streamerProfileAutoRecordEnabled(profiles, 'NoOverride'),
   configuredOptions: playlistOptionsHtml('PLAYLIST_A', 'Global Default'),
   inheritedOptions: playlistOptionsHtml('', 'Global Default'),
   setOverride,
   removedOverride,
+  autoEnabled,
+  playlistChangedAfterAuto,
+  autoRemovedAfterPlaylist,
+  emptyProfileRemoved,
   defaultSingle: buildYoutubeUploadRequest(['one.mp4'], 'streamer-default'),
   defaultMultiple: buildYoutubeUploadRequest(
     ['one.mp4', 'two.mp4'], 'streamer-default'
@@ -313,7 +332,7 @@ def _evaluate_live_stream_ui() -> dict:
     runner = r"""
 const fs = require('fs');
 const source = fs.readFileSync('static/app.js', 'utf8');
-const start = source.indexOf('function formatRecordingDuration');
+const start = source.indexOf('function streamerProfileAutoRecordEnabled');
 const end = source.indexOf('function streamerEditorNames');
 if (start < 0 || end < 0 || end <= start) throw new Error('Live Streams UI helpers not found');
 const ACTIVE_RECORDING_STATES = new Set(['queued', 'running', 'stopping']);
@@ -327,6 +346,8 @@ let liveOfflineExpanded = false;
 let liveStatusLastUpdatedAt = null;
 let liveRecordingJobs = [];
 let liveRecordingActions = new Map();
+let autoRecorderStatusSnapshot = null;
+let state = {settings:{auto_recorder_enabled:false, streamer_profiles:{}}};
 const elements = {
   liveStreamsList: {
     innerHTML:'',
@@ -445,6 +466,37 @@ eval(source.slice(start, end));
     state:'live', streamer:'digitalgirluli', title:'Another live stream'
   });
   const otherStreamerHtml = renderLiveStreamCard('DigitalGirlUli');
+
+  state = {settings:{
+    auto_recorder_enabled:true,
+    streamer_profiles:{nika_livetv:{auto_record:true}}
+  }};
+  autoRecorderStatusSnapshot = {enabled:true, running:true, state_healthy:true, phase:'sleeping', watched_count:1};
+  liveStreamStatuses.set('nika_livetv', {state:'live', streamer:'nika_livetv'});
+  liveRecordingJobs = [{
+    id:'recording-auto', type:'recording', streamer:'nika_livetv', state:'running',
+    origin:'auto', recorded_seconds:42, title:'Auto recording'
+  }];
+  const autoStartedHtml = renderLiveStreamCard('Nika_LiveTV');
+  liveRecordingJobs = [];
+  state.settings.auto_recorder_enabled = false;
+  const autoPausedLiveHtml = renderLiveStreamCard('Nika_LiveTV');
+  state.settings.auto_recorder_enabled = true;
+  const autoEnabledLiveHtml = renderLiveStreamCard('Nika_LiveTV');
+  autoRecorderStatusSnapshot = {enabled:true, running:true, state_healthy:false, phase:'degraded', watched_count:1};
+  const autoDegradedLiveHtml = renderLiveStreamCard('Nika_LiveTV');
+  autoRecorderStatusSnapshot = {enabled:true, running:false, state_healthy:null, phase:'stopped', watched_count:1};
+  const autoUnavailableLiveHtml = renderLiveStreamCard('Nika_LiveTV');
+
+  const autoRecorderViews = {
+    loading:autoRecorderStatusPresentation(null),
+    running:autoRecorderStatusPresentation({enabled:true, running:true, state_healthy:true, phase:'sleeping', watched_count:4, last_check_completed_at:'2026-08-23T15:42:00Z'}),
+    paused:autoRecorderStatusPresentation({enabled:false, running:true, state_healthy:null, phase:'paused', watched_count:4}),
+    zero:autoRecorderStatusPresentation({enabled:true, running:true, state_healthy:true, phase:'sleeping', watched_count:0}),
+    degraded:autoRecorderStatusPresentation({enabled:true, running:true, state_healthy:false, phase:'degraded', watched_count:4, last_error_code:'invalid_json'}),
+    failed:autoRecorderStatusPresentation({unavailable:true}),
+    native:autoRecorderStatusPresentation({enabled:true, running:false, state_healthy:null, phase:'stopped', watched_count:4})
+  };
 
   liveStreamers = ['Nika_LiveTV', 'DigitalGirlUli'];
   liveRecordingJobs = [];
@@ -596,6 +648,8 @@ eval(source.slice(start, end));
     stoppedSavedHtml, naturalSavedHtml, failedRecordingHtml,
     recordingOverridesErrorHtml,
     otherStreamerHtml, noLiveHtml,
+    autoStartedHtml, autoPausedLiveHtml, autoEnabledLiveHtml,
+    autoDegradedLiveHtml, autoUnavailableLiveHtml, autoRecorderViews,
     refreshPaths:refreshCalls.map(call => call.path),
     duplicateCount:duplicateCalls.length,
     updatingMessage, updatingDisabled, refreshedDisabled,
@@ -813,6 +867,61 @@ class V11UiContractTests(unittest.TestCase):
         )
         self.assertEqual(queue_items, [])
 
+    def test_auto_recorder_status_states_are_truthful_and_compact(self) -> None:
+        result = _evaluate_live_stream_ui()["autoRecorderViews"]
+
+        self.assertEqual(result["loading"]["title"], "Auto Recorder · Checking…")
+        self.assertEqual(result["running"]["title"], "Auto Recorder · Running")
+        self.assertIn("Watching 4", result["running"]["detail"])
+        self.assertIn("Last checked", result["running"]["detail"])
+        self.assertEqual(result["paused"]["title"], "Auto Recorder · Paused")
+        self.assertEqual(result["paused"]["detail"], "4 streamers selected")
+        self.assertEqual(result["zero"]["kind"], "running")
+        self.assertEqual(result["zero"]["detail"], "No streamers selected")
+        self.assertEqual(result["degraded"]["kind"], "degraded")
+        self.assertIn("State file invalid", result["degraded"]["detail"])
+        self.assertIn("paused for safety", result["degraded"]["detail"])
+        self.assertEqual(
+            result["failed"]["title"], "Auto Recorder status unavailable"
+        )
+        self.assertNotIn("Paused", result["failed"]["title"])
+        self.assertEqual(result["native"]["title"], "Auto Recorder · Unavailable")
+
+    def test_live_cards_explain_auto_recording_without_competing_with_live_state(self) -> None:
+        result = _evaluate_live_stream_ui()
+
+        self.assertIn("LIVE · RECORDING", result["autoStartedHtml"])
+        self.assertIn("Started automatically", result["autoStartedHtml"])
+        self.assertIn("Auto Recording enabled", result["autoStartedHtml"])
+        self.assertIn(
+            "Auto Recording selected · Auto Recorder paused",
+            result["autoPausedLiveHtml"],
+        )
+        self.assertIn("Auto Recording enabled", result["autoEnabledLiveHtml"])
+        self.assertNotIn("Started automatically", result["autoEnabledLiveHtml"])
+        self.assertIn(
+            "Auto Recording selected · Auto Recorder degraded",
+            result["autoDegradedLiveHtml"],
+        )
+        self.assertIn(
+            "Auto Recording selected · Auto Recorder unavailable",
+            result["autoUnavailableLiveHtml"],
+        )
+
+    def test_auto_recorder_polling_is_modest_and_separate_from_live_lookups(self) -> None:
+        self.assertIn("const AUTO_RECORDER_STATUS_REFRESH_MS = 15000", JAVASCRIPT)
+        self.assertEqual(
+            JAVASCRIPT.count(
+                "setInterval(() => refreshAutoRecorderStatus().catch(() => {}), AUTO_RECORDER_STATUS_REFRESH_MS)"
+            ),
+            1,
+        )
+        status_body = JAVASCRIPT.split(
+            "async function refreshAutoRecorderStatus()", 1
+        )[1].split("function formatRecordingDuration", 1)[0]
+        self.assertIn("/api/auto-recorder/status", status_body)
+        self.assertNotIn("/api/live/status", status_body)
+
     def test_recording_actions_are_minimal_fast_and_globally_exclusive(self) -> None:
         result = _evaluate_live_stream_ui()
 
@@ -837,6 +946,8 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn(".live-stream-grid, .live-stream-grid.is-single { grid-template-columns:1fr; }", STYLESHEET)
         self.assertIn(".live-stream-actions button { width:100%; min-height:44px; }", STYLESHEET)
         self.assertIn(".offline-stream-grid { grid-template-columns:1fr; }", STYLESHEET)
+        self.assertIn(".live-heading-statuses { justify-items:stretch;", STYLESHEET)
+        self.assertIn(".streamer-auto-record-field { grid-column:2; }", STYLESHEET)
         self.assertIn("html, body { max-width:100%; overflow-x:hidden; }", STYLESHEET)
 
     def test_offline_disclosure_is_compact_collapsed_and_toggleable(self) -> None:
@@ -1024,6 +1135,8 @@ class V11UiContractTests(unittest.TestCase):
 
         self.assertEqual(result["configured"], "PLAYLIST_A")
         self.assertEqual(result["inherited"], "")
+        self.assertTrue(result["autoConfigured"])
+        self.assertFalse(result["autoMissing"])
         self.assertIn('value="PLAYLIST_A" selected', result["configuredOptions"])
         self.assertIn(">Global Default</option>", result["inheritedOptions"])
         self.assertEqual(
@@ -1053,10 +1166,43 @@ class V11UiContractTests(unittest.TestCase):
             {"youtube_playlist_id": "ORPHAN"},
         )
 
-    def test_auto_record_profile_state_has_no_visible_p4b_control(self) -> None:
-        self.assertNotIn('id="autoRecorderEnabled"', TEMPLATE)
-        self.assertNotIn('class="streamer-auto-record', TEMPLATE)
-        self.assertNotIn("Auto Recording", TEMPLATE)
+    def test_auto_recorder_controls_are_visible_compact_and_accessible(self) -> None:
+        self.assertIn('id="autoRecorderEnabled"', TEMPLATE)
+        self.assertNotIn('id="autoRecorderEnabled" checked', TEMPLATE)
+        self.assertIn('role="switch"', TEMPLATE)
+        self.assertIn('aria-label="Enable Auto Recorder"', TEMPLATE)
+        self.assertIn(
+            "$('autoRecorderEnabled').checked = state.settings.auto_recorder_enabled === true",
+            JAVASCRIPT,
+        )
+        self.assertIn(
+            "auto_recorder_enabled:$('autoRecorderEnabled').checked",
+            JAVASCRIPT,
+        )
+        self.assertIn("Paused · streamer selections are preserved.", TEMPLATE)
+        self.assertIn('class="streamer-auto-record-toggle"', JAVASCRIPT)
+        self.assertIn(
+            'aria-label="Enable automatic recording for ${escapeHtml(name)}"',
+            JAVASCRIPT,
+        )
+        self.assertIn("min-height:44px", STYLESHEET)
+        self.assertIn("input:focus-visible + .switch-track", STYLESHEET)
+
+    def test_streamer_auto_record_and_playlist_round_trip_independently(self) -> None:
+        result = _evaluate_playlist_ui()
+        self.assertEqual(
+            result["autoEnabled"]["digitalgirluli"],
+            {"youtube_playlist_id": "PLAYLIST_A", "auto_record": True},
+        )
+        self.assertEqual(
+            result["playlistChangedAfterAuto"]["digitalgirluli"],
+            {"youtube_playlist_id": "PLAYLIST_B", "auto_record": True},
+        )
+        self.assertEqual(
+            result["autoRemovedAfterPlaylist"]["digitalgirluli"],
+            {"youtube_playlist_id": "PLAYLIST_B"},
+        )
+        self.assertEqual(result["emptyProfileRemoved"], {})
 
     def test_playlist_refresh_failure_preserves_streamer_profile_draft(self) -> None:
         loader = JAVASCRIPT.split(

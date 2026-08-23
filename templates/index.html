@@ -41,11 +41,17 @@
         <section class="page active" id="page-dashboard">
           <section id="dashboardAlerts" class="dashboard-alerts" aria-live="polite"></section>
           <section class="card live-streams-section" id="liveStreamsSection">
-            <div class="section-heading">
+            <div class="section-heading live-streams-heading">
               <div><p class="eyebrow">Manual recorder</p><h2>Live Streams</h2><p class="muted">Check configured Twitch channels and start one recording at a time.</p></div>
-              <div class="live-refresh-controls">
-                <button type="button" class="quiet-button" id="refreshLiveStatuses">Refresh Status</button>
-                <div id="liveStreamsRefreshStatus" class="live-refresh-status muted" role="status" aria-live="polite">Not updated yet.</div>
+              <div class="live-heading-statuses">
+                <div id="autoRecorderStatus" class="auto-recorder-status is-loading" role="status" aria-live="polite">
+                  <strong>Auto Recorder · Checking…</strong>
+                  <span>Loading monitor status.</span>
+                </div>
+                <div class="live-refresh-controls">
+                  <button type="button" class="quiet-button" id="refreshLiveStatuses">Refresh Status</button>
+                  <div id="liveStreamsRefreshStatus" class="live-refresh-status muted" role="status" aria-live="polite">Not updated yet.</div>
+                </div>
               </div>
             </div>
             <div id="liveStreamsSummary" class="live-stream-summary" aria-live="polite">0 Live · 0 Recording · 0 Offline</div>
@@ -157,12 +163,16 @@
           <section class="settings-panel active" data-settings-panel="general">
             <section class="card"><h2>General</h2><p class="muted settings-intro">Choose the defaults used for Twitch downloads.</p>
               <div class="grid two"><label>Quality <input id="quality" value="source/best"></label><label>Twitch Download Rate Limit <input id="twitchRateLimit" placeholder="Unlimited, 5M, or 800K"></label><label>File Format <input id="mergeFormat" value="mp4"></label><label>When to Prepare or Upload <select id="batchPostprocessMode"><option value="after_each">After Each Download Finishes</option><option value="after_all">After All Selected Downloads Finish</option></select></label></div>
+              <div class="auto-recorder-setting">
+                <div><strong>Auto Recorder</strong><span id="autoRecorderHelp" class="muted">Automatically monitor selected streamers and start a recording when they go live.</span><span id="autoRecorderSettingState" class="auto-recorder-setting-state">Paused · streamer selections are preserved.</span></div>
+                <label class="switch-control"><input type="checkbox" id="autoRecorderEnabled" role="switch" aria-label="Enable Auto Recorder" aria-describedby="autoRecorderHelp autoRecorderSettingState"><span class="switch-track" aria-hidden="true"></span></label>
+              </div>
               <button id="saveSettings" class="primary" type="button">Save General Settings</button>
             </section>
           </section>
 
           <section class="settings-panel" data-settings-panel="streamers">
-            <section class="card"><h2>Streamers</h2><p class="muted block-note">Add Twitch streamer names without the @ prefix. Order is preserved for searches. Each streamer can optionally override the global YouTube playlist.</p><div class="streamer-add-row"><label>Add Streamer <input id="streamerAddInput" autocomplete="off" placeholder="streamer_name"></label><button id="streamerAddButton" class="primary" type="button">Add</button></div><div id="streamerEditorList" class="streamer-editor-list"></div><textarea id="streamersText" class="hidden" aria-hidden="true" tabindex="-1"></textarea><p id="streamerPlaylistStatus" class="field-message muted">Playlist names load from the connected YouTube account. Existing defaults remain saved if YouTube is unavailable.</p><button class="primary full" id="saveStreamers" type="button">Save Streamers</button>
+            <section class="card"><h2>Streamers</h2><p class="muted block-note">Add Twitch streamer names without the @ prefix. Order is preserved for searches. Each streamer can optionally override the global YouTube playlist and opt into Auto Recording.</p><div class="streamer-add-row"><label>Add Streamer <input id="streamerAddInput" autocomplete="off" placeholder="streamer_name"></label><button id="streamerAddButton" class="primary" type="button">Add</button></div><div id="streamerEditorList" class="streamer-editor-list"></div><textarea id="streamersText" class="hidden" aria-hidden="true" tabindex="-1"></textarea><p id="streamerPlaylistStatus" class="field-message muted">Playlist names load from the connected YouTube account. Existing defaults remain saved if YouTube is unavailable.</p><button class="primary full" id="saveStreamers" type="button">Save Streamers</button>
               <details class="technical-details"><summary>Technical details</summary><div class="settings-info"><div><span>Streamer File</span><code id="streamerFileInfo">...</code></div><div><span>Status</span><strong id="streamerFileStatus">not checked</strong></div><div class="button-row"><button id="checkStreamerFile" type="button">Check File</button><button id="repairStreamerNewlines" type="button">Repair Line Breaks</button><button id="forceFixedStreamerPath" type="button">Restore Default Path</button></div></div></details>
             </section>
           </section>

@@ -679,6 +679,13 @@ main { width:100%; max-width:1320px; }
 .dashboard-alerts:empty { display:none; }
 .live-streams-section { display:grid; gap:14px; }
 .live-refresh-controls { display:flex; align-items:center; justify-content:flex-end; gap:12px; }
+.live-heading-statuses { display:grid; justify-items:end; gap:9px; min-width:min(100%,330px); }
+.auto-recorder-status { display:grid; gap:2px; max-width:330px; padding-left:11px; border-left:2px solid var(--line); text-align:right; }
+.auto-recorder-status strong { color:#dbe7ff; font-size:13px; line-height:1.35; }
+.auto-recorder-status span { color:var(--muted); font-size:12px; line-height:1.35; }
+.auto-recorder-status.is-running { border-left-color:rgba(87,214,141,.72); }
+.auto-recorder-status.is-degraded { border-left-color:#ffb85c; }
+.auto-recorder-status.is-degraded strong, .auto-recorder-status.is-degraded span { color:#ffcf91; }
 .live-refresh-status { min-width:96px; font-size:12px; text-align:right; white-space:nowrap; }
 .live-stream-summary { color:#dbe7ff; font-size:13px; font-weight:750; }
 .live-stream-list { display:grid; gap:14px; min-width:0; }
@@ -697,9 +704,11 @@ main { width:100%; max-width:1320px; }
 .live-stream-state { color:#dbe7ff; font-size:12px; font-weight:800; letter-spacing:.055em; }
 .live-stream-name { margin-top:2px; font-size:18px; line-height:1.25; }
 .live-stream-title { margin-top:3px; color:#cbd9f0; font-size:14px; line-height:1.4; }
-.live-stream-time, .live-recording-status, .live-recording-message, .live-recording-note, .live-status-refresh-note { font-size:12px; line-height:1.4; }
+.live-stream-time, .live-recording-status, .live-recording-message, .live-recording-note, .live-status-refresh-note, .live-auto-origin-note, .live-auto-record-note { font-size:12px; line-height:1.4; }
 .live-stream-time { color:var(--muted); }
 .live-recording-status { margin-top:5px; color:var(--good); font-weight:750; }
+.live-auto-origin-note { color:#bcefd2; font-weight:700; }
+.live-auto-record-note { color:#aebbd0; }
 .live-status-refresh-note { color:var(--muted); }
 .live-status-refresh-note.is-error { color:#ffcf91; }
 .live-stream-card.is-error .live-recording-status { color:#ffcf91; }
@@ -762,6 +771,18 @@ main { width:100%; max-width:1320px; }
 .settings-panel { display:none; min-width:0; }
 .settings-panel.active { display:grid; gap:16px; }
 .settings-intro { margin:-7px 0 16px; }
+.auto-recorder-setting { display:flex; align-items:center; justify-content:space-between; gap:18px; margin:16px 0; padding:13px 14px; border:1px solid var(--line); border-radius:14px; background:rgba(12,20,32,.72); }
+.auto-recorder-setting > div { display:grid; gap:4px; min-width:0; }
+.auto-recorder-setting > div > span { font-size:12px; line-height:1.4; }
+.auto-recorder-setting-state { color:#cbd9f0; }
+.switch-control { position:relative; display:inline-flex; flex:0 0 auto; flex-direction:row; align-items:center; gap:8px; min-height:44px; cursor:pointer; }
+.switch-control input { position:absolute; width:1px; height:1px; margin:0; opacity:0; pointer-events:none; }
+.switch-track { position:relative; display:block; width:44px; height:24px; border:1px solid #506077; border-radius:999px; background:#202b3d; transition:background .15s ease,border-color .15s ease; }
+.switch-track::after { content:""; position:absolute; top:3px; left:3px; width:16px; height:16px; border-radius:50%; background:#d8e1ee; transition:transform .15s ease; }
+.switch-control input:checked + .switch-track { border-color:#7a9cff; background:#3156ad; }
+.switch-control input:checked + .switch-track::after { transform:translateX(20px); background:#fff; }
+.switch-control input:focus-visible + .switch-track { outline:3px solid rgba(122,162,255,.38); outline-offset:3px; }
+.switch-value { min-width:20px; color:#cbd9f0; font-size:12px; font-weight:700; }
 .wide-field { grid-column:1 / -1; }
 .connection-status { margin-top:6px; }
 .inlinecheck { flex-direction:row; flex-wrap:wrap; align-items:center; }
@@ -795,6 +816,8 @@ main { width:100%; max-width:1320px; }
   .grid.two, .grid.four { grid-template-columns:1fr; }
   .wide-field { grid-column:auto; }
   .section-heading, .action-alert, .workspace-toolbar { align-items:stretch; flex-direction:column; }
+  .live-heading-statuses { justify-items:stretch; width:100%; max-width:none; }
+  .auto-recorder-status { max-width:none; text-align:left; }
   .section-heading > .button-row, .workspace-toolbar > .button-row { width:100%; }
   .section-heading > .button-row button { flex:1 1 auto; }
   .live-refresh-controls { justify-content:space-between; }
@@ -874,11 +897,13 @@ main { width:100%; max-width:1320px; }
 .streamer-add-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:end; margin:14px 0; }
 .streamer-add-row button { min-height:43px; }
 .streamer-editor-list { display:grid; gap:7px; }
-.streamer-editor-row { display:grid; grid-template-columns:34px minmax(120px,1fr) minmax(180px,280px) auto; gap:10px; align-items:center; padding:9px 11px; border:1px solid var(--line); border-radius:13px; background:#0e1522; }
+.streamer-editor-row { display:grid; grid-template-columns:34px minmax(110px,1fr) minmax(170px,260px) minmax(126px,150px) auto; gap:10px; align-items:center; padding:9px 11px; border:1px solid var(--line); border-radius:13px; background:#0e1522; }
 .streamer-order { display:grid; place-items:center; width:27px; height:27px; border-radius:999px; background:#182236; color:var(--muted); font-size:12px; }
 .streamer-editor-row strong { overflow-wrap:anywhere; }
 .streamer-playlist-field { display:grid; gap:4px; min-width:0; color:var(--muted); font-size:11px; }
 .streamer-playlist-field select { min-width:0; }
+.streamer-auto-record-field { display:grid; gap:0; min-width:0; color:var(--muted); font-size:11px; }
+.streamer-auto-record-field .switch-control { min-width:0; }
 .streamer-row-actions { display:flex; gap:6px; }
 .streamer-row-actions button { padding:7px 10px; }
 .streamer-editor-empty { padding:22px; border:1px dashed var(--line); border-radius:13px; text-align:center; }
@@ -913,6 +938,7 @@ main { width:100%; max-width:1320px; }
   .secondary-actions { grid-column:1 / -1; grid-row:5; justify-self:stretch; }
   .streamer-editor-row { grid-template-columns:34px minmax(0,1fr); }
   .streamer-playlist-field { grid-column:2; }
+  .streamer-auto-record-field { grid-column:2; }
   .streamer-row-actions { grid-column:1 / -1; display:grid; grid-template-columns:1fr 1fr 1.25fr; }
 }
 
@@ -927,6 +953,7 @@ main { width:100%; max-width:1320px; }
   .offline-stream-item { grid-template-columns:8px minmax(0,1fr) auto; }
   .streamer-add-row { grid-template-columns:1fr; }
   .streamer-add-row button { width:100%; }
+  .auto-recorder-setting { align-items:flex-start; }
   .queue-vod-item.compact { grid-template-columns:minmax(0,1fr) auto; }
   .video-workspace-card { grid-template-columns:auto minmax(0,1fr); }
   .video-workspace-card > .pill { grid-column:1 / -1; grid-row:4; justify-self:start; }

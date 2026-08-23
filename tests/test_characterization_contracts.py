@@ -231,6 +231,11 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
             ("/api/dashboard", "GET", "api_dashboard"),
             ("/api/state", "GET", "state"),
             ("/api/settings/status", "GET", "api_settings_status"),
+            (
+                "/api/auto-recorder/status",
+                "GET",
+                "api_auto_recorder_status",
+            ),
             ("/api/settings", "POST", "api_settings"),
             (
                 "/api/streamers/repair-newlines",
@@ -833,6 +838,251 @@ class SettingsContractTests(IsolatedDashboardTestCase):
             (self.runtime_dir / "streamer.txt").read_text(encoding="utf-8"),
             "DigitalGirlUli\nnika_livetv\n",
         )
+
+    def test_auto_recorder_status_api_is_safe_and_honest_without_monitor(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "Nika_LiveTV\nOtherOne\n", encoding="utf-8"
+        )
+        dashboard.save_settings(
+            {
+                "auto_recorder_enabled": True,
+                "streamer_profiles": {
+                    "nika_livetv": {"auto_record": True},
+                    "orphan": {"auto_record": True},
+                },
+            }
+        )
+        previous = dashboard.AUTO_RECORDER_MONITOR
+        try:
+            dashboard.AUTO_RECORDER_MONITOR = None
+            with mock.patch.object(
+                dashboard, "run_ytdlp_live_status"
+            ) as live_lookup:
+                response = self.client.get("/api/auto-recorder/status")
+        finally:
+            dashboard.AUTO_RECORDER_MONITOR = previous
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(
+            set(payload),
+            {
+                "enabled",
+                "running",
+                "state_healthy",
+                "phase",
+                "watched_count",
+                "last_check_started_at",
+                "last_check_completed_at",
+                "next_check_at",
+                "last_action",
+                "last_action_streamer",
+                "error_count_last_run",
+                "last_error_code",
+            },
+        )
+        self.assertTrue(payload["enabled"])
+        self.assertFalse(payload["running"])
+        self.assertEqual(payload["phase"], "stopped")
+        self.assertEqual(payload["watched_count"], 1)
+        live_lookup.assert_not_called()
+
+    def test_auto_recorder_status_api_allowlists_and_sanitizes_snapshot(self):
+        unsafe_snapshot = {
+            "running": True,
+            "enabled": True,
+            "state_healthy": False,
+            "phase": "degraded",
+            "watched_count": 999,
+            "last_check_started_at": "C:/private/token.txt",
+            "last_check_completed_at": "2026-08-23T15:42:00Z",
+            "next_check_at": "https://signed.invalid/?token=SECRET",
+            "last_action": "../../SECRET",
+            "last_action_streamer": "bad/path",
+            "error_count_last_run": 100000,
+            "last_error_code": "SECRET=/private/path",
+            "pid": 1234,
+            "local_path": "C:/private",
+            "token": "SECRET",
+            "raw_exception": "signed URL",
+        }
+        with mock.patch.object(
+            dashboard,
+            "auto_recorder_monitor_snapshot",
+            return_value=unsafe_snapshot,
+        ):
+            response = self.client.get("/api/auto-recorder/status")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        serialized = json.dumps(payload)
+        for forbidden in (
+            "pid",
+            "local_path",
+            "token",
+            "raw_exception",
+            "signed.invalid",
+            "C:/private",
+            "SECRET",
+        ):
+            self.assertNotIn(forbidden, serialized)
+        self.assertIsNone(payload["last_check_started_at"])
+        self.assertEqual(
+            payload["last_check_completed_at"], "2026-08-23T15:42:00Z"
+        )
+        self.assertIsNone(payload["next_check_at"])
+        self.assertEqual(payload["last_action"], "none")
+        self.assertEqual(payload["last_action_streamer"], "")
+        self.assertEqual(payload["error_count_last_run"], 10000)
+        self.assertEqual(payload["last_error_code"], "")
+
+    def test_relevant_settings_save_wakes_only_after_successful_persistence(self):
+        persisted_values = []
+
+        def record_wake(_reason):
+            persisted_values.append(
+                dashboard.load_settings()["auto_recorder_enabled"]
+            )
+            return True
+
+        with mock.patch.object(
+            dashboard, "_wake_auto_recorder_after_save", side_effect=record_wake
+        ) as wake:
+            enabled = self.client.post(
+                "/api/settings",
+                json={"auto_recorder_enabled": True},
+                headers=self.csrf_headers,
+            )
+            unrelated = self.client.post(
+                "/api/settings",
+                json={"fragments": 12},
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(enabled.status_code, 200)
+        self.assertEqual(unrelated.status_code, 200)
+        wake.assert_called_once_with("settings save")
+        self.assertEqual(persisted_values, [True])
+
+    def test_failed_settings_save_does_not_wake_monitor(self):
+        with mock.patch.object(
+            dashboard, "save_settings", side_effect=OSError("synthetic failure")
+        ), mock.patch.object(
+            dashboard, "_wake_auto_recorder_after_save"
+        ) as wake:
+            response = self.client.post(
+                "/api/settings",
+                json={"auto_recorder_enabled": True},
+                headers=self.csrf_headers,
+            )
+        self.assertEqual(response.status_code, 500)
+        wake.assert_not_called()
+
+    def test_streamer_auto_record_wake_and_independent_profile_roundtrip(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "Nika_LiveTV\n", encoding="utf-8"
+        )
+        dashboard.save_settings(
+            {
+                "streamer_profiles": {
+                    "nika_livetv": {
+                        "youtube_playlist_id": "PLAYLIST_A",
+                        "auto_record": True,
+                    }
+                }
+            }
+        )
+
+        with mock.patch.object(
+            dashboard, "_wake_auto_recorder_after_save"
+        ) as wake:
+            playlist_changed = self.client.post(
+                "/api/streamers",
+                json={
+                    "streamers": ["Nika_LiveTV"],
+                    "streamer_profiles": {
+                        "nika_livetv": {
+                            "youtube_playlist_id": "PLAYLIST_B",
+                            "auto_record": True,
+                        }
+                    },
+                },
+                headers=self.csrf_headers,
+            )
+            wake.assert_not_called()
+            auto_removed = self.client.post(
+                "/api/streamers",
+                json={
+                    "streamers": ["Nika_LiveTV"],
+                    "streamer_profiles": {
+                        "nika_livetv": {
+                            "youtube_playlist_id": "PLAYLIST_B",
+                            "auto_record": False,
+                        }
+                    },
+                },
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(playlist_changed.status_code, 200)
+        self.assertEqual(
+            playlist_changed.get_json()["streamer_profiles"],
+            {
+                "nika_livetv": {
+                    "youtube_playlist_id": "PLAYLIST_B",
+                    "auto_record": True,
+                }
+            },
+        )
+        self.assertEqual(auto_removed.status_code, 200)
+        self.assertEqual(
+            auto_removed.get_json()["streamer_profiles"],
+            {"nika_livetv": {"youtube_playlist_id": "PLAYLIST_B"}},
+        )
+        wake.assert_called_once_with("streamer save")
+
+        cleared = self.client.post(
+            "/api/streamers",
+            json={
+                "streamers": ["Nika_LiveTV"],
+                "streamer_profiles": {},
+            },
+            headers=self.csrf_headers,
+        )
+        self.assertEqual(cleared.get_json()["streamer_profiles"], {})
+
+    def test_native_unavailable_wake_is_harmless_after_valid_save(self):
+        previous = dashboard.AUTO_RECORDER_MONITOR
+        try:
+            dashboard.AUTO_RECORDER_MONITOR = None
+            response = self.client.post(
+                "/api/settings",
+                json={"auto_recorder_enabled": True},
+                headers=self.csrf_headers,
+            )
+        finally:
+            dashboard.AUTO_RECORDER_MONITOR = previous
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["auto_recorder_enabled"])
+
+    def test_monitor_wake_failure_does_not_undo_successful_save(self):
+        with mock.patch.object(
+            dashboard,
+            "wake_auto_recorder_monitor",
+            side_effect=RuntimeError("C:/private SECRET"),
+        ), mock.patch.object(dashboard.app.logger, "warning") as warning:
+            response = self.client.post(
+                "/api/settings",
+                json={"auto_recorder_enabled": True},
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(dashboard.load_settings()["auto_recorder_enabled"])
+        warning.assert_called_once()
+        rendered_log = " ".join(str(value) for value in warning.call_args.args)
+        self.assertNotIn("C:/private", rendered_log)
+        self.assertNotIn("SECRET", rendered_log)
 
     def test_explicit_legacy_settings_preserve_compatible_values_only_by_opt_in(self):
         legacy = self.base / "legacy" / "settings.json"
