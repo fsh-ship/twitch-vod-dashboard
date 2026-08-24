@@ -1519,7 +1519,9 @@ def create_upload_job(
                 "streamer": streamer,
                 "date": payload.get("date_de") or "",
                 "title": payload.get("title") or payload.get("youtube_title") or p.name,
-                "vod_id": payload.get("vod_id") or "",
+                "vod_id": dashboard_auto_vod.normalize_auto_vod_id(
+                    payload.get("vod_id")
+                ),
                 "name": p.name,
                 "size_bytes": payload.get("size_bytes"),
                 "size_gb": payload.get("size_gb"),

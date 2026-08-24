@@ -2045,6 +2045,28 @@ class AppJobCompatibilityTests(unittest.TestCase):
             "playlist-default",
         )
 
+    def test_create_upload_job_canonicalizes_v_prefixed_vod_metadata(self):
+        settings = {"youtube_uploaded_files": []}
+        for index, (raw_vod_id, expected) in enumerate((
+            ("v2854335025", "2854335025"),
+            ("2854335025", "2854335025"),
+            ("", ""),
+            (None, ""),
+            ("not-a-twitch-vod", ""),
+        )):
+            with self.subTest(raw_vod_id=raw_vod_id), mock.patch.object(
+                dashboard, "load_settings", return_value=settings
+            ), mock.patch.object(
+                dashboard, "safe_local_video_path", side_effect=lambda raw, _settings: Path(raw)
+            ), mock.patch.object(
+                dashboard, "local_video_metadata_payload", return_value={
+                    "streamer": "Example", "date_de": "2026-08-22", "title": "VOD",
+                    "vod_id": raw_vod_id, "size_bytes": 100, "size_gb": 0.0,
+                }
+            ), mock.patch.object(dashboard.JOB_MANAGER, "start_worker"):
+                job_id = dashboard.create_upload_job([f"C:/media/vod-{index}.mp4"])
+            self.assertEqual(dashboard.jobs[job_id]["item_metadata"][0]["vod_id"], expected)
+
     def test_create_upload_job_freezes_mixed_streamer_playlists_per_item(self):
         configured = {
             "youtube_playlist_id": "GLOBAL",
