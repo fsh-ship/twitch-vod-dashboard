@@ -22,6 +22,10 @@ from vod_dashboard.job_store import (
     JobStorePersistenceError,
     JobStoreValidationError,
 )
+from vod_dashboard.auto_vod_storage import (
+    AutoVodStorageStatus,
+    assess_auto_vod_storage,
+)
 
 
 Job = Dict[str, Any]
@@ -352,6 +356,9 @@ class DownloadWorkerDependencies:
     popen: Callable[..., Any] = subprocess.Popen
     clock: Callable[[], float] = time.time
     enqueue_upload_job: Optional[Callable[[list[str], str], str]] = None
+    storage_assessor: Callable[[Path], AutoVodStorageStatus] = (
+        assess_auto_vod_storage
+    )
 
 
 @dataclass(frozen=True)
@@ -432,6 +439,7 @@ class JobManager:
         }
         self._cancel_events: Dict[tuple[str, str], threading.Event] = {}
         self._download_processes: Dict[tuple[str, str], Any] = {}
+        self._storage_rearmed_jobs: set[str] = set()
         self._recording_processes: Dict[str, Any] = {}
         self._recording_stop_events: Dict[str, threading.Event] = {}
         self._recording_termination_started: set[str] = set()
@@ -772,6 +780,16 @@ class JobManager:
             job["total_urls"] = 1
         return job
 
+    @staticmethod
+    def _is_storage_blocked_auto_vod(job: Job) -> bool:
+        return (
+            str(job.get("type") or "download") == "download"
+            and job.get("origin") == "auto_vod"
+            and job.get("storage_blocked") is True
+            and job.get("blocking_reason")
+            in {"insufficient_storage", "storage_unavailable"}
+        )
+
     def _reconcile_restored_job(
         self, job: Job, reconciliation_time: str
     ) -> int:
@@ -841,6 +859,7 @@ class JobManager:
         self._runtime_shutting_down = False
         self._download_shutdown_requests.clear()
         self._download_processes.clear()
+        self._storage_rearmed_jobs.clear()
         self._recording_processes.clear()
         self._recording_stop_events.clear()
         self._recording_termination_started.clear()
@@ -926,6 +945,17 @@ class JobManager:
         reconciled_jobs = 0
         reconciled_items = 0
         for job in runtime_jobs:
+            if self._is_storage_blocked_auto_vod(job):
+                # Blocked work owns no live process. Keep its durable identity
+                # queued so a later storage recovery can re-arm the same job.
+                for index, state in enumerate(job.get("item_states") or []):
+                    if state not in TERMINAL_ITEM_STATES:
+                        job["item_states"][index] = "queued"
+                        job["item_statuses"][index] = ITEM_STATE_TO_LEGACY[
+                            "queued"
+                        ]
+                self._recompute_job_state_locked(job)
+                continue
             has_nonterminal = any(
                 state not in TERMINAL_ITEM_STATES
                 for state in job.get("item_states") or []
@@ -1177,6 +1207,8 @@ class JobManager:
                         "twitch_vod_id": twitch_vod_id,
                         "attempt": attempt,
                         "post_download_mode": post_download_mode,
+                        "storage_blocked": False,
+                        "blocking_reason": "",
                     }
                 )
             self.jobs[job_id] = job
@@ -1736,6 +1768,11 @@ class JobManager:
                 continue
             self._ensure_control_lists_locked(candidate)
             if any(state == "queued" for state in candidate["item_states"]):
+                if (
+                    self._is_storage_blocked_auto_vod(candidate)
+                    and str(candidate_id) not in self._storage_rearmed_jobs
+                ):
+                    continue
                 return str(candidate_id) == str(job_id)
         return True
 
@@ -1761,6 +1798,10 @@ class JobManager:
                 if (
                     self._lane_paused[lane]
                     or self._lane_active[lane] is not None
+                    or (
+                        self._is_storage_blocked_auto_vod(job)
+                        and str(job_id) not in self._storage_rearmed_jobs
+                    )
                     or not self._job_is_next_for_lane_locked(job_id, lane)
                 ):
                     self._recompute_job_state_locked(job)
@@ -1788,9 +1829,173 @@ class JobManager:
         try:
             self._persist_required(snapshot)
         except JobPersistenceRequiredError:
-            self._mark_required_failure(str(job_id), str(item_id))
+            with self._condition:
+                failed_job = self.jobs.get(str(job_id))
+                storage_blocked = bool(
+                    failed_job is not None
+                    and self._is_storage_blocked_auto_vod(failed_job)
+                )
+                if storage_blocked:
+                    failed_index = self._item_index_locked(
+                        failed_job, str(item_id)
+                    )
+                    if (
+                        failed_index is not None
+                        and failed_job["item_states"][failed_index] == "running"
+                    ):
+                        self._set_item_state_locked(
+                            failed_job, failed_index, "queued"
+                        )
+                    if self._lane_active.get(lane) == (
+                        str(job_id),
+                        str(item_id),
+                    ):
+                        self._lane_active[lane] = None
+                    self._storage_rearmed_jobs.discard(str(job_id))
+                    self._recompute_job_state_locked(failed_job)
+                    self._mark_dirty_locked(failed_job)
+                    self._condition.notify_all()
+            if not storage_blocked:
+                self._mark_required_failure(str(job_id), str(item_id))
             raise
         return claimed
+
+    def block_auto_vod_for_storage(
+        self, job_id: str, item_id: str, reason: str
+    ) -> bool:
+        """Durably return a claimed Auto VOD item to a skippable queued state."""
+        if reason not in {"insufficient_storage", "storage_unavailable"}:
+            raise ValueError("Unsupported Auto VOD storage block reason.")
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if job is None or job.get("origin") != "auto_vod":
+                return False
+            index = self._item_index_locked(job, item_id)
+            if index is None or job["item_states"][index] != "running":
+                return False
+            job["storage_blocked"] = True
+            job["blocking_reason"] = reason
+            self._set_item_state_locked(job, index, "queued")
+            self._storage_rearmed_jobs.discard(str(job_id))
+            if self._lane_active.get("download") == (str(job_id), str(item_id)):
+                self._lane_active["download"] = None
+            self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            self._condition.notify_all()
+        self._persist_required(snapshot)
+        return True
+
+    def authorize_auto_vod_storage_start(
+        self, job_id: str, item_id: str
+    ) -> bool:
+        """Clear a prior durable storage block before the external side effect."""
+        original_reason = ""
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if job is None or job.get("origin") != "auto_vod":
+                return False
+            index = self._item_index_locked(job, item_id)
+            if (
+                index is None
+                or job["item_states"][index] != "running"
+                or self._lane_active.get("download")
+                != (str(job_id), str(item_id))
+            ):
+                return False
+            if self._runtime_shutting_down:
+                return False
+            if job.get("storage_blocked") is True:
+                original_reason = str(job.get("blocking_reason") or "")
+                job["storage_blocked"] = False
+                job["blocking_reason"] = ""
+                self._mark_dirty_locked(job)
+                snapshot = self._snapshot_for_persistence_locked()
+            else:
+                snapshot = None
+        try:
+            self._persist_required(snapshot)
+        except JobPersistenceRequiredError:
+            if original_reason:
+                with self._condition:
+                    job = self.jobs.get(str(job_id))
+                    if job is not None:
+                        index = self._item_index_locked(job, item_id)
+                        job["storage_blocked"] = True
+                        job["blocking_reason"] = original_reason
+                        if index is not None and job["item_states"][index] == "running":
+                            self._set_item_state_locked(job, index, "queued")
+                        if self._lane_active.get("download") == (
+                            str(job_id),
+                            str(item_id),
+                        ):
+                            self._lane_active["download"] = None
+                        self._recompute_job_state_locked(job)
+                        self._mark_dirty_locked(job)
+                        self._condition.notify_all()
+            raise
+        with self._condition:
+            shutting_down = self._runtime_shutting_down
+            rollback_snapshot = None
+            if shutting_down and original_reason:
+                job = self.jobs.get(str(job_id))
+                if job is not None:
+                    index = self._item_index_locked(job, item_id)
+                    job["storage_blocked"] = True
+                    job["blocking_reason"] = original_reason
+                    if index is not None and job["item_states"][index] == "running":
+                        self._set_item_state_locked(job, index, "queued")
+                    if self._lane_active.get("download") == (
+                        str(job_id),
+                        str(item_id),
+                    ):
+                        self._lane_active["download"] = None
+                    self._recompute_job_state_locked(job)
+                    self._mark_dirty_locked(job)
+                    rollback_snapshot = self._snapshot_for_persistence_locked()
+                    self._condition.notify_all()
+            self._storage_rearmed_jobs.discard(str(job_id))
+        self._persist_required(rollback_snapshot)
+        return not shutting_down
+
+    def rearm_storage_blocked_download(
+        self,
+        job_id: str,
+        target: Callable[[str], None],
+        thread_factory: Optional[Callable[..., threading.Thread]] = None,
+    ) -> bool:
+        """Idempotently start one worker for the same blocked durable job."""
+        factory = thread_factory or threading.Thread
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if (
+                self._runtime_shutting_down
+                or job is None
+                or not self._is_storage_blocked_auto_vod(job)
+                or str(job_id) in self._storage_rearmed_jobs
+                or not any(state == "queued" for state in job["item_states"])
+            ):
+                return False
+            self._storage_rearmed_jobs.add(str(job_id))
+            self._worker_started = True
+
+        def run() -> None:
+            try:
+                target(str(job_id))
+            finally:
+                with self._condition:
+                    self._storage_rearmed_jobs.discard(str(job_id))
+                    self._condition.notify_all()
+
+        thread = factory(target=run, daemon=True)
+        try:
+            thread.start()
+        except Exception:
+            with self._condition:
+                self._storage_rearmed_jobs.discard(str(job_id))
+                self._condition.notify_all()
+            raise
+        return True
 
     def finish_claimed_item(
         self,
@@ -2994,6 +3199,10 @@ def run_download_job(
         settings.get("batch_postprocess_mode")
     )
     initial_job = manager.get_job(job_id) or {}
+    automatic_vod = (
+        str(initial_job.get("type") or "download") == "download"
+        and initial_job.get("origin") == "auto_vod"
+    )
     post_download_mode = str(initial_job.get("post_download_mode") or "default")
     download_only = post_download_mode == "download_only"
     total = len(initial_job.get("urls") or [])
@@ -3162,6 +3371,63 @@ def run_download_job(
             )
             dependencies.append_log(job_id, "URLs in this step: 1")
             try:
+                if automatic_vod:
+                    try:
+                        storage = dependencies.storage_assessor(
+                            dependencies.download_directory(settings)
+                        )
+                    except Exception:
+                        storage = AutoVodStorageStatus(
+                            "unavailable", None, None, None
+                        )
+                    if not storage.allows_start:
+                        reason = (
+                            "insufficient_storage"
+                            if storage.state == "insufficient"
+                            else "storage_unavailable"
+                        )
+                        try:
+                            manager.block_auto_vod_for_storage(
+                                job_id, item_id, reason
+                            )
+                        except JobPersistenceRequiredError:
+                            dependencies.append_log(
+                                job_id,
+                                "Automatic VOD download remains blocked because required job persistence is unavailable.",
+                            )
+                        else:
+                            dependencies.append_log(
+                                job_id,
+                                "Automatic VOD download is waiting for sufficient storage.",
+                            )
+                        return
+                    try:
+                        authorized = manager.authorize_auto_vod_storage_start(
+                            job_id, item_id
+                        )
+                    except JobPersistenceRequiredError:
+                        dependencies.append_log(
+                            job_id,
+                            "Automatic VOD download did not start because required job persistence is unavailable.",
+                        )
+                        return
+                    if not authorized:
+                        current = manager.get_job(job_id) or {}
+                        if current.get("storage_blocked") is True:
+                            try:
+                                manager.block_auto_vod_for_storage(
+                                    job_id,
+                                    item_id,
+                                    str(current.get("blocking_reason") or "storage_unavailable"),
+                                )
+                            except JobPersistenceRequiredError:
+                                pass
+                        else:
+                            manager.finish_download_shutdown_item(job_id, item_id)
+                        return
+                    if manager.runtime_shutdown_requested():
+                        manager.finish_download_shutdown_item(job_id, item_id)
+                        return
                 process_options = download_process_group_options()
                 proc = dependencies.popen(
                     cmd,

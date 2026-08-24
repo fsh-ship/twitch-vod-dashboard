@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from vod_dashboard.media import MediaPathPolicy, unique_path
+from vod_dashboard.runtime_files import atomic_write_text
 
 
 try:
@@ -188,12 +189,11 @@ def youtube_token_file(
 
 
 def _persist_youtube_token(path: Path, serialized: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(serialized, encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+    # Reject incomplete serialization before replacing the last known-good token.
+    value = json.loads(serialized)
+    if not isinstance(value, dict):
+        raise ValueError("YouTube token serialization must be a JSON object.")
+    atomic_write_text(path, serialized, mode=0o600)
 
 
 def bootstrap_youtube_oauth(
@@ -524,43 +524,45 @@ def remember_youtube_uploaded_file(
     path: Path,
     *,
     settings_loader: Callable[[], Dict[str, Any]],
-    settings_file: Path,
+    settings_file: Optional[Path] = None,
+    settings_saver: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     now: Callable[[], datetime] = datetime.now,
 ) -> None:
+    settings = settings_loader()
+    current = list(settings.get("youtube_uploaded_files") or [])
+    value = str(path)
+    if value not in current:
+        current.append(value)
+    settings["youtube_uploaded_files"] = current
+    history = [
+        dict(item)
+        for item in settings.get("youtube_upload_history") or []
+        if isinstance(item, Mapping)
+        and str(item.get("path") or "").strip()
+        and str(item.get("uploaded_at") or "").strip()
+    ]
+    history = [item for item in history if str(item.get("path")) != value]
+    history.append(
+        {"path": value, "uploaded_at": now().isoformat(timespec="seconds")}
+    )
+    settings["youtube_upload_history"] = history
     try:
-        settings = settings_loader()
-        current = list(settings.get("youtube_uploaded_files") or [])
-        value = str(path)
-        if value not in current:
-            current.append(value)
-        settings["youtube_uploaded_files"] = current
-        history = [
-            dict(item)
-            for item in settings.get("youtube_upload_history") or []
-            if isinstance(item, Mapping)
-            and str(item.get("path") or "").strip()
-            and str(item.get("uploaded_at") or "").strip()
-        ]
-        history = [
-            item for item in history if str(item.get("path")) != value
-        ]
-        history.append(
-            {
-                "path": value,
-                "uploaded_at": now().isoformat(timespec="seconds"),
-            }
-        )
-        settings["youtube_upload_history"] = history
-        settings_file.write_text(
-            json.dumps(settings, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except Exception as exc:
-        if log_callback:
-            log_callback(
-                f"Could not save the YouTube upload history: {exc}"
+        if settings_saver is not None:
+            settings_saver(settings)
+        elif settings_file is not None:
+            atomic_write_text(
+                settings_file, json.dumps(settings, indent=2, ensure_ascii=False)
             )
+        else:
+            raise RuntimeError("Settings persistence is unavailable.")
+    except Exception:
+        if log_callback:
+            try:
+                log_callback("Could not save the YouTube upload history.")
+            except Exception:
+                pass
+        raise
 
 
 def move_uploaded_vod_to_done_folder(

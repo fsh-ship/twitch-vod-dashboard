@@ -14,6 +14,7 @@ from vod_dashboard.runtime import (
     UPLOADED_VODS_FOLDER_NAME,
     RuntimePaths,
 )
+from vod_dashboard.runtime_files import atomic_write_text
 
 
 YTDLP_DEFAULT_OUTPUT_TEMPLATE = (
@@ -487,10 +488,7 @@ def read_streamers_from_path(path: Path) -> List[str]:
 
 def write_streamers_to_path(path: Path, names: List[str]) -> List[str]:
     clean = clean_streamer_names(names)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "\n".join(clean) + ("\n" if clean else ""), encoding="utf-8"
-    )
+    atomic_write_text(path, "\n".join(clean) + ("\n" if clean else ""))
     return clean
 
 
@@ -702,9 +700,9 @@ class SettingsRepository:
         current = self.normalize(current)
         download_dir = self.media_policy.download_path(current)
         download_dir.mkdir(parents=True, exist_ok=True)
-        self.settings_file.parent.mkdir(parents=True, exist_ok=True)
-        self.settings_file.write_text(
-            json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8"
+        atomic_write_text(
+            self.settings_file,
+            json.dumps(current, indent=2, ensure_ascii=False),
         )
 
         check = self.read_json_file(self.settings_file)

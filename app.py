@@ -26,6 +26,7 @@ from vod_dashboard import auto_vod as dashboard_auto_vod
 from vod_dashboard import auto_vod_coordinator as dashboard_auto_vod_coordinator
 from vod_dashboard import auto_vod_runtime as dashboard_auto_vod_runtime
 from vod_dashboard import auto_vod_storage as dashboard_auto_vod_storage
+from vod_dashboard import auto_vod_status as dashboard_auto_vod_status
 from vod_dashboard import local_vods as dashboard_local_vods
 from vod_dashboard import jobs as dashboard_jobs
 from vod_dashboard import job_store as dashboard_job_store
@@ -768,7 +769,7 @@ def remember_youtube_uploaded_file(path: Path) -> None:
     dashboard_youtube.remember_youtube_uploaded_file(
         path,
         settings_loader=load_settings,
-        settings_file=SETTINGS_FILE,
+        settings_saver=save_settings,
         log_callback=log_line,
     )
 
@@ -1133,30 +1134,13 @@ def auto_vod_monitor_snapshot() -> Dict[str, Any]:
 def public_auto_vod_status(settings: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     current = dict(settings or load_settings())
     snapshot = auto_vod_monitor_snapshot()
-    result = snapshot.get("last_result")
-    safe_result = None
-    if isinstance(result, Mapping):
-        safe_result = {
-            key: result[key]
-            for key in (
-                "checked_count", "discovered_count", "queued_count", "handled_count",
-                "retry_wait_count", "error_count", "action", "enabled", "state_healthy",
-            )
-            if key in result and isinstance(result[key], (str, int, float, bool, type(None)))
-        }
-    return {
-        "initialized": AUTO_VOD_MONITOR is not None,
-        "enabled": current.get("auto_vod_enabled") is True,
-        "poll_minutes": current.get("auto_vod_poll_minutes") if current.get("auto_vod_poll_minutes") in {60, 120} else 60,
-        "running": snapshot.get("running") is True,
-        "thread_alive": snapshot.get("thread_alive") is True,
-        "in_progress": snapshot.get("in_progress") is True,
-        "last_started_at": snapshot.get("last_started_at"),
-        "last_finished_at": snapshot.get("last_finished_at"),
-        "next_check_at": snapshot.get("next_check_at"),
-        "last_result": safe_result,
-        "watched_count": len(_configured_auto_vod_streamers(current)),
-    }
+    return dashboard_auto_vod_status.public_auto_vod_status(
+        snapshot,
+        initialized=AUTO_VOD_MONITOR is not None,
+        enabled=current.get("auto_vod_enabled") is True,
+        poll_minutes=current.get("auto_vod_poll_minutes"),
+        watched_count=len(_configured_auto_vod_streamers(current)),
+    )
 
 
 def auto_recorder_monitor_snapshot() -> Dict[str, Any]:

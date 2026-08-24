@@ -61,6 +61,9 @@ FAILURE_KINDS = frozenset({"", "known", "uncertain"})
 RECORDING_ORIGINS = frozenset({"manual", "auto"})
 DOWNLOAD_ORIGINS = frozenset({"manual", "auto_vod"})
 DOWNLOAD_POST_MODES = frozenset({"default", "download_only"})
+AUTO_VOD_STORAGE_BLOCK_REASONS = frozenset(
+    {"insufficient_storage", "storage_unavailable"}
+)
 
 _JOB_ID_RE = re.compile(r"[1-9][0-9]{0,9}")
 _ITEM_ID_RE = re.compile(r"([1-9][0-9]{0,9})-item-([1-9][0-9]{0,3})")
@@ -536,6 +539,22 @@ def _normalize_download(job: Mapping[str, Any], result: Job, count: int) -> None
         raise JobStoreValidationError("invalid_auto_vod_download_metadata")
     if origin == "manual" and (streamer or vod_id or attempt != 0 or post_download_mode != "default"):
         raise JobStoreValidationError("invalid_manual_download_metadata")
+    storage_blocked = job.get("storage_blocked", False)
+    blocking_reason = job.get("blocking_reason", "")
+    if not isinstance(storage_blocked, bool):
+        raise JobStoreValidationError("invalid_storage_blocked")
+    if not isinstance(blocking_reason, str):
+        raise JobStoreValidationError("invalid_blocking_reason")
+    if storage_blocked:
+        if (
+            origin != "auto_vod"
+            or blocking_reason not in AUTO_VOD_STORAGE_BLOCK_REASONS
+            or result.get("state") not in {"queued", "running"}
+            or any(state not in {"queued", "running"} for state in result["item_states"])
+        ):
+            raise JobStoreValidationError("invalid_storage_block")
+    elif blocking_reason:
+        raise JobStoreValidationError("invalid_storage_block")
     result.update(
         {
             "urls": normalized_urls,
@@ -574,6 +593,8 @@ def _normalize_download(job: Mapping[str, Any], result: Job, count: int) -> None
                 "twitch_vod_id": vod_id,
                 "attempt": attempt,
                 "post_download_mode": post_download_mode,
+                "storage_blocked": storage_blocked,
+                "blocking_reason": blocking_reason,
             }
         )
 

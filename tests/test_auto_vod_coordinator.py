@@ -20,6 +20,8 @@ class FakeManager:
         self.jobs = {}
         self.created = []
         self.started = []
+        self.rearmed = []
+        self.rearm_pending = set()
         self.fail_create = False
 
     def create_download_job(self, urls, label, **metadata):
@@ -36,6 +38,13 @@ class FakeManager:
 
     def start_worker(self, target, job_id):
         self.started.append(str(job_id))
+
+    def rearm_storage_blocked_download(self, job_id, target):
+        if str(job_id) in self.rearm_pending:
+            return False
+        self.rearm_pending.add(str(job_id))
+        self.rearmed.append(str(job_id))
+        return True
 
 
 class AutoVodCoordinatorTests(unittest.TestCase):
@@ -536,6 +545,70 @@ class AutoVodCoordinatorTests(unittest.TestCase):
 
         self.assertEqual(result["action"], "shutdown_requested")
         self.assertEqual(self.manager.created, [])
+
+    def test_blocked_outstanding_job_stays_blocked_when_storage_is_low(self):
+        self.establish_baseline("alpha", [])
+        self.store.ensure_pending("alpha", "2854443252")
+        self.store.set_queued("alpha", "2854443252", "7", attempts=1)
+        self.manager.jobs["7"] = {
+            "id": "7", "type": "download", "origin": "auto_vod",
+            "state": "queued", "storage_blocked": True,
+            "blocking_reason": "insufficient_storage", "streamer": "alpha",
+            "twitch_vod_id": "2854443252", "attempt": 1,
+            "urls": ["https://www.twitch.tv/videos/2854443252"],
+        }
+
+        result = self.coordinator(
+            storage_provider=lambda settings: AutoVodStorageStatus(
+                "insufficient", 1, 200, 50
+            )
+        ).run_once()
+
+        self.assertEqual(result["action"], "storage_insufficient")
+        self.assertEqual(result["storage_blocked_count"], 1)
+        self.assertEqual(self.manager.rearmed, [])
+        self.assertEqual(self.manager.created, [])
+        self.assertEqual(self.store.get_vod("alpha", "2854443252")["job_id"], "7")
+
+    def test_storage_recovery_rearms_same_job_id_idempotently(self):
+        self.establish_baseline("alpha", [])
+        self.store.ensure_pending("alpha", "2854443252")
+        self.store.set_queued("alpha", "2854443252", "7", attempts=1)
+        self.manager.jobs["7"] = {
+            "id": "7", "type": "download", "origin": "auto_vod",
+            "state": "queued", "storage_blocked": True,
+            "blocking_reason": "insufficient_storage", "streamer": "alpha",
+            "twitch_vod_id": "2854443252", "attempt": 1,
+            "urls": ["https://www.twitch.tv/videos/2854443252"],
+        }
+
+        first = self.coordinator().run_once()
+        second = self.coordinator().run_once()
+
+        self.assertEqual(first["action"], "rearmed_storage_blocked_job")
+        self.assertEqual(second["action"], "waiting_for_existing_job")
+        self.assertEqual(self.manager.rearmed, ["7"])
+        self.assertEqual(self.manager.created, [])
+        record = self.store.get_vod("alpha", "2854443252")
+        self.assertEqual(record["job_id"], "7")
+        self.assertEqual(record["attempts"], 1)
+
+    def test_blocked_job_storage_unavailable_remains_fail_closed(self):
+        self.establish_baseline("alpha", [])
+        self.manager.jobs["7"] = {
+            "id": "7", "type": "download", "origin": "auto_vod",
+            "state": "queued", "storage_blocked": True,
+            "blocking_reason": "storage_unavailable", "streamer": "alpha",
+            "twitch_vod_id": "2854443252", "attempt": 1,
+            "urls": ["https://www.twitch.tv/videos/2854443252"],
+        }
+        result = self.coordinator(
+            storage_provider=lambda settings: AutoVodStorageStatus(
+                "unavailable", None, None, None
+            )
+        ).run_once()
+        self.assertEqual(result["action"], "storage_unavailable")
+        self.assertEqual(self.manager.rearmed, [])
 
 
 if __name__ == "__main__":

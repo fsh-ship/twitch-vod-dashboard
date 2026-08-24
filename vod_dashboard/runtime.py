@@ -76,16 +76,20 @@ def log_line(
     log_file: Path,
     max_bytes: int = LOG_MAX_BYTES,
 ) -> None:
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with log_file_lock:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            should_rotate = log_file.stat().st_size >= max_bytes
-        except FileNotFoundError:
-            should_rotate = False
-        if should_rotate:
-            backup_file = Path(f"{log_file}.1")
-            backup_file.unlink(missing_ok=True)
-            log_file.replace(backup_file)
-        with log_file.open("a", encoding="utf-8") as file_handle:
-            file_handle.write(f"[{stamp}] {text}\n")
+    # Logging must never mask the request/worker error that it tries to report.
+    try:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with log_file_lock:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                should_rotate = log_file.stat().st_size >= max_bytes
+            except FileNotFoundError:
+                should_rotate = False
+            if should_rotate:
+                backup_file = Path(f"{log_file}.1")
+                backup_file.unlink(missing_ok=True)
+                log_file.replace(backup_file)
+            with log_file.open("a", encoding="utf-8") as file_handle:
+                file_handle.write(f"[{stamp}] {text}\n")
+    except Exception:
+        pass

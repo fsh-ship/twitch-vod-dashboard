@@ -3170,13 +3170,17 @@ class YouTubeContractTests(IsolatedDashboardTestCase):
         ) as moved_history:
             dashboard.remember_youtube_uploaded_file(video)
         self.assertEqual(moved_history.call_args.args, (video,))
-        self.assertEqual(
-            moved_history.call_args.kwargs["settings_file"],
-            self.settings_file,
-        )
         self.assertIs(
             moved_history.call_args.kwargs["settings_loader"],
             dashboard.load_settings,
+        )
+        self.assertIs(
+            moved_history.call_args.kwargs["settings_saver"],
+            dashboard.save_settings,
+        )
+        self.assertNotIn("settings_file", moved_history.call_args.kwargs)
+        self.assertIs(
+            moved_history.call_args.kwargs["log_callback"], dashboard.log_line
         )
 
         moved_path = video.with_name("moved.mp4")

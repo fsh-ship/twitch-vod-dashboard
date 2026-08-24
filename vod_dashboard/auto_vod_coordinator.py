@@ -105,6 +105,9 @@ class AutoVodCoordinator:
             "queued_count": 0,
             "handled_count": 0,
             "retry_wait_count": 0,
+            "baseline_established_count": 0,
+            "baseline_initialized_count": 0,
+            "baseline_pending_count": 0,
             "storage_blocked_count": 0,
             "storage_state": "not_checked",
             "storage_free_bytes": None,
@@ -135,7 +138,10 @@ class AutoVodCoordinator:
     @staticmethod
     def _is_outstanding_auto_vod_job(job: Mapping[str, Any]) -> bool:
         """Count any auto-download that is not fully terminal, including bad state."""
-        if job.get("type") != "download" or job.get("origin") != "auto_vod":
+        if (
+            str(job.get("type") or "download") != "download"
+            or job.get("origin") != "auto_vod"
+        ):
             return False
         if str(job.get("state") or "") not in TERMINAL_JOB_STATES:
             return True
@@ -328,6 +334,7 @@ class AutoVodCoordinator:
                         baseline_ids.append(vod_id)
                 try:
                     self._state_store.establish_baseline(streamer, baseline_ids)
+                    result["baseline_established_count"] += 1
                 except AutoVodStateMigrationRequired:
                     raise
                 except AutoVodStateError:
@@ -365,12 +372,56 @@ class AutoVodCoordinator:
         if stop_scheduling:
             final = self._state_store.snapshot()
         else:
-            outstanding = sum(
-                1 for job in jobs if self._is_outstanding_auto_vod_job(job)
-            )
-            result["outstanding_auto_vod_jobs"] = outstanding
-            if outstanding:
-                result["action"] = "waiting_for_existing_job"
+            outstanding_jobs = [
+                job for job in jobs if self._is_outstanding_auto_vod_job(job)
+            ]
+            result["outstanding_auto_vod_jobs"] = len(outstanding_jobs)
+            if outstanding_jobs:
+                blocked = next(
+                    (
+                        job
+                        for job in outstanding_jobs
+                        if job.get("storage_blocked") is True
+                        and job.get("blocking_reason")
+                        in {"insufficient_storage", "storage_unavailable"}
+                    ),
+                    None,
+                )
+                if blocked is None or len(outstanding_jobs) != 1:
+                    result["action"] = "waiting_for_existing_job"
+                else:
+                    storage_status = self._storage_status(settings)
+                    self._set_storage_result(result, storage_status)
+                    if not storage_status.allows_start:
+                        result["storage_blocked_count"] = 1
+                        result["action"] = (
+                            "storage_insufficient"
+                            if storage_status.state == "insufficient"
+                            else "storage_unavailable"
+                        )
+                    elif self._should_stop():
+                        result["action"] = "shutdown_requested"
+                    else:
+                        rearm = getattr(
+                            self._job_manager,
+                            "rearm_storage_blocked_download",
+                            None,
+                        )
+                        try:
+                            did_rearm = bool(
+                                callable(rearm)
+                                and rearm(
+                                    str(blocked.get("id") or ""),
+                                    self._worker_target,
+                                )
+                            )
+                        except Exception:
+                            did_rearm = False
+                        result["action"] = (
+                            "rearmed_storage_blocked_job"
+                            if did_rearm
+                            else "waiting_for_existing_job"
+                        )
                 final = self._state_store.snapshot()
             else:
                 final = None
@@ -503,6 +554,11 @@ class AutoVodCoordinator:
                         break
             final = self._state_store.snapshot()
         for streamer in selected:
+            bucket = final["streamers"].get(streamer, {})
+            if bucket.get("baseline_initialized") is True:
+                result["baseline_initialized_count"] += 1
+            else:
+                result["baseline_pending_count"] += 1
             for record in final["streamers"].get(streamer, {}).get("vods", {}).values():
                 result[f"{record['disposition']}_count"] += 1
                 if record["disposition"] == "pending" and record.get("retry_after"):

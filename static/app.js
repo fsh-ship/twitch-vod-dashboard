@@ -715,14 +715,34 @@ function updateAutoVodSettingCopy() {
 }
 
 function autoVodStatusPresentation(snapshot) {
-  if (!snapshot || snapshot.initialized !== true) return {kind:'unavailable', title:'Auto VOD runtime inactive', detail:'Available in the production runtime.'};
+  // Presentation priority: migration, storage, state/discovery errors,
+  // baseline confirmation, selection state, then ordinary monitor state.
+  if (!snapshot || snapshot.initialized !== true) return {kind:'unavailable', title:'Auto VOD · Unavailable', detail:'Available in the production runtime.'};
   if (!snapshot.enabled) return {kind:'paused', title:'Auto VOD · Off', detail:'Streamer selections are preserved.'};
+  const result = snapshot.last_result || {};
+  const action = String(result.action || '');
+  const storage = String(result.storage_state || 'not_checked');
+  const blocked = Math.max(0, Number(result.storage_blocked_count) || 0);
+  const singular = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+  if (action === 'migration_required') return {kind:'degraded', title:'Auto VOD · Needs attention', detail:'A one-time Auto VOD baseline migration is required before automatic downloads can resume.'};
+  if (action === 'storage_unavailable' || storage === 'unavailable') return {kind:'degraded', title:'Auto VOD · Needs attention', detail:'Automatic downloads are paused because storage could not be checked.'};
+  if (action === 'storage_insufficient' || storage === 'insufficient' || blocked > 0) {
+    const free = Number(result.storage_free_gb), required = Number(result.storage_required_gb);
+    const detail = Number.isFinite(free) && Number.isFinite(required)
+      ? `Paused: only ${free.toFixed(1)} GB free; ${required.toFixed(1)} GB required.`
+      : 'Waiting for storage. Automatic downloads are paused.';
+    return {kind:'degraded', title:'Auto VOD · Needs attention', detail};
+  }
+  if (action === 'state_unhealthy') return {kind:'degraded', title:'Auto VOD · Needs attention', detail:'Automatic VOD scheduling is paused to prevent duplicates.'};
+  const errors = Math.max(0, Number(result.error_count) || 0);
+  if (errors) return {kind:'degraded', title:'Auto VOD · Needs attention', detail:`${singular(errors, 'streamer')} could not be checked. Auto VOD will try again later.`};
+  const baselined = Math.max(0, Number(result.baseline_established_count) || 0);
+  if (baselined) return {kind:'running', title:'Auto VOD · Ready', detail:`Baseline saved for ${singular(baselined, 'streamer')}. Existing VODs were not queued.`};
+  if (!snapshot.watched_count) return {kind:'paused', title:'Auto VOD · No streamers', detail:'Enable Auto VOD for at least one streamer in Streamers.'};
   if (snapshot.in_progress) return {kind:'running', title:'Auto VOD · Checking…', detail:`Watching ${snapshot.watched_count || 0} streamers`};
-  if (snapshot.last_result?.action === 'state_unhealthy') return {kind:'degraded', title:'Auto VOD · Needs attention', detail:'Automatic VOD scheduling is paused to prevent duplicates.'};
-  if (!snapshot.watched_count) return {kind:'paused', title:'Auto VOD · Running', detail:'No streamers selected for Auto VOD'};
   if (!snapshot.last_finished_at) return {kind:'running', title:'Auto VOD · Starting', detail:'Waiting for first check.'};
-  const queued = Number(snapshot.last_result?.queued_count || 0), errors = Number(snapshot.last_result?.error_count || 0);
-  const detail = errors ? `Last check: ${errors} streamer could not be checked` : queued ? `Last check: ${queued} new VOD${queued === 1 ? '' : 's'} queued` : `Last checked ${formatAutoRecorderTimestamp(snapshot.last_finished_at)} · Next ${formatAutoRecorderTimestamp(snapshot.next_check_at)}`;
+  const queued = Math.max(0, Number(result.queued_count) || 0);
+  const detail = queued ? `Last check: ${singular(queued, 'new VOD')} queued` : `Last checked ${formatAutoRecorderTimestamp(snapshot.last_finished_at)} · Next ${formatAutoRecorderTimestamp(snapshot.next_check_at)}`;
   return {kind:'running', title:'Auto VOD · Running', detail};
 }
 
@@ -730,7 +750,11 @@ async function refreshAutoVodStatus() {
   let snapshot; try { snapshot = await api('/api/auto-vod/status'); } catch { snapshot = {unavailable:true}; }
   const box = $('autoVodStatus'); if (!box) return snapshot; const view = autoVodStatusPresentation(snapshot);
   box.className = `auto-recorder-status is-${view.kind}`;
-  box.innerHTML = `<strong>${escapeHtml(view.title)}</strong><span>${escapeHtml(view.detail)}</span>`;
+  const title = box.querySelector('strong'), detail = box.querySelector('span');
+  if (title) title.textContent = view.title;
+  if (detail) detail.textContent = view.detail;
+  const checkNow = $('checkAutoVodNow');
+  if (checkNow) checkNow.disabled = snapshot.initialized !== true || snapshot.running !== true || snapshot.enabled !== true;
   return snapshot;
 }
 
