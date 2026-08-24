@@ -434,6 +434,25 @@ class LocalYouTubeHelperTests(unittest.TestCase):
             original_title,
         )
 
+    def test_sanitized_description_matches_preview_preparation_and_upload(self):
+        video = self.make_video()
+        original_title = "Hallüüü <3 | Vanausbau"
+        self.write_info(video, self.info_payload(title=original_title))
+        settings = {
+            **self.settings,
+            "manual_upload_rename_video": False,
+            "youtube_description_template": "Stream: {title}\nKeep ü\t\x00<3>",
+        }
+
+        preview = self.build_metadata(video, settings)
+        self.assertEqual(preview["description"], "Stream: Hallüüü 3 | Vanausbau\nKeep ü 3")
+        self.assertNotIn("<", preview["description"])
+        prepared = self.prepare(video, settings)
+        persisted = json.loads(prepared.with_suffix(".youtube.json").read_text(encoding="utf-8"))
+        self.assertEqual(persisted["description"], preview["description"])
+
+        self.assertEqual(self.metadata(video)["title"], original_title)
+
     def test_template_rendering_whitespace_and_failure_fallback(self):
         meta = {"title": "VOD", "date_de": "04.03.2026"}
         self.assertEqual(
@@ -1270,6 +1289,20 @@ class YouTubeUploadHelperTests(unittest.TestCase):
         body = service.videos.return_value.insert.call_args.kwargs["body"]
         self.assertEqual(body["snippet"]["title"], "A B")
         self.assertEqual(metadata["title"], "A << > B")
+
+    def test_upload_sanitizes_description_preserving_unicode_and_lines(self):
+        service = mock.Mock()
+        service.videos.return_value.insert.return_value.next_chunk.return_value = (
+            None, {"id": "youtube-video-1"}
+        )
+        metadata = self.metadata()
+        metadata["description"] = "Hallüüü <3\nSecond line\x00"
+
+        self.upload(service, metadata_builder=mock.Mock(return_value=metadata))
+
+        body = service.videos.return_value.insert.call_args.kwargs["body"]
+        self.assertEqual(body["snippet"]["description"], "Hallüüü 3\nSecond line")
+        self.assertEqual(metadata["description"], "Hallüüü <3\nSecond line\x00")
 
     def test_invalid_privacy_falls_back_to_private(self):
         self.settings["youtube_privacy_status"] = "friends"

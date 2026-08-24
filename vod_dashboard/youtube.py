@@ -619,7 +619,9 @@ def upload_video_to_youtube(
                 youtube_metadata.get("title"),
                 fallback=safe_filename_title(path),
             ),
-            "description": youtube_metadata["description"],
+            "description": sanitize_youtube_description(
+                youtube_metadata.get("description")
+            ),
             "tags": tags,
             "categoryId": str(
                 settings.get("youtube_category_id") or "20"
@@ -916,6 +918,28 @@ def sanitize_youtube_title(
     return title or "YouTube Upload"
 
 
+def sanitize_youtube_description(value: Any) -> str:
+    """Return a YouTube-safe description without mutating source metadata.
+
+    Keep ordinary Unicode and line breaks intact, while removing markup-like
+    angle brackets and Unicode control/format characters that YouTube rejects.
+    """
+    raw = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    characters = []
+    for character in raw:
+        if character in "<>":
+            continue
+        if character == "\n":
+            characters.append(character)
+        elif character == "\t":
+            characters.append(" ")
+        elif unicodedata.category(character).startswith("C"):
+            continue
+        else:
+            characters.append(character)
+    return "".join(characters)
+
+
 def build_youtube_metadata(
     path: Path,
     settings: Dict[str, Any],
@@ -963,11 +987,11 @@ def build_youtube_metadata(
         expanded_title,
         fallback=title_builder(path),
     )
-    description = template_renderer(
+    description = sanitize_youtube_description(template_renderer(
         description_template,
         meta,
         str(settings.get("youtube_description") or ""),
-    )
+    ))
     return {"title": title, "description": description, "meta": meta}
 
 
@@ -1066,7 +1090,8 @@ def prepare_file_for_manual_youtube_upload(
         fallback=title_builder(path),
     )
     metadata["title"] = title
-    description = metadata.get("description") or ""
+    description = sanitize_youtube_description(metadata.get("description") or "")
+    metadata["description"] = description
     target_path = path
 
     old_info_candidates = [
