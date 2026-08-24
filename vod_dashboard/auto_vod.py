@@ -16,7 +16,8 @@ from vod_dashboard.settings import canonical_streamer_login
 
 
 AUTO_VOD_STATE_FILE_NAME = "auto-vod-state.json"
-AUTO_VOD_STATE_VERSION = 1
+AUTO_VOD_STATE_VERSION = 2
+LEGACY_AUTO_VOD_STATE_VERSION = 1
 AUTO_VOD_DISPOSITIONS = frozenset({"pending", "queued", "handled"})
 AUTO_VOD_HANDLED_LIMIT_PER_STREAMER = 500
 MAX_AUTO_VOD_ATTEMPTS = 1000
@@ -55,12 +56,27 @@ class AutoVodStateLoadError(AutoVodStateError):
         self.reason = reason
 
 
+class AutoVodStateMigrationRequired(AutoVodStateLoadError):
+    """Raised for a valid legacy v1 state which must not be scheduled."""
+
+    def __init__(self) -> None:
+        super().__init__("migration_required")
+
+
 class AutoVodStatePersistenceError(AutoVodStateError):
     """Raised when an atomic, validated write cannot complete."""
 
 
 def empty_auto_vod_state() -> State:
     return {"version": AUTO_VOD_STATE_VERSION, "streamers": {}}
+
+
+def _empty_streamer_bucket() -> Dict[str, Any]:
+    return {
+        "baseline_initialized": False,
+        "baseline_established_at": None,
+        "vods": {},
+    }
 
 
 def auto_vod_state_path(dashboard_dir: Path) -> Path:
@@ -184,18 +200,30 @@ def _normalize_record(value: Any) -> Optional[VodRecord]:
     }
 
 
-def normalize_auto_vod_state(value: Any) -> State:
-    """Strictly validate complete persisted state; any bad record fails closed."""
+def _normalize_vods(raw_vods: Any) -> Dict[str, VodRecord]:
+    if not isinstance(raw_vods, Mapping) or len(raw_vods) > MAX_AUTO_VODS_PER_STREAMER:
+        raise AutoVodStateLoadError("invalid_record")
+    vods: Dict[str, VodRecord] = {}
+    for raw_vod_id, raw_record in raw_vods.items():
+        vod_id = _normalize_vod_id(raw_vod_id)
+        record = _normalize_record(raw_record)
+        if not vod_id or vod_id != raw_vod_id or record is None:
+            raise AutoVodStateLoadError("invalid_record")
+        vods[vod_id] = record
+    return vods
+
+
+def normalize_legacy_auto_vod_state(value: Any) -> State:
+    """Strictly validate v1 for an explicit offline migration only."""
     if not isinstance(value, Mapping) or set(value) != {"version", "streamers"}:
         raise AutoVodStateLoadError("invalid_structure")
     version = value.get("version")
-    if isinstance(version, bool) or version != AUTO_VOD_STATE_VERSION:
+    if isinstance(version, bool) or version != LEGACY_AUTO_VOD_STATE_VERSION:
         raise AutoVodStateLoadError("unsupported_version")
     raw_streamers = value.get("streamers")
     if not isinstance(raw_streamers, Mapping) or len(raw_streamers) > MAX_AUTO_VOD_STREAMERS:
         raise AutoVodStateLoadError("invalid_structure")
-
-    streamers: Dict[str, Dict[str, Dict[str, VodRecord]]] = {}
+    streamers: Dict[str, Dict[str, Any]] = {}
     total_records = 0
     for raw_streamer, raw_bucket in raw_streamers.items():
         streamer = canonical_streamer_login(raw_streamer)
@@ -203,20 +231,67 @@ def normalize_auto_vod_state(value: Any) -> State:
             raise AutoVodStateLoadError("invalid_record")
         if not isinstance(raw_bucket, Mapping) or set(raw_bucket) != {"vods"}:
             raise AutoVodStateLoadError("invalid_record")
-        raw_vods = raw_bucket.get("vods")
-        if not isinstance(raw_vods, Mapping) or len(raw_vods) > MAX_AUTO_VODS_PER_STREAMER:
+        vods = _normalize_vods(raw_bucket.get("vods"))
+        total_records += len(vods)
+        if total_records > MAX_AUTO_VOD_RECORDS:
             raise AutoVodStateLoadError("invalid_record")
-        vods: Dict[str, VodRecord] = {}
-        for raw_vod_id, raw_record in raw_vods.items():
-            vod_id = _normalize_vod_id(raw_vod_id)
-            record = _normalize_record(raw_record)
-            if not vod_id or vod_id != raw_vod_id or record is None:
-                raise AutoVodStateLoadError("invalid_record")
-            vods[vod_id] = record
-            total_records += 1
-            if total_records > MAX_AUTO_VOD_RECORDS:
-                raise AutoVodStateLoadError("invalid_record")
         streamers[streamer] = {"vods": vods}
+    return {"version": LEGACY_AUTO_VOD_STATE_VERSION, "streamers": streamers}
+
+
+def normalize_auto_vod_state(value: Any) -> State:
+    """Strictly validate v2 state; recognized v1 state fails closed for migration."""
+    if not isinstance(value, Mapping) or set(value) != {"version", "streamers"}:
+        raise AutoVodStateLoadError("invalid_structure")
+    version = value.get("version")
+    if isinstance(version, bool):
+        raise AutoVodStateLoadError("unsupported_version")
+    if version == LEGACY_AUTO_VOD_STATE_VERSION:
+        normalize_legacy_auto_vod_state(value)
+        raise AutoVodStateMigrationRequired()
+    if version != AUTO_VOD_STATE_VERSION:
+        raise AutoVodStateLoadError("unsupported_version")
+    raw_streamers = value.get("streamers")
+    if not isinstance(raw_streamers, Mapping) or len(raw_streamers) > MAX_AUTO_VOD_STREAMERS:
+        raise AutoVodStateLoadError("invalid_structure")
+
+    streamers: Dict[str, Dict[str, Any]] = {}
+    total_records = 0
+    for raw_streamer, raw_bucket in raw_streamers.items():
+        streamer = canonical_streamer_login(raw_streamer)
+        if not streamer or streamer != raw_streamer:
+            raise AutoVodStateLoadError("invalid_record")
+        if not isinstance(raw_bucket, Mapping) or set(raw_bucket) != {
+            "baseline_initialized",
+            "baseline_established_at",
+            "vods",
+        }:
+            raise AutoVodStateLoadError("invalid_record")
+        baseline_initialized = raw_bucket.get("baseline_initialized")
+        baseline_established_at = _normalize_utc_timestamp(
+            raw_bucket.get("baseline_established_at")
+        )
+        if (
+            not isinstance(baseline_initialized, bool)
+            or (
+                baseline_initialized
+                and baseline_established_at is None
+            )
+            or (
+                not baseline_initialized
+                and raw_bucket.get("baseline_established_at") is not None
+            )
+        ):
+            raise AutoVodStateLoadError("invalid_record")
+        vods = _normalize_vods(raw_bucket.get("vods"))
+        total_records += len(vods)
+        if total_records > MAX_AUTO_VOD_RECORDS:
+            raise AutoVodStateLoadError("invalid_record")
+        streamers[streamer] = {
+            "baseline_initialized": baseline_initialized,
+            "baseline_established_at": baseline_established_at,
+            "vods": vods,
+        }
     return {"version": AUTO_VOD_STATE_VERSION, "streamers": streamers}
 
 
@@ -276,7 +351,7 @@ def _timestamp_from_clock(clock: Clock) -> str:
 
 
 def apply_auto_vod_retention(state: Any) -> State:
-    """Prune only deterministic oldest handled records, per streamer."""
+    """Prune only deterministic non-baseline handled records, per streamer."""
     normalized = normalize_auto_vod_state(state)
     retained = deepcopy(normalized)
     for bucket in retained["streamers"].values():
@@ -284,7 +359,10 @@ def apply_auto_vod_retention(state: Any) -> State:
         handled = [
             (vod_id, record)
             for vod_id, record in vods.items()
-            if record["disposition"] == "handled"
+            if (
+                record["disposition"] == "handled"
+                and record["reason"] != "baseline_existing"
+            )
         ]
         handled.sort(
             key=lambda item: (
@@ -352,9 +430,20 @@ class AutoVodStateStore:
             return None
         with self._lock:
             record = self._load_locked()["streamers"].get(
-                canonical_streamer, {"vods": {}}
+                canonical_streamer, _empty_streamer_bucket()
             )["vods"].get(canonical_vod_id)
             return deepcopy(record) if record is not None else None
+
+    def baseline_initialized(self, streamer: Any) -> bool:
+        """Return whether this streamer's initial successful discovery is durable."""
+        canonical_streamer = canonical_streamer_login(streamer)
+        if not canonical_streamer:
+            return False
+        with self._lock:
+            bucket = self._load_locked()["streamers"].get(
+                canonical_streamer, _empty_streamer_bucket()
+            )
+            return bucket["baseline_initialized"] is True
 
     @staticmethod
     def _fsync_parent_directory(path: Path) -> None:
@@ -370,9 +459,13 @@ class AutoVodStateStore:
             if descriptor is not None:
                 os.close(descriptor)
 
-    def _write_locked(self, state: State) -> None:
+    def _write_locked(self, state: State, *, apply_retention: bool = True) -> None:
         try:
-            normalized = apply_auto_vod_retention(state)
+            normalized = (
+                apply_auto_vod_retention(state)
+                if apply_retention
+                else normalize_auto_vod_state(state)
+            )
         except AutoVodStateLoadError as exc:
             raise AutoVodStateValidationError("invalid_state") from exc
         temporary_path: Optional[Path] = None
@@ -407,9 +500,65 @@ class AutoVodStateStore:
     def _persist_record_locked(
         self, state: State, streamer: str, vod_id: str, record: VodRecord
     ) -> VodRecord:
-        state["streamers"].setdefault(streamer, {"vods": {}})["vods"][vod_id] = record
+        state["streamers"].setdefault(streamer, _empty_streamer_bucket())["vods"][
+            vod_id
+        ] = record
         self._write_locked(state)
         return deepcopy(record)
+
+    def replace_state(self, state: Any, *, apply_retention: bool = True) -> State:
+        """Atomically replace a complete validated v2 state for an offline tool."""
+        with self._lock:
+            normalized = normalize_auto_vod_state(state)
+            self._write_locked(normalized, apply_retention=apply_retention)
+            return deepcopy(normalized)
+
+    def establish_baseline(self, streamer: Any, vod_ids: Any) -> Dict[str, Any]:
+        """Atomically mark a streamer's first successful discovery as existing work."""
+        canonical_streamer = _required_streamer(streamer)
+        if isinstance(vod_ids, (str, bytes, Mapping)):
+            raise AutoVodStateValidationError("invalid_vod_ids")
+        try:
+            raw_vod_ids = list(vod_ids)
+        except TypeError as exc:
+            raise AutoVodStateValidationError("invalid_vod_ids") from exc
+        canonical_vod_ids: list[str] = []
+        seen: set[str] = set()
+        for value in raw_vod_ids:
+            vod_id = _required_vod_id(value)
+            if vod_id not in seen:
+                seen.add(vod_id)
+                canonical_vod_ids.append(vod_id)
+
+        with self._lock:
+            state = self._load_locked()
+            bucket = state["streamers"].setdefault(
+                canonical_streamer, _empty_streamer_bucket()
+            )
+            if bucket["baseline_initialized"] is True:
+                return deepcopy(bucket)
+            if len(bucket["vods"]) + len(
+                [vod_id for vod_id in canonical_vod_ids if vod_id not in bucket["vods"]]
+            ) > MAX_AUTO_VODS_PER_STREAMER:
+                raise AutoVodStateValidationError("too_many_vods")
+            now = _timestamp_from_clock(self._clock)
+            bucket["baseline_initialized"] = True
+            bucket["baseline_established_at"] = now
+            for vod_id in canonical_vod_ids:
+                existing = bucket["vods"].get(vod_id)
+                if existing is not None and existing["disposition"] == "handled":
+                    continue
+                bucket["vods"][vod_id] = {
+                    "disposition": "handled",
+                    "reason": "baseline_existing",
+                    "attempts": 0,
+                    "retry_after": None,
+                    "job_id": None,
+                    "discovered_at": now,
+                    "updated_at": now,
+                }
+            self._write_locked(state)
+            return deepcopy(bucket)
 
     def ensure_pending(
         self, streamer: Any, vod_id: Any, *, reason: Any = "new_vod"
@@ -420,7 +569,7 @@ class AutoVodStateStore:
         with self._lock:
             state = self._load_locked()
             existing = state["streamers"].get(
-                canonical_streamer, {"vods": {}}
+                canonical_streamer, _empty_streamer_bucket()
             )["vods"].get(canonical_vod_id)
             if existing is not None:
                 return deepcopy(existing)
@@ -457,7 +606,7 @@ class AutoVodStateStore:
         with self._lock:
             state = self._load_locked()
             existing = state["streamers"].get(
-                canonical_streamer, {"vods": {}}
+                canonical_streamer, _empty_streamer_bucket()
             )["vods"].get(canonical_vod_id)
             if existing is None:
                 now = _timestamp_from_clock(self._clock)
@@ -511,7 +660,7 @@ class AutoVodStateStore:
         with self._lock:
             state = self._load_locked()
             existing = state["streamers"].get(
-                canonical_streamer, {"vods": {}}
+                canonical_streamer, _empty_streamer_bucket()
             )["vods"].get(canonical_vod_id)
             if existing is None:
                 raise AutoVodStateValidationError("vod_not_found")
@@ -558,7 +707,7 @@ class AutoVodStateStore:
         with self._lock:
             state = self._load_locked()
             existing = state["streamers"].get(
-                canonical_streamer, {"vods": {}}
+                canonical_streamer, _empty_streamer_bucket()
             )["vods"].get(canonical_vod_id)
             if existing is None:
                 raise AutoVodStateValidationError("vod_not_found")
@@ -600,7 +749,7 @@ class AutoVodStateStore:
         with self._lock:
             state = self._load_locked()
             existing = state["streamers"].get(
-                canonical_streamer, {"vods": {}}
+                canonical_streamer, _empty_streamer_bucket()
             )["vods"].get(canonical_vod_id)
             if existing is None:
                 raise AutoVodStateValidationError("vod_not_found")

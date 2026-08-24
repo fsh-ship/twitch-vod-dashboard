@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import time
@@ -73,6 +74,9 @@ class AutoVodCoordinatorTests(unittest.TestCase):
             worker_starter=worker_starter,
         )
 
+    def establish_baseline(self, streamer="alpha", vod_ids=()):
+        return self.store.establish_baseline(streamer, vod_ids)
+
     def test_disabled_and_no_selected_streamers_have_zero_side_effects(self):
         self.settings["auto_vod_enabled"] = False
         result = self.coordinator().run_once()
@@ -92,12 +96,13 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.assertEqual([call[0] for call in self.discovery_calls], ["alpha", "beta"])
         self.assertTrue(all(call[1] == 10 for call in self.discovery_calls))
         self.assertEqual(result["watched_count"], 2)
-        self.assertEqual(len(self.manager.created), 1)
-        job = self.manager.created[0]
-        self.assertEqual(job["origin"], "auto_vod")
-        self.assertEqual(job["post_download_mode"], "download_only")
-        self.assertEqual(job["attempt"], 1)
-        self.assertEqual(self.manager.started, ["1"])
+        self.assertEqual(self.manager.created, [])
+        self.assertTrue(self.store.baseline_initialized("alpha"))
+        self.assertTrue(self.store.baseline_initialized("beta"))
+        self.assertEqual(
+            self.store.get_vod("beta", "2854443252")["reason"],
+            "baseline_existing",
+        )
 
     def test_discovery_is_bounded_to_two_workers_and_one_failure_does_not_stop_others(self):
         self.settings["streamer_profiles"]["gamma"] = {"auto_vod_download": True}
@@ -123,7 +128,10 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.assertLessEqual(maximum, 2)
         self.assertGreaterEqual(maximum, 2)
         self.assertEqual(result["errors"], [{"streamer": "beta", "code": "yt_dlp_failed"}])
-        self.assertEqual([job["streamer"] for job in self.manager.created], ["alpha", "gamma"])
+        self.assertEqual(self.manager.created, [])
+        self.assertTrue(self.store.baseline_initialized("alpha"))
+        self.assertFalse(self.store.baseline_initialized("beta"))
+        self.assertTrue(self.store.baseline_initialized("gamma"))
 
     def test_unhealthy_state_fails_closed_before_archive_or_discovery(self):
         bad = mock.Mock()
@@ -140,6 +148,7 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.assertEqual(self.manager.created, [])
 
     def test_archive_and_manual_jobs_prevent_duplicate_auto_jobs(self):
+        self.establish_baseline("alpha", [])
         self.archive.add("2854443252")
         self.manager.jobs["7"] = {"id": "7", "type": "download", "origin": "manual", "urls": ["https://www.twitch.tv/videos/2854443251"], "state": "queued"}
         self.coordinator(lambda streamer: {"vods": [self.vod("2854443252"), self.vod("2854443251")]}).run_once()
@@ -152,6 +161,7 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.assertEqual(waiting["disposition"], "pending")
 
     def test_crash_window_rebinds_matching_auto_job_and_completed_or_cancelled_jobs_are_handled(self):
+        self.establish_baseline("alpha", [])
         self.store.ensure_pending("alpha", "2854443252")
         self.manager.jobs["3"] = {"id": "3", "type": "download", "origin": "auto_vod", "streamer": "alpha", "twitch_vod_id": "2854443252", "attempt": 1, "urls": ["https://www.twitch.tv/videos/2854443252"], "state": "queued"}
         self.coordinator().run_once()
@@ -165,6 +175,7 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.assertEqual(self.store.get_vod("alpha", "2854443251")["reason"], "downloaded")
 
     def test_queued_state_never_binds_a_manual_job_with_the_same_url(self):
+        self.establish_baseline("alpha", [])
         self.store.ensure_pending("alpha", "2854443252")
         self.store.set_queued("alpha", "2854443252", "9", attempts=1)
         self.manager.jobs["9"] = {
@@ -181,6 +192,7 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.assertEqual(self.store.get_vod("alpha", "2854443252")["disposition"], "queued")
 
     def test_failed_retry_cooldowns_and_exhaustion_are_durable(self):
+        self.establish_baseline("alpha", [])
         for vod_id, attempts in (("2854443252", 1), ("2854443251", 2), ("2854443250", 3)):
             self.store.ensure_pending("alpha", vod_id)
             job_id = str(attempts + 10)
@@ -192,6 +204,7 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.assertEqual(self.store.get_vod("alpha", "2854443250")["reason"], "retry_exhausted")
 
     def test_crash_window_failed_auto_job_uses_the_normal_retry_cooldown(self):
+        self.establish_baseline("alpha", [])
         self.store.ensure_pending("alpha", "2854443252")
         self.manager.jobs["3"] = {
             "id": "3", "type": "download", "origin": "auto_vod",
@@ -207,6 +220,7 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.assertEqual(self.manager.created, [])
 
     def test_due_pending_retry_without_rediscovery_schedules_once_and_attempts_match(self):
+        self.establish_baseline("alpha", [])
         self.store.ensure_pending("alpha", "2854443252")
         self.store.set_pending("alpha", "2854443252", reason="job_failed", attempts=1, retry_after="2026-08-24T11:00:00Z")
         self.coordinator(lambda streamer: {"vods": []}).run_once()
@@ -218,6 +232,8 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.assertEqual(state["job_id"], job["id"])
 
     def test_newest_first_discovery_schedules_oldest_first_with_bounded_limits(self):
+        self.establish_baseline("alpha", [])
+        self.establish_baseline("beta", [])
         def discoveries(streamer):
             if streamer == "alpha":
                 return {"vods": [self.vod(2854443252 - index) for index in range(5)]}
@@ -228,6 +244,7 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.assertEqual(len(self.manager.created), 6)
 
     def test_failed_manual_job_does_not_block_a_new_auto_attempt(self):
+        self.establish_baseline("alpha", [])
         self.manager.jobs["7"] = {
             "id": "7", "type": "download", "origin": "manual",
             "urls": ["https://www.twitch.tv/videos/2854443252"], "state": "failed",
@@ -241,6 +258,7 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.assertEqual(self.manager.created[0]["origin"], "auto_vod")
 
     def test_job_or_state_persistence_failure_never_starts_worker_or_consumes_attempt(self):
+        self.establish_baseline("alpha", [])
         self.manager.fail_create = True
         result = self.coordinator(lambda streamer: {"vods": [self.vod("2854443252")]}).run_once()
         self.assertEqual(result["action"], "job_persistence_failed")
@@ -252,12 +270,14 @@ class AutoVodCoordinatorTests(unittest.TestCase):
             def set_queued(self, *args, **kwargs):
                 raise AutoVodStateLoadError("unreadable_state")
         failing = FailingBindStore(Path(self.temp.name) / "other.json", clock=lambda: NOW)
+        failing.establish_baseline("alpha", [])
         result = self.coordinator(lambda streamer: {"vods": [self.vod("2854443251")]}, state_store=failing).run_once()
         self.assertEqual(result["action"], "state_persistence_failed")
         self.assertEqual(self.manager.started, [])
         self.assertEqual(len(self.manager.created), 1)
 
     def test_worker_start_failure_leaves_the_durable_job_and_binding_for_reconciliation(self):
+        self.establish_baseline("alpha", [])
         result = self.coordinator(
             lambda streamer: {"vods": [self.vod("2854443252")]},
             worker_starter=mock.Mock(side_effect=RuntimeError("start failed")),
@@ -267,6 +287,105 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.assertEqual(result["errors"], [{"streamer": "alpha", "code": "worker_start_failed"}])
         self.assertEqual(self.store.get_vod("alpha", "2854443252")["job_id"], "1")
         self.assertEqual(self.manager.created[0]["attempt"], 1)
+
+    def test_first_successful_discovery_establishes_baseline_and_later_id_queues_once(self):
+        discoveries = [
+            {"vods": [self.vod("2854443252"), self.vod("2854443251")]},
+            {"vods": [self.vod("2854443253"), self.vod("2854443252")]},
+            {"vods": [self.vod("2854443253"), self.vod("2854443252")]},
+        ]
+
+        def discovery(streamer):
+            if streamer == "alpha":
+                return discoveries.pop(0)
+            return {"vods": []}
+
+        self.coordinator(discovery).run_once()
+        self.assertEqual(self.manager.created, [])
+        self.assertTrue(self.store.baseline_initialized("alpha"))
+        self.assertEqual(self.store.get_vod("alpha", "2854443252")["reason"], "baseline_existing")
+
+        self.coordinator(discovery).run_once()
+        self.assertEqual([job["twitch_vod_id"] for job in self.manager.created], ["2854443253"])
+        self.assertEqual(self.manager.created[0]["origin"], "auto_vod")
+        self.assertEqual(self.manager.created[0]["post_download_mode"], "download_only")
+        self.assertEqual(self.manager.created[0]["attempt"], 1)
+
+        self.coordinator(discovery).run_once()
+        self.assertEqual(len(self.manager.created), 1)
+
+    def test_empty_first_discovery_baselines_and_failure_does_not(self):
+        self.coordinator(lambda streamer: {"vods": []}).run_once()
+        self.assertTrue(self.store.baseline_initialized("alpha"))
+        self.assertEqual(self.store.load()["streamers"]["alpha"]["vods"], {})
+
+        fresh = AutoVodStateStore(Path(self.temp.name) / "fresh.json", clock=lambda: NOW)
+        result = self.coordinator(
+            lambda streamer: {"vods": [], "error": {"code": "yt_dlp_failed"}},
+            state_store=fresh,
+        ).run_once()
+        self.assertFalse(fresh.baseline_initialized("alpha"))
+        self.assertEqual(result["error_count"], 2)
+
+        self.coordinator(
+            lambda streamer: {"vods": [self.vod("2854443252")]},
+            state_store=fresh,
+        ).run_once()
+        self.assertTrue(fresh.baseline_initialized("alpha"))
+        self.assertEqual(self.manager.created, [])
+
+    def test_disable_reenable_keeps_baseline_and_known_id_is_never_pending(self):
+        self.coordinator(
+            lambda streamer: {"vods": [self.vod("2854443252")]} if streamer == "alpha" else {"vods": []}
+        ).run_once()
+        baseline = self.store.load()["streamers"]["alpha"]
+        self.settings["auto_vod_enabled"] = False
+        self.coordinator().run_once()
+        self.assertEqual(self.store.load()["streamers"]["alpha"], baseline)
+
+        self.settings["auto_vod_enabled"] = True
+        self.coordinator(
+            lambda streamer: {"vods": [self.vod("2854443252")]} if streamer == "alpha" else {"vods": []}
+        ).run_once()
+        self.assertEqual(self.manager.created, [])
+        record = self.store.get_vod("alpha", "2854443252")
+        self.assertEqual(record["disposition"], "handled")
+        self.assertEqual(record["reason"], "baseline_existing")
+
+    def test_migration_required_creates_no_jobs_or_state_mutations(self):
+        legacy_path = Path(self.temp.name) / "legacy.json"
+        legacy = {
+            "version": 1,
+            "streamers": {
+                "alpha": {
+                    "vods": {
+                        "2854443252": {
+                            "disposition": "pending",
+                            "reason": "new_vod",
+                            "attempts": 0,
+                            "retry_after": None,
+                            "job_id": None,
+                            "discovered_at": "2026-08-24T00:00:00Z",
+                            "updated_at": "2026-08-24T00:00:00Z",
+                        }
+                    }
+                }
+            },
+        }
+        raw = json.dumps(legacy).encode("utf-8")
+        legacy_path.write_bytes(raw)
+        legacy_store = AutoVodStateStore(legacy_path, clock=lambda: NOW)
+
+        result = self.coordinator(
+            lambda streamer: {"vods": [self.vod("2854443253")]},
+            state_store=legacy_store,
+        ).run_once()
+
+        self.assertEqual(result["action"], "migration_required")
+        self.assertEqual(result["errors"], [{"code": "migration_required"}])
+        self.assertEqual(self.discovery_calls, [])
+        self.assertEqual(self.manager.created, [])
+        self.assertEqual(legacy_path.read_bytes(), raw)
 
 
 if __name__ == "__main__":

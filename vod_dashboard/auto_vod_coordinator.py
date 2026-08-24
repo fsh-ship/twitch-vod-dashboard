@@ -6,7 +6,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
-from vod_dashboard.auto_vod import AutoVodStateError, AutoVodStateStore
+from vod_dashboard.auto_vod import (
+    AutoVodStateError,
+    AutoVodStateMigrationRequired,
+    AutoVodStateStore,
+    normalize_auto_vod_id,
+)
 from vod_dashboard.settings import canonical_streamer_login, normalize_streamer_profiles
 from vod_dashboard.twitch import canonical_twitch_vod_url, discover_streamer_vods
 
@@ -183,6 +188,15 @@ class AutoVodCoordinator:
             settings = dict(self._settings_provider())
             enabled = settings.get("auto_vod_enabled") is True
             return self._run_once(settings)
+        except AutoVodStateMigrationRequired:
+            result = self._result(enabled, "migration_required")
+            result.update(
+                {
+                    "error_count": 1,
+                    "errors": [{"code": "migration_required"}],
+                }
+            )
+            return result
         except Exception:
             result = self._result(enabled, "coordinator_error")
             result.update(
@@ -205,6 +219,11 @@ class AutoVodCoordinator:
         try:
             state = self._state_store.snapshot()
             now = _utc_now(self._clock)
+        except AutoVodStateMigrationRequired:
+            return self._result(True, "migration_required") | {
+                "error_count": 1,
+                "errors": [{"code": "migration_required"}],
+            }
         except (AutoVodStateError, ValueError):
             result.update({"state_healthy": False, "action": "state_unhealthy", "error_count": 1, "errors": [{"code": "state_unhealthy"}]})
             return result
@@ -215,7 +234,7 @@ class AutoVodCoordinator:
         jobs = list(self._jobs_provider())
         errors: list[Dict[str, str]] = []
         for streamer in selected:
-            for vod_id, record in state["streamers"].get(streamer, {"vods": {}})["vods"].items():
+            for vod_id, record in state["streamers"].get(streamer, {}).get("vods", {}).items():
                 try:
                     self._reconcile_record(streamer, vod_id, record, archive_ids, jobs, now, errors)
                 except AutoVodStateError:
@@ -246,7 +265,28 @@ class AutoVodCoordinator:
                 errors.append({"streamer": streamer, "code": str(discovery["error"].get("code") or "yt_dlp_failed")})
             vods = [] if discovery.get("error") else list(discovery.get("vods") or [])
             result["discovered_count"] += len(vods)
-            current = self._state_store.snapshot()["streamers"].get(streamer, {"vods": {}})["vods"]
+            current_bucket = self._state_store.snapshot()["streamers"].get(streamer)
+            if current_bucket is None or current_bucket.get("baseline_initialized") is not True:
+                if discovery.get("error"):
+                    continue
+                baseline_ids: list[str] = []
+                seen_baseline_ids: set[str] = set()
+                for vod in vods:
+                    vod_id = normalize_auto_vod_id(vod.get("twitch_vod_id"))
+                    if vod_id and vod_id not in seen_baseline_ids:
+                        seen_baseline_ids.add(vod_id)
+                        baseline_ids.append(vod_id)
+                try:
+                    self._state_store.establish_baseline(streamer, baseline_ids)
+                except AutoVodStateMigrationRequired:
+                    raise
+                except AutoVodStateError:
+                    result.update({"state_healthy": False, "action": "state_unhealthy"})
+                    errors.append({"streamer": streamer, "code": "state_unhealthy"})
+                    stop_scheduling = True
+                    break
+                continue
+            current = current_bucket["vods"]
             pending = [
                 (vod_id, record) for vod_id, record in current.items()
                 if record["disposition"] == "pending" and (not record["retry_after"] or record["retry_after"] <= now.isoformat(timespec="seconds").replace("+00:00", "Z"))
@@ -331,7 +371,7 @@ class AutoVodCoordinator:
                     result["action"] = "job_persistence_failed"; errors.append({"streamer": streamer, "code": "job_persistence_failed"}); stop_scheduling = True; break
         final = self._state_store.snapshot()
         for streamer in selected:
-            for record in final["streamers"].get(streamer, {"vods": {}})["vods"].values():
+            for record in final["streamers"].get(streamer, {}).get("vods", {}).values():
                 result[f"{record['disposition']}_count"] += 1
                 if record["disposition"] == "pending" and record.get("retry_after"):
                     result["retry_wait_count"] += 1

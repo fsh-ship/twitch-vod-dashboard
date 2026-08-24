@@ -44,7 +44,7 @@ class AutoVodStateStoreTests(unittest.TestCase):
             self.path,
         )
 
-    def test_valid_roundtrip_uses_only_version_one_allowlisted_schema(self):
+    def test_valid_roundtrip_uses_only_version_two_allowlisted_schema(self):
         pending = self.pending()
         queued = self.store.set_queued(self.streamer, self.vod_id, "17")
         handled = self.store.set_handled(
@@ -56,7 +56,14 @@ class AutoVodStateStoreTests(unittest.TestCase):
         self.assertEqual(handled["disposition"], "handled")
         persisted = json.loads(self.path.read_text(encoding="utf-8"))
         self.assertEqual(persisted, self.store.load())
-        record = persisted["streamers"]["nika_livetv"]["vods"][self.vod_id]
+        bucket = persisted["streamers"]["nika_livetv"]
+        self.assertEqual(
+            set(bucket),
+            {"baseline_initialized", "baseline_established_at", "vods"},
+        )
+        self.assertFalse(bucket["baseline_initialized"])
+        self.assertIsNone(bucket["baseline_established_at"])
+        record = bucket["vods"][self.vod_id]
         self.assertEqual(
             set(record),
             {
@@ -69,7 +76,7 @@ class AutoVodStateStoreTests(unittest.TestCase):
         cases = (
             ("{broken", "invalid_json"),
             (json.dumps([]), "invalid_structure"),
-            (json.dumps({"version": 2, "streamers": {}}), "unsupported_version"),
+            (json.dumps({"version": 3, "streamers": {}}), "unsupported_version"),
             (json.dumps({"version": 1, "streamers": {"Nika": {"vods": {}}}}), "invalid_record"),
             (json.dumps({"version": 1, "streamers": {"nika": {"vods": {"2854443252": {}}}}}), "invalid_record"),
         )
@@ -83,6 +90,36 @@ class AutoVodStateStoreTests(unittest.TestCase):
                 with self.assertRaises(auto_vod.AutoVodStateLoadError):
                     self.pending()
                 self.assertEqual(self.path.read_bytes(), raw.encode("utf-8"))
+
+    def test_v1_state_requires_migration_and_is_not_overwritten(self):
+        legacy = {
+            "version": 1,
+            "streamers": {
+                "nika_livetv": {
+                    "vods": {
+                        self.vod_id: {
+                            "disposition": "pending",
+                            "reason": "new_vod",
+                            "attempts": 0,
+                            "retry_after": None,
+                            "job_id": None,
+                            "discovered_at": "2026-08-24T00:00:00Z",
+                            "updated_at": "2026-08-24T00:00:00Z",
+                        }
+                    }
+                }
+            },
+        }
+        raw = json.dumps(legacy, indent=2).encode("utf-8")
+        self.dashboard_dir.mkdir(parents=True)
+        self.path.write_bytes(raw)
+
+        with self.assertRaises(auto_vod.AutoVodStateMigrationRequired) as raised:
+            self.store.load()
+        self.assertEqual(raised.exception.reason, "migration_required")
+        with self.assertRaises(auto_vod.AutoVodStateMigrationRequired):
+            self.store.ensure_pending(self.streamer, "2854443251")
+        self.assertEqual(self.path.read_bytes(), raw)
 
     def test_unreadable_state_has_safe_reason(self):
         self.dashboard_dir.mkdir(parents=True)
@@ -108,6 +145,51 @@ class AutoVodStateStoreTests(unittest.TestCase):
                 with self.assertRaises(auto_vod.AutoVodStateValidationError) as raised:
                     self.store.ensure_pending(streamer, vod_id)
                 self.assertEqual(str(raised.exception), expected)
+
+    def test_establish_baseline_is_atomic_idempotent_and_canonical(self):
+        self.assertFalse(self.store.baseline_initialized(self.streamer))
+        bucket = self.store.establish_baseline(
+            "@Nika_LiveTV", ["v2854443252", "2854443251", "2854443252"]
+        )
+
+        self.assertTrue(bucket["baseline_initialized"])
+        self.assertEqual(bucket["baseline_established_at"], "2026-08-24T00:00:00Z")
+        self.assertTrue(self.store.baseline_initialized(self.streamer))
+        self.assertEqual(set(bucket["vods"]), {"2854443252", "2854443251"})
+        for record in bucket["vods"].values():
+            self.assertEqual(record["disposition"], "handled")
+            self.assertEqual(record["reason"], "baseline_existing")
+            self.assertEqual(record["attempts"], 0)
+            self.assertIsNone(record["retry_after"])
+            self.assertIsNone(record["job_id"])
+
+        original = self.path.read_bytes()
+        repeated = self.store.establish_baseline(self.streamer, ["2854443000"])
+        self.assertEqual(repeated, bucket)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_empty_establish_baseline_persists_initialized_marker(self):
+        bucket = self.store.establish_baseline(self.streamer, [])
+        self.assertTrue(bucket["baseline_initialized"])
+        self.assertEqual(bucket["vods"], {})
+        persisted = self.store.load()["streamers"]["nika_livetv"]
+        self.assertTrue(persisted["baseline_initialized"])
+        self.assertIsNotNone(persisted["baseline_established_at"])
+
+    def test_baseline_preserves_existing_handled_history_reason(self):
+        self.pending()
+        self.store.set_handled(self.streamer, self.vod_id, reason="downloaded")
+
+        bucket = self.store.establish_baseline(self.streamer, [self.vod_id])
+
+        self.assertEqual(bucket["vods"][self.vod_id]["reason"], "downloaded")
+
+    def test_failed_baseline_write_leaves_no_partial_marker_or_records(self):
+        with mock.patch.object(auto_vod.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(auto_vod.AutoVodStatePersistenceError):
+                self.store.establish_baseline(self.streamer, [self.vod_id])
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.store.baseline_initialized(self.streamer))
 
     def test_pending_queued_handled_transitions_are_explicit_and_sticky(self):
         first = self.pending()
@@ -162,7 +244,7 @@ class AutoVodStateStoreTests(unittest.TestCase):
                 call()
         self.assertEqual(self.store.set_queued(self.streamer, self.vod_id, "22")["job_id"], "22")
 
-    def test_retention_prunes_only_deterministic_old_handled_records(self):
+    def test_retention_prunes_only_deterministic_non_baseline_handled_records(self):
         def record(disposition, updated_at, *, reason=None, job_id=None):
             return {
                 "disposition": disposition,
@@ -182,15 +264,26 @@ class AutoVodStateStoreTests(unittest.TestCase):
         }
         vods["2854999001"] = record("pending", "2026-08-24T00:00:00Z", reason="new_vod")
         vods["2854999002"] = record("queued", "2026-08-24T00:00:00Z", job_id="1")
-        state = {"version": 1, "streamers": {"nika_livetv": {"vods": vods}}}
+        vods["2854999003"] = record("handled", "2026-08-24T00:00:00Z", reason="baseline_existing")
+        state = {
+            "version": 2,
+            "streamers": {
+                "nika_livetv": {
+                    "baseline_initialized": True,
+                    "baseline_established_at": "2026-08-24T00:00:00Z",
+                    "vods": vods,
+                }
+            },
+        }
 
         retained = auto_vod.apply_auto_vod_retention(state)
         retained_vods = retained["streamers"]["nika_livetv"]["vods"]
-        self.assertEqual(sum(r["disposition"] == "handled" for r in retained_vods.values()), 500)
+        self.assertEqual(sum(r["disposition"] == "handled" for r in retained_vods.values()), 501)
         self.assertNotIn("2854443000", retained_vods)
         self.assertIn("2854443500", retained_vods)
         self.assertIn("2854999001", retained_vods)
         self.assertIn("2854999002", retained_vods)
+        self.assertIn("2854999003", retained_vods)
         self.assertEqual(retained, auto_vod.apply_auto_vod_retention(state))
 
     def test_atomic_write_failures_and_invalid_outgoing_changes_preserve_primary(self):
