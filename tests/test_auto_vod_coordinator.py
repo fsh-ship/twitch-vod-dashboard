@@ -9,6 +9,7 @@ from unittest import mock
 
 from vod_dashboard.auto_vod import AutoVodStateLoadError, AutoVodStateStore
 from vod_dashboard.auto_vod_coordinator import AutoVodCoordinator
+from vod_dashboard.auto_vod_storage import AutoVodStorageStatus
 
 
 NOW = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
@@ -58,7 +59,14 @@ class AutoVodCoordinatorTests(unittest.TestCase):
     def vod(vod_id):
         return {"twitch_vod_id": str(vod_id), "canonical_url": f"https://www.twitch.tv/videos/{vod_id}", "title": "VOD", "upload_date": None}
 
-    def coordinator(self, discovery=None, state_store=None, worker_starter=None):
+    def coordinator(
+        self,
+        discovery=None,
+        state_store=None,
+        worker_starter=None,
+        storage_provider=None,
+        should_stop=None,
+    ):
         def discover(streamer, settings, *, limit):
             self.discovery_calls.append((streamer, limit, settings))
             return (discovery or (lambda value: {"vods": []}))(streamer)
@@ -72,6 +80,9 @@ class AutoVodCoordinatorTests(unittest.TestCase):
             discovery=discover,
             clock=lambda: NOW,
             worker_starter=worker_starter,
+            storage_provider=storage_provider
+            or (lambda settings: AutoVodStorageStatus("sufficient", 100, 200, 50)),
+            should_stop=should_stop,
         )
 
     def establish_baseline(self, streamer="alpha", vod_ids=()):
@@ -239,9 +250,8 @@ class AutoVodCoordinatorTests(unittest.TestCase):
                 return {"vods": [self.vod(2854443252 - index) for index in range(5)]}
             return {"vods": [self.vod(2854443240 - index) for index in range(5)]}
         self.coordinator(discoveries).run_once()
-        self.assertEqual([job["streamer"] for job in self.manager.created[:3]], ["alpha"] * 3)
-        self.assertEqual([job["twitch_vod_id"] for job in self.manager.created[:3]], ["2854443248", "2854443249", "2854443250"])
-        self.assertEqual(len(self.manager.created), 6)
+        self.assertEqual([job["streamer"] for job in self.manager.created], ["alpha"])
+        self.assertEqual([job["twitch_vod_id"] for job in self.manager.created], ["2854443248"])
 
     def test_failed_manual_job_does_not_block_a_new_auto_attempt(self):
         self.establish_baseline("alpha", [])
@@ -386,6 +396,146 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.assertEqual(self.discovery_calls, [])
         self.assertEqual(self.manager.created, [])
         self.assertEqual(legacy_path.read_bytes(), raw)
+
+    def test_low_storage_discovers_and_persists_pending_without_attempt_or_retry(self):
+        self.establish_baseline("alpha", [])
+        low = lambda settings: AutoVodStorageStatus("insufficient", 1, 200, 50)
+
+        result = self.coordinator(
+            lambda streamer: {
+                "vods": [self.vod("2854443252"), self.vod("2854443251")]
+                if streamer == "alpha"
+                else []
+            },
+            storage_provider=low,
+        ).run_once()
+
+        self.assertEqual(result["action"], "storage_insufficient")
+        self.assertEqual(result["storage_state"], "insufficient")
+        self.assertEqual(result["storage_blocked_count"], 2)
+        self.assertEqual(self.manager.created, [])
+        for vod_id in ("2854443251", "2854443252"):
+            record = self.store.get_vod("alpha", vod_id)
+            self.assertEqual(record["disposition"], "pending")
+            self.assertEqual(record["reason"], "storage_blocked")
+            self.assertEqual(record["attempts"], 0)
+            self.assertIsNone(record["retry_after"])
+            self.assertIsNone(record["job_id"])
+        self.assertEqual([call[0] for call in self.discovery_calls], ["alpha", "beta"])
+
+    def test_storage_recovery_schedules_the_same_pending_vod_once(self):
+        self.establish_baseline("alpha", [])
+        state = {"value": "insufficient"}
+
+        def storage(settings):
+            return AutoVodStorageStatus(state["value"], 100, 200, 50)
+
+        discovery = lambda streamer: {
+            "vods": [self.vod("2854443252")] if streamer == "alpha" else []
+        }
+        self.coordinator(discovery, storage_provider=storage).run_once()
+        state["value"] = "sufficient"
+        result = self.coordinator(discovery, storage_provider=storage).run_once()
+
+        self.assertEqual(result["action"], "queued")
+        self.assertEqual([job["twitch_vod_id"] for job in self.manager.created], ["2854443252"])
+        record = self.store.get_vod("alpha", "2854443252")
+        self.assertEqual(record["disposition"], "queued")
+        self.assertEqual(record["attempts"], 1)
+
+    def test_unavailable_storage_fails_closed_without_consuming_attempt(self):
+        self.establish_baseline("alpha", [])
+        result = self.coordinator(
+            lambda streamer: {
+                "vods": [self.vod("2854443252")] if streamer == "alpha" else []
+            },
+            storage_provider=lambda settings: AutoVodStorageStatus(
+                "unavailable", None, None, None
+            ),
+        ).run_once()
+
+        self.assertEqual(result["action"], "storage_unavailable")
+        self.assertEqual(result["storage_state"], "unavailable")
+        self.assertEqual(self.manager.created, [])
+        record = self.store.get_vod("alpha", "2854443252")
+        self.assertEqual(record["attempts"], 0)
+        self.assertIsNone(record["retry_after"])
+
+    def test_first_run_baseline_does_not_require_storage(self):
+        result = self.coordinator(
+            lambda streamer: {
+                "vods": [self.vod("2854443252")] if streamer == "alpha" else []
+            },
+            storage_provider=lambda settings: AutoVodStorageStatus("insufficient", 1, 200, 50),
+        ).run_once()
+
+        self.assertTrue(self.store.baseline_initialized("alpha"))
+        self.assertEqual(self.manager.created, [])
+        self.assertEqual(result["storage_state"], "not_checked")
+
+    def test_existing_nonterminal_auto_job_blocks_new_jobs_but_keeps_discovery(self):
+        self.establish_baseline("alpha", [])
+        self.manager.jobs["7"] = {
+            "id": "7", "type": "download", "origin": "auto_vod", "state": "running",
+            "streamer": "beta", "twitch_vod_id": "2854443200",
+            "urls": ["https://www.twitch.tv/videos/2854443200"],
+        }
+
+        result = self.coordinator(
+            lambda streamer: {
+                "vods": [self.vod("2854443252")] if streamer == "alpha" else []
+            }
+        ).run_once()
+
+        self.assertEqual(result["action"], "waiting_for_existing_job")
+        self.assertEqual(result["outstanding_auto_vod_jobs"], 1)
+        self.assertEqual(self.manager.created, [])
+        self.assertEqual(self.store.get_vod("alpha", "2854443252")["disposition"], "pending")
+
+    def test_terminal_auto_history_and_manual_jobs_do_not_block_new_auto_job(self):
+        self.establish_baseline("alpha", [])
+        self.manager.jobs["7"] = {
+            "id": "7", "type": "download", "origin": "auto_vod", "state": "completed",
+            "streamer": "beta", "twitch_vod_id": "2854443200",
+            "urls": ["https://www.twitch.tv/videos/2854443200"],
+        }
+        self.manager.jobs["8"] = {
+            "id": "8", "type": "download", "origin": "manual", "state": "running",
+            "urls": ["https://www.twitch.tv/videos/2854443100"],
+        }
+
+        self.coordinator(
+            lambda streamer: {
+                "vods": [self.vod("2854443252")] if streamer == "alpha" else []
+            }
+        ).run_once()
+
+        self.assertEqual([job["twitch_vod_id"] for job in self.manager.created], ["2854443252"])
+
+    def test_repeated_check_now_equivalent_calls_cannot_bypass_storage_guard(self):
+        self.establish_baseline("alpha", [])
+        low = lambda settings: AutoVodStorageStatus("insufficient", 1, 200, 50)
+        discovery = lambda streamer: {
+            "vods": [self.vod("2854443252")] if streamer == "alpha" else []
+        }
+
+        self.coordinator(discovery, storage_provider=low).run_once()
+        self.coordinator(discovery, storage_provider=low).run_once()
+
+        self.assertEqual(self.manager.created, [])
+        record = self.store.get_vod("alpha", "2854443252")
+        self.assertEqual(record["attempts"], 0)
+        self.assertIsNone(record["retry_after"])
+
+    def test_shutdown_prevents_job_creation(self):
+        self.establish_baseline("alpha", [])
+        result = self.coordinator(
+            lambda streamer: {"vods": [self.vod("2854443252")]},
+            should_stop=lambda: True,
+        ).run_once()
+
+        self.assertEqual(result["action"], "shutdown_requested")
+        self.assertEqual(self.manager.created, [])
 
 
 if __name__ == "__main__":

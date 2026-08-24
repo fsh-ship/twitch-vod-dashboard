@@ -12,6 +12,8 @@ from vod_dashboard.auto_vod import (
     AutoVodStateStore,
     normalize_auto_vod_id,
 )
+from vod_dashboard.auto_vod_storage import AutoVodStorageStatus
+from vod_dashboard.job_store import TERMINAL_JOB_STATES
 from vod_dashboard.settings import canonical_streamer_login, normalize_streamer_profiles
 from vod_dashboard.twitch import canonical_twitch_vod_url, discover_streamer_vods
 
@@ -68,6 +70,9 @@ class AutoVodCoordinator:
         jobs_provider: Optional[Callable[[], Iterable[Mapping[str, Any]]]] = None,
         worker_starter: Optional[Callable[[str], Any]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
+        storage_provider: Optional[
+            Callable[[Dict[str, Any]], AutoVodStorageStatus]
+        ] = None,
     ) -> None:
         self._settings_provider = settings_provider
         self._streamer_provider = streamer_provider
@@ -80,6 +85,7 @@ class AutoVodCoordinator:
         self._jobs_provider = jobs_provider or self._default_jobs
         self._worker_starter = worker_starter or self._default_worker_starter
         self._should_stop = should_stop or (lambda: False)
+        self._storage_provider = storage_provider
 
     def _default_jobs(self) -> Iterable[Mapping[str, Any]]:
         return list(getattr(self._job_manager, "jobs", {}).values())
@@ -99,6 +105,11 @@ class AutoVodCoordinator:
             "queued_count": 0,
             "handled_count": 0,
             "retry_wait_count": 0,
+            "storage_blocked_count": 0,
+            "storage_state": "not_checked",
+            "storage_free_bytes": None,
+            "storage_required_bytes": None,
+            "outstanding_auto_vod_jobs": 0,
             "error_count": 0,
             "action": action,
             "errors": [],
@@ -120,6 +131,41 @@ class AutoVodCoordinator:
     @staticmethod
     def _active(job: Mapping[str, Any]) -> bool:
         return str(job.get("state") or "") in {"queued", "running", "stopping", "cancelling"}
+
+    @staticmethod
+    def _is_outstanding_auto_vod_job(job: Mapping[str, Any]) -> bool:
+        """Count any auto-download that is not fully terminal, including bad state."""
+        if job.get("type") != "download" or job.get("origin") != "auto_vod":
+            return False
+        if str(job.get("state") or "") not in TERMINAL_JOB_STATES:
+            return True
+        item_states = job.get("item_states")
+        return isinstance(item_states, list) and any(
+            str(state or "") not in TERMINAL_JOB_STATES for state in item_states
+        )
+
+    def _storage_status(self, settings: Dict[str, Any]) -> AutoVodStorageStatus:
+        if self._storage_provider is None:
+            return AutoVodStorageStatus("unavailable", None, None, None)
+        try:
+            status = self._storage_provider(settings)
+        except Exception:
+            return AutoVodStorageStatus("unavailable", None, None, None)
+        if not isinstance(status, AutoVodStorageStatus):
+            return AutoVodStorageStatus("unavailable", None, None, None)
+        return status
+
+    @staticmethod
+    def _set_storage_result(
+        result: Dict[str, Any], status: AutoVodStorageStatus
+    ) -> None:
+        result.update(
+            {
+                "storage_state": status.state,
+                "storage_free_bytes": status.free_bytes,
+                "storage_required_bytes": status.required_free_bytes,
+            }
+        )
 
     def _retry_or_handle(self, streamer: str, vod_id: str, record: Mapping[str, Any], reason: str, now: datetime) -> None:
         attempts = int(record.get("attempts") or 0)
@@ -254,8 +300,12 @@ class AutoVodCoordinator:
         with ThreadPoolExecutor(max_workers=min(MAX_DISCOVERY_WORKERS, len(selected))) as executor:
             discovered = list(executor.map(discover, selected))
         by_streamer = dict(discovered)
-        created_total = 0
         stop_scheduling = False
+        candidates_by_streamer: list[tuple[str, list[str]]] = []
+
+        # First make every discovered identity durable.  This deliberately happens
+        # before capacity and queue guards: neither a full disk nor an existing
+        # job may cause a newly observed Twitch VOD to be forgotten.
         for streamer in selected:
             if stop_scheduling:
                 break
@@ -294,82 +344,164 @@ class AutoVodCoordinator:
             pending.sort(key=lambda item: (item[1]["discovered_at"], item[0]))
             candidates = [vod_id for vod_id, _record in pending]
             for vod in reversed(vods):
-                vod_id = str(vod.get("twitch_vod_id") or "")
-                if (
-                    vod_id.isdigit()
-                    and 1 <= len(vod_id) <= 32
-                    and vod_id not in candidates
-                ):
-                    candidates.append(vod_id)
-            created_streamer = 0
-            for vod_id in candidates:
-                if self._should_stop():
-                    result["action"] = "shutdown_requested"
-                    stop_scheduling = True
-                    break
-                if created_total >= MAX_NEW_JOBS_PER_CYCLE or created_streamer >= MAX_NEW_JOBS_PER_STREAMER:
-                    result["action"] = "queue_limited"
-                    break
+                vod_id = normalize_auto_vod_id(vod.get("twitch_vod_id"))
+                if not vod_id or vod_id in candidates:
+                    continue
                 try:
                     record = self._state_store.get_vod(streamer, vod_id)
                     if record is None:
-                        record = self._state_store.ensure_pending(streamer, vod_id, reason="new_vod")
-                    if record["disposition"] == "handled":
-                        continue
-                    if record["disposition"] == "queued":
-                        continue
-                    if vod_id in archive_ids:
-                        self._state_store.set_handled(streamer, vod_id, reason="archive_present")
-                        continue
-                    matches = [job for job in jobs if job_matches_vod(job, streamer, vod_id)]
-                    manual = next((job for job in matches if str(job.get("origin") or "manual") != "auto_vod"), None)
-                    if manual is not None:
-                        manual_state = str(manual.get("state") or "")
-                        if manual_state == "completed": self._state_store.set_handled(streamer, vod_id, reason="downloaded")
-                        elif manual_state == "cancelled": self._state_store.set_handled(streamer, vod_id, reason="manual_cancelled")
-                        if manual_state in {"completed", "cancelled"} or self._active(manual):
-                            continue
-                    if record["retry_after"] and record["retry_after"] > now.isoformat(timespec="seconds").replace("+00:00", "Z"):
-                        continue
-                    attempt = int(record["attempts"]) + 1
-                    job_id = self._job_manager.create_download_job(
-                        [canonical_twitch_vod_url(vod_id)], f"Automatic Twitch VOD: {streamer}",
-                        origin="auto_vod", streamer=streamer, twitch_vod_id=vod_id,
-                        attempt=attempt, post_download_mode="download_only",
-                    )
-                    try:
-                        self._state_store.set_queued(streamer, vod_id, job_id, attempts=attempt)
-                    except AutoVodStateError:
-                        result["action"] = "state_persistence_failed"; errors.append({"streamer": streamer, "code": "state_persistence_failed"}); stop_scheduling = True; break
-                    try:
-                        if self._should_stop():
-                            result["action"] = "shutdown_requested"
-                            stop_scheduling = True
-                            break
-                        self._worker_starter(job_id)
-                    except Exception:
-                        fail_unfinished = getattr(
-                            self._job_manager,
-                            "fail_unfinished_download_items",
-                            None,
+                        record = self._state_store.ensure_pending(
+                            streamer, vod_id, reason="new_vod"
                         )
-                        if callable(fail_unfinished):
-                            try:
-                                fail_unfinished(job_id)
-                            except Exception:
-                                pass
-                        result["action"] = "worker_start_failed"
-                        errors.append({"streamer": streamer, "code": "worker_start_failed"})
+                except AutoVodStateError:
+                    result.update({"state_healthy": False, "action": "state_unhealthy"})
+                    errors.append({"streamer": streamer, "code": "state_unhealthy"})
+                    stop_scheduling = True
+                    break
+                if record["disposition"] == "pending":
+                    candidates.append(vod_id)
+            candidates_by_streamer.append((streamer, candidates))
+
+        if stop_scheduling:
+            final = self._state_store.snapshot()
+        else:
+            outstanding = sum(
+                1 for job in jobs if self._is_outstanding_auto_vod_job(job)
+            )
+            result["outstanding_auto_vod_jobs"] = outstanding
+            if outstanding:
+                result["action"] = "waiting_for_existing_job"
+                final = self._state_store.snapshot()
+            else:
+                final = None
+
+        storage_status: Optional[AutoVodStorageStatus] = None
+        if final is None:
+            for streamer, candidates in candidates_by_streamer:
+                if stop_scheduling:
+                    break
+                for vod_id in candidates:
+                    if self._should_stop():
+                        result["action"] = "shutdown_requested"
                         stop_scheduling = True
                         break
-                    jobs.append(self._job_manager.get_job(job_id) or {})
-                    created_total += 1; created_streamer += 1
-                    result["action"] = "queued"
-                except AutoVodStateError:
-                    result["action"] = "state_unhealthy"; errors.append({"streamer": streamer, "code": "state_unhealthy"}); stop_scheduling = True; break
-                except Exception:
-                    result["action"] = "job_persistence_failed"; errors.append({"streamer": streamer, "code": "job_persistence_failed"}); stop_scheduling = True; break
-        final = self._state_store.snapshot()
+                    try:
+                        record = self._state_store.get_vod(streamer, vod_id)
+                        if record is None or record["disposition"] != "pending":
+                            continue
+                        if vod_id in archive_ids:
+                            self._state_store.set_handled(
+                                streamer, vod_id, reason="archive_present"
+                            )
+                            continue
+                        matches = [
+                            job
+                            for job in jobs
+                            if job_matches_vod(job, streamer, vod_id)
+                        ]
+                        manual = next(
+                            (
+                                job
+                                for job in matches
+                                if str(job.get("origin") or "manual") != "auto_vod"
+                            ),
+                            None,
+                        )
+                        if manual is not None:
+                            manual_state = str(manual.get("state") or "")
+                            if manual_state == "completed":
+                                self._state_store.set_handled(
+                                    streamer, vod_id, reason="downloaded"
+                                )
+                            elif manual_state == "cancelled":
+                                self._state_store.set_handled(
+                                    streamer, vod_id, reason="manual_cancelled"
+                                )
+                            if manual_state in {"completed", "cancelled"} or self._active(manual):
+                                continue
+                        if (
+                            record["retry_after"]
+                            and record["retry_after"]
+                            > now.isoformat(timespec="seconds").replace("+00:00", "Z")
+                        ):
+                            continue
+                        if storage_status is None:
+                            storage_status = self._storage_status(settings)
+                            self._set_storage_result(result, storage_status)
+                        if not storage_status.allows_start:
+                            self._state_store.set_pending(
+                                streamer,
+                                vod_id,
+                                reason="storage_blocked",
+                                attempts=int(record["attempts"]),
+                                retry_after=record["retry_after"],
+                            )
+                            result["storage_blocked_count"] += 1
+                            result["action"] = (
+                                "storage_insufficient"
+                                if storage_status.state == "insufficient"
+                                else "storage_unavailable"
+                            )
+                            continue
+                        attempt = int(record["attempts"]) + 1
+                        job_id = self._job_manager.create_download_job(
+                            [canonical_twitch_vod_url(vod_id)],
+                            f"Automatic Twitch VOD: {streamer}",
+                            origin="auto_vod",
+                            streamer=streamer,
+                            twitch_vod_id=vod_id,
+                            attempt=attempt,
+                            post_download_mode="download_only",
+                        )
+                        try:
+                            self._state_store.set_queued(
+                                streamer, vod_id, job_id, attempts=attempt
+                            )
+                        except AutoVodStateError:
+                            result["action"] = "state_persistence_failed"
+                            errors.append(
+                                {"streamer": streamer, "code": "state_persistence_failed"}
+                            )
+                            stop_scheduling = True
+                            break
+                        try:
+                            if self._should_stop():
+                                result["action"] = "shutdown_requested"
+                                stop_scheduling = True
+                                break
+                            self._worker_starter(job_id)
+                        except Exception:
+                            fail_unfinished = getattr(
+                                self._job_manager,
+                                "fail_unfinished_download_items",
+                                None,
+                            )
+                            if callable(fail_unfinished):
+                                try:
+                                    fail_unfinished(job_id)
+                                except Exception:
+                                    pass
+                            result["action"] = "worker_start_failed"
+                            errors.append({"streamer": streamer, "code": "worker_start_failed"})
+                            stop_scheduling = True
+                            break
+                        jobs.append(self._job_manager.get_job(job_id) or {})
+                        result["outstanding_auto_vod_jobs"] = 1
+                        result["action"] = "queued"
+                        # P6l intentionally permits only one globally outstanding job.
+                        stop_scheduling = True
+                        break
+                    except AutoVodStateError:
+                        result["action"] = "state_unhealthy"
+                        errors.append({"streamer": streamer, "code": "state_unhealthy"})
+                        stop_scheduling = True
+                        break
+                    except Exception:
+                        result["action"] = "job_persistence_failed"
+                        errors.append({"streamer": streamer, "code": "job_persistence_failed"})
+                        stop_scheduling = True
+                        break
+            final = self._state_store.snapshot()
         for streamer in selected:
             for record in final["streamers"].get(streamer, {}).get("vods", {}).values():
                 result[f"{record['disposition']}_count"] += 1

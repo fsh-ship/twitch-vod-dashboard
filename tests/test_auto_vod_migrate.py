@@ -8,6 +8,7 @@ from unittest import mock
 
 from vod_dashboard.auto_vod import AutoVodStatePersistenceError, AutoVodStateStore
 from vod_dashboard.auto_vod_coordinator import AutoVodCoordinator
+from vod_dashboard.auto_vod_storage import AutoVodStorageStatus
 from vod_dashboard.auto_vod_migrate import (
     AutoVodMigrationError,
     main,
@@ -331,6 +332,9 @@ class AutoVodMigrationTests(unittest.TestCase):
             worker_target=lambda job_id: None,
             discovery=lambda streamer, current, *, limit: discoveries.pop(0),
             clock=lambda: NOW,
+            storage_provider=lambda settings: AutoVodStorageStatus(
+                "sufficient", 100, 200, 50
+            ),
         )
 
         coordinator.run_once()
