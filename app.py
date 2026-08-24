@@ -25,6 +25,7 @@ from vod_dashboard import auto_recording_runtime as dashboard_auto_runtime
 from vod_dashboard import auto_vod as dashboard_auto_vod
 from vod_dashboard import auto_vod_coordinator as dashboard_auto_vod_coordinator
 from vod_dashboard import auto_vod_runtime as dashboard_auto_vod_runtime
+from vod_dashboard import auto_vod_storage as dashboard_auto_vod_storage
 from vod_dashboard import local_vods as dashboard_local_vods
 from vod_dashboard import jobs as dashboard_jobs
 from vod_dashboard import job_store as dashboard_job_store
@@ -837,6 +838,9 @@ def create_auto_vod_monitor() -> dashboard_auto_vod_runtime.AutoVodMonitor:
         discovery=dashboard_twitch.discover_streamer_vods,
         jobs_provider=lambda: _job_manager_for_compatibility().snapshot_jobs(),
         should_stop=stop_event.is_set,
+        storage_provider=lambda settings: dashboard_auto_vod_storage.assess_auto_vod_storage(
+            download_path(settings)
+        ),
     )
     return dashboard_auto_vod_runtime.AutoVodMonitor(
         coordinator, settings_provider=load_settings, stop_event=stop_event, log=log_line
