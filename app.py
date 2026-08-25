@@ -2126,6 +2126,25 @@ def api_search():
         detail_runner=run_ytdlp_vod_detail,
         log_callback=log_line,
     )
+    if settings.get("auto_vod_enabled") is True:
+        try:
+            baseline_vod_ids = (
+                dashboard_auto_vod.AutoVodStateStore.from_dashboard_dir(
+                    DEFAULT_DASHBOARD_DIR
+                ).baseline_existing_vod_ids()
+            )
+        except dashboard_auto_vod.AutoVodStateError:
+            log_line("Auto VOD baseline status is unavailable for VOD Search.")
+        else:
+            configured_streamers = _configured_auto_vod_streamers(settings)
+            dashboard_vod_search.apply_auto_vod_baseline_status(
+                payload,
+                {
+                    streamer: vod_ids
+                    for streamer, vod_ids in baseline_vod_ids.items()
+                    if streamer in configured_streamers
+                },
+            )
     return jsonify(payload)
 
 

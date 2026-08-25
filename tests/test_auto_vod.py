@@ -168,6 +168,16 @@ class AutoVodStateStoreTests(unittest.TestCase):
         self.assertEqual(repeated, bucket)
         self.assertEqual(self.path.read_bytes(), original)
 
+    def test_baseline_existing_vod_ids_exposes_only_baseline_identities(self):
+        self.store.establish_baseline(self.streamer, ["v2854443252"])
+        self.store.ensure_pending(self.streamer, "2854443251")
+        self.store.set_handled(self.streamer, "2854443251", reason="downloaded")
+
+        self.assertEqual(
+            self.store.baseline_existing_vod_ids(),
+            {"nika_livetv": {"2854443252"}},
+        )
+
     def test_empty_establish_baseline_persists_initialized_marker(self):
         bucket = self.store.establish_baseline(self.streamer, [])
         self.assertTrue(bucket["baseline_initialized"])

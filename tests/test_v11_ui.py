@@ -112,6 +112,27 @@ process.stdout.write(JSON.stringify({
     return json.loads(completed.stdout)
 
 
+def _search_result_status(result: dict) -> str:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for search UI tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function searchResultStatusHtml');
+const end = source.indexOf('function renderResults', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Search status helper not found');
+eval(source.slice(start, end));
+process.stdout.write(searchResultStatusHtml(JSON.parse(fs.readFileSync(0, 'utf8'))));
+"""
+    completed = subprocess.run(
+        [NODE, "-e", runner], input=json.dumps(result), cwd=ROOT,
+        encoding="utf-8", capture_output=True, check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return completed.stdout
+
+
 def _classify_download_jobs(
     jobs: list[dict], results: list[dict] | None = None
 ) -> list[dict]:
@@ -1052,6 +1073,20 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("$('searchErrors').innerHTML = errHtml;", JAVASCRIPT)
         self.assertIn("Ready to Download", JAVASCRIPT)
         self.assertNotIn("New/Pending", JAVASCRIPT)
+
+    def test_baseline_search_status_keeps_manual_download_available(self) -> None:
+        self.assertEqual(
+            _search_result_status({"auto_vod_baseline_existing": True}),
+            'Baseline<br><span class="muted">Manual download available</span>',
+        )
+        self.assertEqual(
+            _search_result_status(
+                {"auto_vod_baseline_existing": True, "already_downloaded": True}
+            ),
+            "Already in Archive",
+        )
+        self.assertIn('class="rowcheck" type="checkbox"', JAVASCRIPT)
+        self.assertIn("data-url=\"${escapeHtml(r.url)}\"", JAVASCRIPT)
 
     def test_ready_for_upload_uses_compact_counts_and_no_manual_move(self) -> None:
         self.assertIn('id="workspacePending" class="heading-count"', TEMPLATE)

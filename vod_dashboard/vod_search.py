@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
+from vod_dashboard.auto_vod import normalize_auto_vod_id
+from vod_dashboard.settings import canonical_streamer_login
+
 
 @dataclass(frozen=True)
 class DownloadSelection:
@@ -83,6 +86,27 @@ def search_vods_from_payload(
         detail_runner=detail_runner,
         log_callback=log_callback,
     )
+
+
+def apply_auto_vod_baseline_status(
+    payload: Dict[str, List[Dict[str, Any]]],
+    baseline_vod_ids: Mapping[str, set[str]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Add the compact search-display flag for intentional Auto VOD baselines."""
+    results = payload.get("results")
+    if not isinstance(results, list) or not baseline_vod_ids:
+        return payload
+
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        if result.get("already_downloaded") is True:
+            continue
+        streamer = canonical_streamer_login(result.get("streamer"))
+        vod_id = normalize_auto_vod_id(result.get("id"))
+        if streamer and vod_id and vod_id in baseline_vod_ids.get(streamer, set()):
+            result["auto_vod_baseline_existing"] = True
+    return payload
 
 
 def prepare_download_selection(

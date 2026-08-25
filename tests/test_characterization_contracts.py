@@ -39,6 +39,7 @@ from vod_dashboard import runtime as runtime_helpers  # noqa: E402
 from vod_dashboard import settings as settings_helpers  # noqa: E402
 from vod_dashboard import twitch as twitch_helpers  # noqa: E402
 from vod_dashboard import youtube as youtube_helpers  # noqa: E402
+from vod_dashboard import auto_vod as dashboard_auto_vod  # noqa: E402
 from vod_dashboard.auto_recorder import (  # noqa: E402
     AutoRecorderStatePersistenceError,
     AutoRecorderStateStore,
@@ -573,6 +574,96 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
         self.assertIs(kwargs["source_runner"], dashboard.run_ytdlp_json_sources)
         self.assertIs(kwargs["detail_runner"], dashboard.run_ytdlp_vod_detail)
         self.assertIs(kwargs["log_callback"], dashboard.log_line)
+
+    def test_search_api_adds_only_safe_baseline_display_status_when_available(self):
+        settings = {
+            **dashboard.DEFAULT_SETTINGS,
+            "auto_vod_enabled": True,
+            "streamer_profiles": {"nika_livetv": {"auto_vod_download": True}},
+        }
+        expected = {
+            "results": [
+                {
+                    "streamer": "Nika_LiveTV",
+                    "id": "v2854443252",
+                    "already_downloaded": False,
+                }
+            ],
+            "errors": [],
+            "debug": [],
+        }
+        state_store = mock.Mock()
+        state_store.baseline_existing_vod_ids.return_value = {
+            "nika_livetv": {"2854443252"}
+        }
+        with (
+            mock.patch.object(dashboard, "load_settings", return_value=settings),
+            mock.patch.object(dashboard, "read_streamers", return_value=["Nika_LiveTV"]),
+            mock.patch.object(twitch_helpers, "search_vods", return_value=expected),
+            mock.patch.object(
+                dashboard_auto_vod.AutoVodStateStore,
+                "from_dashboard_dir",
+                return_value=state_store,
+            ),
+        ):
+            response = self.client.post(
+                "/api/search",
+                json={"streamers": ["Nika_LiveTV"]},
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        result = response.get_json()["results"][0]
+        self.assertEqual(result["auto_vod_baseline_existing"], True)
+        self.assertNotIn("reason", result)
+        self.assertNotIn("job_id", result)
+        self.assertNotIn("updated_at", result)
+
+    def test_search_api_ignores_unavailable_baseline_status(self):
+        settings = {**dashboard.DEFAULT_SETTINGS, "auto_vod_enabled": True}
+        expected = {"results": [{"streamer": "Nika_LiveTV", "id": "2854443252"}], "errors": [], "debug": []}
+        with (
+            mock.patch.object(dashboard, "load_settings", return_value=settings),
+            mock.patch.object(twitch_helpers, "search_vods", return_value=expected),
+            mock.patch.object(
+                dashboard_auto_vod.AutoVodStateStore,
+                "from_dashboard_dir",
+                side_effect=dashboard_auto_vod.AutoVodStateLoadError("invalid_json"),
+            ),
+        ):
+            response = self.client.post(
+                "/api/search",
+                json={"streamers": ["Nika_LiveTV"]},
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("auto_vod_baseline_existing", response.get_json()["results"][0])
+
+    def test_search_api_preserves_non_auto_vod_streamer_behavior(self):
+        settings = {**dashboard.DEFAULT_SETTINGS, "auto_vod_enabled": True}
+        expected = {"results": [{"streamer": "Nika_LiveTV", "id": "2854443252"}], "errors": [], "debug": []}
+        state_store = mock.Mock()
+        state_store.baseline_existing_vod_ids.return_value = {
+            "nika_livetv": {"2854443252"}
+        }
+        with (
+            mock.patch.object(dashboard, "load_settings", return_value=settings),
+            mock.patch.object(twitch_helpers, "search_vods", return_value=expected),
+            mock.patch.object(
+                dashboard_auto_vod.AutoVodStateStore,
+                "from_dashboard_dir",
+                return_value=state_store,
+            ),
+        ):
+            response = self.client.post(
+                "/api/search",
+                json={"streamers": ["Nika_LiveTV"]},
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("auto_vod_baseline_existing", response.get_json()["results"][0])
 
 
 class RuntimeCompatibilityTests(unittest.TestCase):

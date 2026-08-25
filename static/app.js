@@ -1349,6 +1349,13 @@ Review the streamer list before starting.`);
   showPage('queue');
 }
 
+function searchResultStatusHtml(result) {
+  const outsideRange = result.outside_range ? '<br><span class="warn">Outside Date Range</span>' : '';
+  if (result.already_downloaded) return `Already in Archive${outsideRange}`;
+  if (result.auto_vod_baseline_existing) return `Baseline<br><span class="muted">Manual download available</span>${outsideRange}`;
+  return `Ready to Download${outsideRange}`;
+}
+
 function renderResults(results, errors, debug) {
   lastResults = results || [];
   rememberSearchResults(lastResults);
@@ -1382,7 +1389,7 @@ function renderResults(results, errors, debug) {
           <td data-label="Date">${escapeHtml(r.date)}</td>
           <td data-label="Streamer">${escapeHtml(r.streamer)}</td>
           <td data-label="Title">${escapeHtml(r.title)}</td>
-          <td data-label="Status" class="${r.already_downloaded ? 'good' : ''}">${r.already_downloaded ? 'Already in Archive' : 'Ready to Download'}${r.outside_range ? '<br><span class="warn">Outside Date Range</span>' : ''}</td>
+          <td data-label="Status" class="${r.already_downloaded ? 'good' : ''}">${searchResultStatusHtml(r)}</td>
           <td data-label="Link"><a href="${escapeHtml(r.url)}" target="_blank" rel="noopener">Open Twitch</a></td>
         </tr>`);
     });

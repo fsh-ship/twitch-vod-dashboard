@@ -445,6 +445,27 @@ class AutoVodStateStore:
             )
             return bucket["baseline_initialized"] is True
 
+    def baseline_existing_vod_ids(self) -> Dict[str, set[str]]:
+        """Return only the durable identities intentionally handled at baseline."""
+        with self._lock:
+            state = self._load_locked()
+            return {
+                streamer: {
+                    vod_id
+                    for vod_id, record in bucket["vods"].items()
+                    if (
+                        record["disposition"] == "handled"
+                        and record["reason"] == "baseline_existing"
+                    )
+                }
+                for streamer, bucket in state["streamers"].items()
+                if any(
+                    record["disposition"] == "handled"
+                    and record["reason"] == "baseline_existing"
+                    for record in bucket["vods"].values()
+                )
+            }
+
     @staticmethod
     def _fsync_parent_directory(path: Path) -> None:
         if os.name != "posix":

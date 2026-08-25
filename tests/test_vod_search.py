@@ -165,6 +165,44 @@ class VodSearchPayloadTests(unittest.TestCase):
                 log_callback=mock.Mock(),
             )
 
+    def test_auto_vod_baseline_status_is_safe_and_preserves_archive_priority(self):
+        payload = {
+            "results": [
+                {"streamer": "@Nika_LiveTV", "id": "v2854443252"},
+                {"streamer": "nika_livetv", "id": "2854443251"},
+                {
+                    "streamer": "nika_livetv",
+                    "id": "2854443252",
+                    "already_downloaded": True,
+                },
+                {"streamer": "other", "id": "2854443252"},
+                {"streamer": "nika_livetv", "id": "not-a-vod"},
+            ],
+            "errors": [],
+            "debug": [],
+        }
+
+        result = vod_search.apply_auto_vod_baseline_status(
+            payload, {"nika_livetv": {"2854443252"}}
+        )
+
+        self.assertIs(result, payload)
+        self.assertTrue(result["results"][0]["auto_vod_baseline_existing"])
+        self.assertNotIn("auto_vod_baseline_existing", result["results"][1])
+        self.assertNotIn("auto_vod_baseline_existing", result["results"][2])
+        self.assertNotIn("auto_vod_baseline_existing", result["results"][3])
+        self.assertNotIn("auto_vod_baseline_existing", result["results"][4])
+        self.assertEqual(
+            set(result["results"][0]),
+            {"streamer", "id", "auto_vod_baseline_existing"},
+        )
+
+    def test_unavailable_or_empty_baseline_data_preserves_search_payload(self):
+        payload = {"results": [{"streamer": "alpha", "id": "2854443252"}], "errors": [], "debug": []}
+
+        self.assertIs(vod_search.apply_auto_vod_baseline_status(payload, {}), payload)
+        self.assertNotIn("auto_vod_baseline_existing", payload["results"][0])
+
 
 class DownloadSelectionTests(unittest.TestCase):
     @staticmethod
