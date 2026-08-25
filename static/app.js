@@ -1935,7 +1935,7 @@ function queueItemsFromJobs(jobs, nowMs=Date.now()) {
         : '';
       items.push({
         job, itemId, capabilities, state: stateName, operation, resolved,
-        streamer: meta.streamer || '', date: meta.date || '', title: meta.title || (vodId ? `Twitch VOD ${vodId}` : job.label),
+        streamer: job.streamer || meta.streamer || '', date: meta.date || '', title: job.display_title || meta.title || (vodId ? `Twitch VOD ${vodId}` : job.label),
         vodId, filename: '', sizeBytes: null, sizeGb: null,
         progress: displayedProgress,
         processedSeconds: activeTransfer ? trackedProcessedSeconds : null,

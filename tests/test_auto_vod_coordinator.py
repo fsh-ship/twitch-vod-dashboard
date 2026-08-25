@@ -261,6 +261,7 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         self.coordinator(discoveries).run_once()
         self.assertEqual([job["streamer"] for job in self.manager.created], ["alpha"])
         self.assertEqual([job["twitch_vod_id"] for job in self.manager.created], ["2854443248"])
+        self.assertEqual(self.manager.created[0]["display_title"], "VOD")
 
     def test_failed_manual_job_does_not_block_a_new_auto_attempt(self):
         self.establish_baseline("alpha", [])

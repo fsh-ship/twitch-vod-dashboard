@@ -1188,6 +1188,7 @@ class JobManager:
         origin: str = "manual",
         streamer: str = "",
         twitch_vod_id: str = "",
+        display_title: str = "",
         attempt: int = 0,
         post_download_mode: str = "default",
         counter_getter: Optional[CounterGetter] = None,
@@ -1239,12 +1240,21 @@ class JobManager:
                         "twitch_vod_id": twitch_vod_id,
                         "attempt": attempt,
                         "post_download_mode": post_download_mode,
+                        "display_title": str(display_title or "").strip(),
                         "storage_blocked": False,
                         "blocking_reason": "",
                     }
                 )
             self.jobs[job_id] = job
             try:
+                if retry_of and not job.get("display_title"):
+                    parent = self.jobs.get(str(retry_of.get("job_id") or ""))
+                    if parent:
+                        job["display_title"] = str(parent.get("display_title") or "")
+                        if not job.get("streamer"):
+                            job["streamer"] = str(parent.get("streamer") or "")
+                        if not job.get("twitch_vod_id"):
+                            job["twitch_vod_id"] = str(parent.get("twitch_vod_id") or "")
                 self._attach_retry_relationship_locked(job, retry_of)
             except Exception:
                 self.jobs.pop(job_id, None)

@@ -136,6 +136,8 @@ def _download_job(
     updated: str = "2026-08-23T20:00:00Z",
     retry: bool = False,
     retry_job_id: str = "",
+    streamer: str = "",
+    display_title: str = "",
 ) -> dict:
     legacy = {"queued": "wartet", "running": "läuft", "completed": "fertig"}.get(
         state, "fehler"
@@ -164,6 +166,8 @@ def _download_job(
         "item_capabilities": [
             _capability(retry=retry, retry_job_id=retry_job_id)
         ],
+        "streamer": streamer,
+        "display_title": display_title,
         "log": [],
     }
 
@@ -239,6 +243,18 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertIn("Last recorded progress", running)
         self.assertNotIn("43.2x", running)
         self.assertNotIn("remaining", running)
+
+    def test_durable_download_display_context_precedes_vod_id_fallback(self):
+        result = _evaluate_history_ui([
+            _download_job("40", "interrupted", streamer="bearlychen", display_title="[PEAK] Junior - Time to think"),
+            _download_job("41", "interrupted", streamer="bearlychen"),
+            _download_job("42", "interrupted"),
+        ])
+        cards = {item["jobId"]: item["html"] for item in result["rendered"]}
+        self.assertIn("bearlychen", cards["40"])
+        self.assertIn("[PEAK] Junior - Time to think", cards["40"])
+        self.assertIn("Twitch VOD", cards["41"])
+        self.assertIn("Unknown streamer", cards["42"])
 
     def test_safe_and_uncertain_uploads_have_distinct_actions(self):
         safe = self.normal_row("8", "8-item-1")

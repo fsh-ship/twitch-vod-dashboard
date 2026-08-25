@@ -526,6 +526,7 @@ def _normalize_download(job: Mapping[str, Any], result: Job, count: int) -> None
     vod_id = job.get("twitch_vod_id", "")
     if not isinstance(vod_id, str) or (vod_id and not _VOD_ID_RE.fullmatch(vod_id)):
         raise JobStoreValidationError("invalid_download_vod_id")
+    display_title = _safe_text(job.get("display_title", ""), maximum=500, code="invalid_display_title")
     attempt = _bounded_int(
         job.get("attempt", 0), minimum=0, maximum=1_000,
         code="invalid_download_attempt",
@@ -537,7 +538,10 @@ def _normalize_download(job: Mapping[str, Any], result: Job, count: int) -> None
         not streamer or not vod_id or attempt < 1 or post_download_mode != "download_only"
     ):
         raise JobStoreValidationError("invalid_auto_vod_download_metadata")
-    if origin == "manual" and (streamer or vod_id or attempt != 0 or post_download_mode != "default"):
+    retry_context = "retry_of" in result
+    if origin == "manual" and (attempt != 0 or post_download_mode != "default"):
+        raise JobStoreValidationError("invalid_manual_download_metadata")
+    if origin == "manual" and (streamer or vod_id) and not retry_context:
         raise JobStoreValidationError("invalid_manual_download_metadata")
     storage_blocked = job.get("storage_blocked", False)
     blocking_reason = job.get("blocking_reason", "")
@@ -585,18 +589,16 @@ def _normalize_download(job: Mapping[str, Any], result: Job, count: int) -> None
             ),
         }
     )
-    if origin == "auto_vod":
+    if origin == "auto_vod" or retry_context:
         result.update(
             {
-                "origin": origin,
                 "streamer": streamer,
                 "twitch_vod_id": vod_id,
-                "attempt": attempt,
-                "post_download_mode": post_download_mode,
-                "storage_blocked": storage_blocked,
-                "blocking_reason": blocking_reason,
+                "display_title": display_title,
             }
         )
+    if origin == "auto_vod":
+        result.update({"origin": origin, "attempt": attempt, "post_download_mode": post_download_mode, "storage_blocked": storage_blocked, "blocking_reason": blocking_reason})
 
 
 def _normalize_upload_metadata(value: Any) -> Dict[str, Any]:

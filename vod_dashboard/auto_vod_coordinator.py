@@ -306,6 +306,7 @@ class AutoVodCoordinator:
         with ThreadPoolExecutor(max_workers=min(MAX_DISCOVERY_WORKERS, len(selected))) as executor:
             discovered = list(executor.map(discover, selected))
         by_streamer = dict(discovered)
+        discovered_titles: Dict[tuple[str, str], str] = {}
         stop_scheduling = False
         candidates_by_streamer: list[tuple[str, list[str]]] = []
 
@@ -320,6 +321,10 @@ class AutoVodCoordinator:
             if discovery.get("error"):
                 errors.append({"streamer": streamer, "code": str(discovery["error"].get("code") or "yt_dlp_failed")})
             vods = [] if discovery.get("error") else list(discovery.get("vods") or [])
+            for vod in vods:
+                vod_id = normalize_auto_vod_id(vod.get("twitch_vod_id"))
+                if vod_id:
+                    discovered_titles[(streamer, vod_id)] = str(vod.get("title") or "").strip()
             result["discovered_count"] += len(vods)
             current_bucket = self._state_store.snapshot()["streamers"].get(streamer)
             if current_bucket is None or current_bucket.get("baseline_initialized") is not True:
@@ -501,6 +506,7 @@ class AutoVodCoordinator:
                             origin="auto_vod",
                             streamer=streamer,
                             twitch_vod_id=vod_id,
+                            display_title=discovered_titles.get((streamer, vod_id), ""),
                             attempt=attempt,
                             post_download_mode="download_only",
                         )
