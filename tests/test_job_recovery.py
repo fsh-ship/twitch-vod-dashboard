@@ -231,6 +231,7 @@ class JobRecoveryTests(unittest.TestCase):
                     original["item_recovery_reasons"], [reason]
                 )
                 self.assertEqual(original["item_retry_job_ids"], [retry_id])
+                self.assertEqual(original["item_resolved"], [True])
                 self.assertEqual(
                     retry_job["urls"],
                     ["https://www.twitch.tv/videos/1234567890"],
@@ -291,6 +292,7 @@ class JobRecoveryTests(unittest.TestCase):
             original["item_completion_reasons"], ["worker_shutdown"]
         )
         self.assertEqual(original["item_retry_job_ids"], [retry_id])
+        self.assertEqual(original["item_resolved"], [True])
         self.assertEqual(
             retry["urls"],
             ["https://www.twitch.tv/videos/1234567890"],
@@ -304,6 +306,44 @@ class JobRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(observed["retry"]["id"], retry_id)
         starter.assert_called_once()
+
+    def test_valid_historical_retry_link_is_resolved_on_restore(self):
+        store = self.store("historical-retry.json")
+        source = self.manager(store)
+        parent = source.create_download_job(
+            ["https://www.twitch.tv/videos/1234567890"], "Parent"
+        )
+        parent_item = source.claim_next_item(parent)["item_id"]
+        source.finish_claimed_item(parent, parent_item, "failed")
+        child = source.create_download_job(
+            ["https://www.twitch.tv/videos/1234567890"], "Retry",
+            retry_of={"job_id": parent, "item_id": parent_item},
+        )
+        # Simulate P5/P6-era persisted history that predates this resolution.
+        durable = store.load()
+        durable.jobs[0]["item_resolved"] = [False]
+        store.save(
+            durable.jobs,
+            durable.next_job_id,
+            store.status()["last_written_revision"] + 1,
+        )
+        restored = self.manager(store, restarted=True)
+        restored.restore_from_store()
+        self.assertTrue(restored.get_job(parent)["item_resolved"][0])
+        self.assertEqual(restored.get_job(child)["retry_of"]["job_id"], parent)
+        again = self.manager(store, restarted=True)
+        again.restore_from_store()
+        self.assertTrue(again.get_job(parent)["item_resolved"][0])
+
+    def test_interrupted_item_can_be_manually_resolved_but_active_items_cannot(self):
+        manager, _, job_id = self.restored_download("manual-resolve.json")
+        item_id = manager.get_job(job_id)["item_ids"][0]
+        self.assertTrue(manager.snapshot_jobs()[0]["item_capabilities"][0]["can_resolve"])
+        self.assertTrue(manager.resolve_error_by_id(job_id, item_id))
+        self.assertTrue(manager.get_job(job_id)["item_resolved"][0])
+        active = manager.create_download_job(["https://www.twitch.tv/videos/2345678901"], "Active")
+        active_item = manager.get_job(active)["item_ids"][0]
+        self.assertFalse(manager.resolve_error_by_id(active, active_item))
 
     def test_noncanonical_download_is_blocked_without_worker(self):
         manager, _, job_id = self.restored_download("unsafe-download.json")

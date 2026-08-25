@@ -2626,11 +2626,14 @@ def api_resolve_job_error():
     item_id = str(data.get("item_id") or "").strip()
     if not job_id or not item_id:
         return jsonify({"error": "A valid Queue item is required."}), 400
-    resolved = _job_manager_for_compatibility().resolve_error_by_id(
-        job_id, item_id
-    )
+    try:
+        resolved = _job_manager_for_compatibility().resolve_error_by_id(
+            job_id, item_id
+        )
+    except dashboard_jobs.JobPersistenceRequiredError as exc:
+        return jsonify({"error": str(exc), "reason": exc.code}), 409
     if not resolved:
-        return jsonify({"error": "Only an unresolved failed item can be resolved."}), 409
+        return jsonify({"error": "Only an unresolved failed or interrupted item can be resolved."}), 409
     return jsonify({"ok": True, "job_id": job_id, "item_id": item_id})
 
 

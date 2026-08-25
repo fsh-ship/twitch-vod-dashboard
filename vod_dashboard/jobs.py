@@ -989,6 +989,7 @@ class JobManager:
             self.jobs.update(
                 (str(job["id"]), job) for job in runtime_jobs
             )
+            retry_reconciled = self._reconcile_retry_parent_resolutions_locked()
             maximum_id = max(
                 (int(job_id) for job_id in self.jobs), default=0
             )
@@ -1006,7 +1007,7 @@ class JobManager:
             )
             self._reset_runtime_ownership_locked()
             self._record_load_health_locked(load_result)
-            if reconciled_jobs:
+            if reconciled_jobs or retry_reconciled:
                 self._mark_dirty_locked()
                 snapshot = self._snapshot_for_persistence_locked()
             else:
@@ -1079,6 +1080,16 @@ class JobManager:
     def _handle_creation_persistence_failure(
         self, job_id: str, exc: JobPersistenceRequiredError
     ) -> None:
+        with self.lock:
+            failed = self.jobs.get(str(job_id))
+            retry_of = failed.get("retry_of") if isinstance(failed, dict) else None
+            if isinstance(retry_of, dict):
+                parent = self.jobs.get(str(retry_of.get("job_id") or ""))
+                index = self._item_index_locked(parent, str(retry_of.get("item_id") or "")) if parent is not None else None
+                if index is not None and parent["item_retry_job_ids"][index] == str(job_id):
+                    parent["item_retry_job_ids"][index] = ""
+                    parent["item_resolved"][index] = False
+                failed.pop("retry_of", None)
         if exc.code != "persistence_validation_failed":
             self._mark_required_failure(job_id)
             return
@@ -1105,7 +1116,25 @@ class JobManager:
                     and parent["item_retry_job_ids"][index] == str(job_id)
                 ):
                     parent["item_retry_job_ids"][index] = ""
+                    parent["item_resolved"][index] = False
             self._mark_dirty_locked()
+
+    def _reconcile_retry_parent_resolutions_locked(self) -> int:
+        """Resolve historical parents only when their retry link is two-sided."""
+        changed = 0
+        for parent_id, parent in self.jobs.items():
+            self._ensure_control_lists_locked(parent)
+            for index, child_id in enumerate(parent["item_retry_job_ids"]):
+                if parent["item_resolved"][index] or not child_id or child_id == "__pending__":
+                    continue
+                child = self.jobs.get(str(child_id))
+                retry_of = child.get("retry_of") if isinstance(child, dict) else None
+                if (isinstance(retry_of, dict)
+                    and str(retry_of.get("job_id") or "") == str(parent_id)
+                    and str(retry_of.get("item_id") or "") == parent["item_ids"][index]):
+                    parent["item_resolved"][index] = True
+                    changed += 1
+        return changed
 
     def _attach_retry_relationship_locked(
         self,
@@ -1132,6 +1161,9 @@ class JobManager:
             "item_id": parent_item_id,
         }
         parent["item_retry_job_ids"][index] = retry_job_id
+        # The child and this handoff are persisted in one required snapshot.
+        # Keep the parent's original failure/interruption diagnostics intact.
+        parent["item_resolved"][index] = True
 
     @staticmethod
     def _lane_for_job(job: Job) -> str:
@@ -1691,7 +1723,7 @@ class JobManager:
             "can_cancel": state == "running",
             "can_remove": state == "queued",
             "can_retry": can_retry,
-            "can_resolve": state == "failed",
+            "can_resolve": state in {"failed", "interrupted"},
             "can_stop_after_current": state == "running",
             "retry_pending": retry_job_id == "__pending__",
             "retry_job_id": "" if retry_job_id == "__pending__" else retry_job_id,
@@ -2924,18 +2956,23 @@ class JobManager:
             if not isinstance(resolved, list):
                 resolved = [False for _ in statuses] if isinstance(statuses, list) else []
                 job["item_resolved"] = resolved
-            if (
-                not isinstance(statuses, list)
-                or not isinstance(resolved, list)
-                or index < 0
-                or index >= len(statuses)
-                or statuses[index] != "fehler"
-            ):
+            self._ensure_control_lists_locked(job)
+            if (not isinstance(statuses, list) or not isinstance(resolved, list)
+                or index < 0 or index >= len(statuses)
+                or job["item_states"][index] not in {"failed", "interrupted"}):
                 return False
             resolved[index] = True
             self._mark_dirty_locked(job)
             snapshot = self._snapshot_for_persistence_locked()
-        self._persist_best_effort(snapshot)
+        try:
+            self._persist_required(snapshot)
+        except JobPersistenceRequiredError:
+            with self.lock:
+                job = self.jobs.get(job_id)
+                if job is not None:
+                    self._ensure_control_lists_locked(job)
+                    job["item_resolved"][index] = False
+            raise
         return True
 
     def resolve_error_by_id(self, job_id: str, item_id: str) -> bool:
