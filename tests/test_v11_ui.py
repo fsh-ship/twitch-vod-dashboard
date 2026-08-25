@@ -34,9 +34,10 @@ function escapeHtml(value) {
 }
 eval(source.slice(start, end));
 const profiles = {
-  digitalgirluli: {youtube_playlist_id:'PLAYLIST_A', auto_record:true, auto_vod_download:true},
+  digitalgirluli: {youtube_playlist_id:'PLAYLIST_A', auto_record:true, auto_vod_download:true, auto_youtube_upload:true},
   auto_only: {auto_record:true},
   auto_vod_only: {auto_vod_download:true},
+  auto_youtube_only: {auto_youtube_upload:true},
   false_only: {auto_record:false},
   string_true: {auto_record:'true'},
   orphan_streamer: {youtube_playlist_id:'ORPHAN'}
@@ -68,12 +69,24 @@ const autoRemovedAfterVod = withStreamerAutoRecordSelection(
 const emptyProfileRemoved = withStreamerAutoRecordSelection(
   {auto_only:{auto_record:true}}, 'auto_only', false
 );
+const autoYoutubeEnabled = withStreamerAutoYoutubeSelection(
+  {digitalgirluli:{youtube_playlist_id:'PLAYLIST_A', auto_vod_download:true}},
+  'DigitalGirlUli', true
+);
+const autoYoutubeRemoved = withStreamerAutoYoutubeSelection(
+  autoYoutubeEnabled, 'DigitalGirlUli', false
+);
+const emptyAutoYoutubeProfileRemoved = withStreamerAutoYoutubeSelection(
+  {auto_youtube_only:{auto_youtube_upload:true}}, 'auto_youtube_only', false
+);
 process.stdout.write(JSON.stringify({
   clonedProfiles,
   configured: streamerProfilePlaylistId(profiles, 'DigitalGirlUli'),
   inherited: streamerProfilePlaylistId(profiles, 'NoOverride'),
   autoConfigured: streamerProfileAutoRecordEnabled(profiles, 'DigitalGirlUli'),
   autoMissing: streamerProfileAutoRecordEnabled(profiles, 'NoOverride'),
+  autoYoutubeConfigured: streamerProfileAutoYoutubeEnabled(profiles, 'DigitalGirlUli'),
+  autoYoutubeMissing: streamerProfileAutoYoutubeEnabled(profiles, 'NoOverride'),
   configuredOptions: playlistOptionsHtml('PLAYLIST_A', 'Global Default'),
   inheritedOptions: playlistOptionsHtml('', 'Global Default'),
   setOverride,
@@ -84,6 +97,9 @@ process.stdout.write(JSON.stringify({
   autoEnabledAfterVod,
   autoRemovedAfterVod,
   emptyProfileRemoved,
+  autoYoutubeEnabled,
+  autoYoutubeRemoved,
+  emptyAutoYoutubeProfileRemoved,
   defaultSingle: buildYoutubeUploadRequest(['one.mp4'], 'streamer-default'),
   defaultMultiple: buildYoutubeUploadRequest(
     ['one.mp4', 'two.mp4'], 'streamer-default'
@@ -1183,6 +1199,8 @@ class V11UiContractTests(unittest.TestCase):
         self.assertEqual(result["inherited"], "")
         self.assertTrue(result["autoConfigured"])
         self.assertFalse(result["autoMissing"])
+        self.assertTrue(result["autoYoutubeConfigured"])
+        self.assertFalse(result["autoYoutubeMissing"])
         self.assertIn('value="PLAYLIST_A" selected', result["configuredOptions"])
         self.assertIn(">Global Default</option>", result["inheritedOptions"])
         self.assertEqual(
@@ -1191,6 +1209,7 @@ class V11UiContractTests(unittest.TestCase):
                 "youtube_playlist_id": "PLAYLIST_A",
                 "auto_record": True,
                 "auto_vod_download": True,
+                "auto_youtube_upload": True,
             },
         )
         self.assertEqual(
@@ -1204,11 +1223,16 @@ class V11UiContractTests(unittest.TestCase):
             {"auto_vod_download": True},
         )
         self.assertEqual(
+            result["clonedProfiles"]["auto_youtube_only"],
+            {"auto_youtube_upload": True},
+        )
+        self.assertEqual(
             result["setOverride"]["digitalgirluli"],
             {
                 "youtube_playlist_id": "PLAYLIST_B",
                 "auto_record": True,
                 "auto_vod_download": True,
+                "auto_youtube_upload": True,
             },
         )
         self.assertEqual(
@@ -1217,7 +1241,11 @@ class V11UiContractTests(unittest.TestCase):
         )
         self.assertEqual(
             result["removedOverride"]["digitalgirluli"],
-            {"auto_record": True, "auto_vod_download": True},
+            {
+                "auto_record": True,
+                "auto_vod_download": True,
+                "auto_youtube_upload": True,
+            },
         )
         self.assertEqual(
             result["removedOverride"]["orphan_streamer"],
@@ -1246,6 +1274,27 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("min-height:44px", STYLESHEET)
         self.assertIn("input:focus-visible + .switch-track", STYLESHEET)
 
+    def test_auto_youtube_settings_are_visible_but_not_an_active_workflow(self) -> None:
+        self.assertIn('id="autoYoutubeEnabled"', TEMPLATE)
+        self.assertNotIn('id="autoYoutubeEnabled" checked', TEMPLATE)
+        self.assertIn("Auto YouTube settings can be saved now. Automation is not active yet.", TEMPLATE)
+        self.assertIn(
+            "$('autoYoutubeEnabled').checked = state.settings.auto_youtube_enabled === true",
+            JAVASCRIPT,
+        )
+        self.assertIn(
+            "auto_youtube_enabled:$('autoYoutubeEnabled').checked",
+            JAVASCRIPT,
+        )
+        self.assertIn('class="streamer-auto-youtube-toggle"', JAVASCRIPT)
+        self.assertIn(
+            'aria-label="Enable automatic YouTube uploads for ${escapeHtml(name)}"',
+            JAVASCRIPT,
+        )
+        self.assertNotIn('data-page="auto-youtube"', TEMPLATE)
+        self.assertIn(".streamer-editor-row", STYLESHEET)
+        self.assertIn("grid-template-columns:34px minmax(0,1fr)", STYLESHEET)
+
     def test_streamer_auto_record_and_playlist_round_trip_independently(self) -> None:
         result = _evaluate_playlist_ui()
         self.assertEqual(
@@ -1273,6 +1322,22 @@ class V11UiContractTests(unittest.TestCase):
             result["autoRemovedAfterVod"]["digitalgirluli"],
             {"youtube_playlist_id": "PLAYLIST_A", "auto_vod_download": True},
         )
+
+    def test_streamer_auto_youtube_and_playlist_round_trip_independently(self) -> None:
+        result = _evaluate_playlist_ui()
+        self.assertEqual(
+            result["autoYoutubeEnabled"]["digitalgirluli"],
+            {
+                "youtube_playlist_id": "PLAYLIST_A",
+                "auto_vod_download": True,
+                "auto_youtube_upload": True,
+            },
+        )
+        self.assertEqual(
+            result["autoYoutubeRemoved"]["digitalgirluli"],
+            {"youtube_playlist_id": "PLAYLIST_A", "auto_vod_download": True},
+        )
+        self.assertEqual(result["emptyAutoYoutubeProfileRemoved"], {})
 
     def test_playlist_refresh_failure_preserves_streamer_profile_draft(self) -> None:
         loader = JAVASCRIPT.split(

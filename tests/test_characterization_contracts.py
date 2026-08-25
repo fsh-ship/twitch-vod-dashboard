@@ -61,6 +61,7 @@ DEFAULT_SETTINGS_KEYS = {
     "archive_file",
     "auto_recorder_enabled",
     "auto_vod_enabled",
+    "auto_youtube_enabled",
     "auto_vod_poll_minutes",
     "batch_postprocess_mode",
     "cookie_browser",
@@ -754,6 +755,7 @@ class SettingsContractTests(IsolatedDashboardTestCase):
         self.assertFalse(defaults["youtube_auto_upload"])
         self.assertFalse(defaults["auto_recorder_enabled"])
         self.assertFalse(defaults["auto_vod_enabled"])
+        self.assertFalse(defaults["auto_youtube_enabled"])
         self.assertEqual(defaults["auto_vod_poll_minutes"], 60)
         self.assertTrue(defaults["move_uploaded_vods"])
         self.assertEqual(defaults["youtube_privacy_status"], "private")
@@ -894,6 +896,27 @@ class SettingsContractTests(IsolatedDashboardTestCase):
         create_monitor.assert_not_called()
         twitch_lookup.assert_not_called()
 
+    def test_auto_youtube_settings_api_is_configuration_only(self):
+        with mock.patch.object(
+            dashboard, "_wake_auto_recorder_after_save"
+        ) as wake_recorder, mock.patch.object(
+            dashboard, "_wake_auto_vod_after_save"
+        ) as wake_vod, mock.patch.object(
+            dashboard, "create_upload_job"
+        ) as create_upload:
+            response = self.client.post(
+                "/api/settings",
+                json={"auto_youtube_enabled": True},
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.get_json()["auto_youtube_enabled"], True)
+        self.assertIs(dashboard.load_settings()["auto_youtube_enabled"], True)
+        wake_recorder.assert_not_called()
+        wake_vod.assert_not_called()
+        create_upload.assert_not_called()
+
     def test_streamer_api_round_trips_auto_vod_profile_without_waking_auto_recorder(self):
         with mock.patch.object(
             dashboard, "_wake_auto_recorder_after_save"
@@ -923,6 +946,28 @@ class SettingsContractTests(IsolatedDashboardTestCase):
             },
         )
         wake.assert_not_called()
+
+    def test_streamer_api_round_trips_auto_youtube_profile_without_jobs(self):
+        with mock.patch.object(
+            dashboard, "create_upload_job"
+        ) as create_upload:
+            response = self.client.post(
+                "/api/streamers",
+                json={
+                    "streamers": ["Nika_LiveTV"],
+                    "streamer_profiles": {
+                        "Nika_LiveTV": {"auto_youtube_upload": True}
+                    },
+                },
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["streamer_profiles"],
+            {"nika_livetv": {"auto_youtube_upload": True}},
+        )
+        create_upload.assert_not_called()
 
     def test_streamer_api_saves_profiles_without_changing_text_format(self):
         dashboard.save_settings({"youtube_playlist_id": "GLOBAL"})

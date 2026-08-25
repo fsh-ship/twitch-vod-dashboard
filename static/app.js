@@ -118,6 +118,7 @@ async function startSingleVodDownload() {
       playlist_end: val('limit', '150'),
       auto_recorder_enabled: val('autoRecorderEnabled', false),
       auto_vod_enabled: val('autoVodEnabled', false),
+      auto_youtube_enabled: val('autoYoutubeEnabled', false),
       auto_vod_poll_minutes: val('autoVodPollMinutes', '60'),
       youtube_enabled: val('youtubeEnabled', false),
       youtube_auto_upload: val('youtubeAutoUpload', false),
@@ -371,6 +372,7 @@ function renderState() {
   $('outputTemplate').value = state.settings.output_template;
   $('autoRecorderEnabled').checked = state.settings.auto_recorder_enabled === true;
   $('autoVodEnabled').checked = state.settings.auto_vod_enabled === true;
+  $('autoYoutubeEnabled').checked = state.settings.auto_youtube_enabled === true;
   $('autoVodPollMinutes').value = String(state.settings.auto_vod_poll_minutes || 60);
   $('autoVodPollMinutes').disabled = !$('autoVodEnabled').checked;
   updateAutoVodSettingCopy();
@@ -570,6 +572,7 @@ function cloneStreamerProfiles(profiles) {
     if (playlistId) normalizedProfile.youtube_playlist_id = playlistId;
     if (profile?.auto_record === true) normalizedProfile.auto_record = true;
     if (profile?.auto_vod_download === true) normalizedProfile.auto_vod_download = true;
+    if (profile?.auto_youtube_upload === true) normalizedProfile.auto_youtube_upload = true;
     if (login && Object.keys(normalizedProfile).length && !normalized[login]) {
       normalized[login] = normalizedProfile;
     }
@@ -591,6 +594,11 @@ function streamerProfileAutoRecordEnabled(profiles, streamer) {
 function streamerProfileAutoVodEnabled(profiles, streamer) {
   const login = canonicalStreamerLoginClient(streamer);
   return !!login && profiles?.[login]?.auto_vod_download === true;
+}
+
+function streamerProfileAutoYoutubeEnabled(profiles, streamer) {
+  const login = canonicalStreamerLoginClient(streamer);
+  return !!login && profiles?.[login]?.auto_youtube_upload === true;
 }
 
 function withStreamerPlaylistSelection(profiles, streamer, playlistId) {
@@ -623,6 +631,18 @@ function withStreamerAutoVodSelection(profiles, streamer, enabled) {
   if (!login) return updated; const profile = { ...(updated[login] || {}) };
   if (enabled === true) profile.auto_vod_download = true; else delete profile.auto_vod_download;
   if (Object.keys(profile).length) updated[login] = profile; else delete updated[login]; return updated;
+}
+
+function withStreamerAutoYoutubeSelection(profiles, streamer, enabled) {
+  const updated = cloneStreamerProfiles(profiles);
+  const login = canonicalStreamerLoginClient(streamer);
+  if (!login) return updated;
+  const profile = { ...(updated[login] || {}) };
+  if (enabled === true) profile.auto_youtube_upload = true;
+  else delete profile.auto_youtube_upload;
+  if (Object.keys(profile).length) updated[login] = profile;
+  else delete updated[login];
+  return updated;
 }
 
 function buildYoutubeUploadRequest(paths, mode, playlistId='') {
@@ -1241,7 +1261,8 @@ function renderStreamerEditor() {
       streamerProfileDraft, name
     );
     const autoVod = streamerProfileAutoVodEnabled(streamerProfileDraft, name);
-    return `<div class="streamer-editor-row" data-streamer-index="${index}"><span class="streamer-order">${index + 1}</span><strong>${escapeHtml(name)}</strong><label class="streamer-playlist-field"><span>Default Playlist</span><select class="streamer-playlist-select" data-streamer-login="${escapeHtml(name)}" aria-label="Default YouTube playlist for ${escapeHtml(name)}">${playlistOptionsHtml(playlistId, 'Global Default')}</select></label><label class="streamer-auto-record-field"><span>Auto VOD</span><span class="switch-control"><input type="checkbox" role="switch" class="streamer-auto-vod-toggle" data-streamer-login="${escapeHtml(name)}" aria-label="Enable automatic VOD downloads for ${escapeHtml(name)}" ${autoVod ? 'checked' : ''}><span class="switch-track" aria-hidden="true"></span><span class="switch-value">${autoVod ? 'On' : 'Off'}</span></span></label><label class="streamer-auto-record-field"><span>Auto Recording</span><span class="switch-control"><input type="checkbox" role="switch" class="streamer-auto-record-toggle" data-streamer-login="${escapeHtml(name)}" aria-label="Enable automatic recording for ${escapeHtml(name)}" ${autoRecord ? 'checked' : ''}><span class="switch-track" aria-hidden="true"></span><span class="switch-value">${autoRecord ? 'On' : 'Off'}</span></span></label><div class="streamer-row-actions"><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></div>`;
+    const autoYoutube = streamerProfileAutoYoutubeEnabled(streamerProfileDraft, name);
+    return `<div class="streamer-editor-row" data-streamer-index="${index}"><span class="streamer-order">${index + 1}</span><strong>${escapeHtml(name)}</strong><label class="streamer-playlist-field"><span>Default Playlist</span><select class="streamer-playlist-select" data-streamer-login="${escapeHtml(name)}" aria-label="Default YouTube playlist for ${escapeHtml(name)}">${playlistOptionsHtml(playlistId, 'Global Default')}</select></label><label class="streamer-auto-record-field"><span>Auto VOD</span><span class="switch-control"><input type="checkbox" role="switch" class="streamer-auto-vod-toggle" data-streamer-login="${escapeHtml(name)}" aria-label="Enable automatic VOD downloads for ${escapeHtml(name)}" ${autoVod ? 'checked' : ''}><span class="switch-track" aria-hidden="true"></span><span class="switch-value">${autoVod ? 'On' : 'Off'}</span></span></label><label class="streamer-auto-record-field"><span>Auto YouTube</span><span class="switch-control"><input type="checkbox" role="switch" class="streamer-auto-youtube-toggle" data-streamer-login="${escapeHtml(name)}" aria-label="Enable automatic YouTube uploads for ${escapeHtml(name)}" ${autoYoutube ? 'checked' : ''}><span class="switch-track" aria-hidden="true"></span><span class="switch-value">${autoYoutube ? 'On' : 'Off'}</span></span></label><label class="streamer-auto-record-field"><span>Auto Recording</span><span class="switch-control"><input type="checkbox" role="switch" class="streamer-auto-record-toggle" data-streamer-login="${escapeHtml(name)}" aria-label="Enable automatic recording for ${escapeHtml(name)}" ${autoRecord ? 'checked' : ''}><span class="switch-track" aria-hidden="true"></span><span class="switch-value">${autoRecord ? 'On' : 'Off'}</span></span></label><div class="streamer-row-actions"><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></div>`;
   }).join('');
   list.querySelectorAll('.streamer-playlist-select').forEach(select => {
     select.addEventListener('change', () => {
@@ -1254,6 +1275,9 @@ function renderStreamerEditor() {
   });
   list.querySelectorAll('.streamer-auto-vod-toggle').forEach(toggle => toggle.addEventListener('change', () => {
     streamerProfileDraft = withStreamerAutoVodSelection(streamerProfileDraft, toggle.dataset.streamerLogin, toggle.checked); renderStreamerEditor();
+  }));
+  list.querySelectorAll('.streamer-auto-youtube-toggle').forEach(toggle => toggle.addEventListener('change', () => {
+    streamerProfileDraft = withStreamerAutoYoutubeSelection(streamerProfileDraft, toggle.dataset.streamerLogin, toggle.checked); renderStreamerEditor();
   }));
   list.querySelectorAll('.streamer-auto-record-toggle').forEach(toggle => {
     toggle.addEventListener('change', () => {
@@ -1453,6 +1477,7 @@ function gatherSettingsFromForm() {
     playlist_end:$('limit').value,
     auto_recorder_enabled:$('autoRecorderEnabled').checked,
     auto_vod_enabled:$('autoVodEnabled').checked,
+    auto_youtube_enabled:$('autoYoutubeEnabled').checked,
     auto_vod_poll_minutes:$('autoVodPollMinutes').value,
     youtube_enabled:$('youtubeEnabled').checked,
     youtube_auto_upload:$('youtubeAutoUpload').checked,

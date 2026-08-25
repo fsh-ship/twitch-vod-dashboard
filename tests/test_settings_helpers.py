@@ -16,6 +16,7 @@ DEFAULT_SETTINGS_KEYS = {
     "archive_file",
     "auto_recorder_enabled",
     "auto_vod_enabled",
+    "auto_youtube_enabled",
     "auto_vod_poll_minutes",
     "batch_postprocess_mode",
     "cookie_browser",
@@ -123,6 +124,7 @@ class SettingsRepositoryTests(unittest.TestCase):
             "youtube_playlist_id": "",
             "auto_recorder_enabled": False,
             "auto_vod_enabled": False,
+            "auto_youtube_enabled": False,
             "auto_vod_poll_minutes": 60,
             "streamer_profiles": {},
             "youtube_client_secret_file": str(
@@ -147,7 +149,7 @@ class SettingsRepositoryTests(unittest.TestCase):
             "manual_upload_write_metadata_json": True,
         }
         self.assertEqual(set(settings.DEFAULT_SETTINGS), DEFAULT_SETTINGS_KEYS)
-        self.assertEqual(len(settings.DEFAULT_SETTINGS), 43)
+        self.assertEqual(len(settings.DEFAULT_SETTINGS), 44)
         self.assertEqual(settings.DEFAULT_SETTINGS, expected)
 
     def test_legacy_settings_without_automation_fields_use_defaults(self):
@@ -157,6 +159,7 @@ class SettingsRepositoryTests(unittest.TestCase):
             if key not in {
                 "auto_recorder_enabled",
                 "auto_vod_enabled",
+                "auto_youtube_enabled",
                 "auto_vod_poll_minutes",
                 "streamer_profiles",
             }
@@ -169,6 +172,7 @@ class SettingsRepositoryTests(unittest.TestCase):
 
         self.assertIs(loaded["auto_recorder_enabled"], False)
         self.assertIs(loaded["auto_vod_enabled"], False)
+        self.assertIs(loaded["auto_youtube_enabled"], False)
         self.assertEqual(loaded["auto_vod_poll_minutes"], 60)
         self.assertEqual(loaded["streamer_profiles"], {})
 
@@ -214,6 +218,28 @@ class SettingsRepositoryTests(unittest.TestCase):
         self.assertIs(saved["auto_recorder_enabled"], True)
         self.assertIs(saved["auto_vod_enabled"], True)
         self.assertEqual(saved["auto_vod_poll_minutes"], 120)
+
+    def test_auto_youtube_setting_is_strict_and_independent(self):
+        for value, expected in (
+            (True, True),
+            (False, False),
+            ("true", False),
+            (1, False),
+            (None, False),
+        ):
+            with self.subTest(value=value):
+                normalized = self.repository.normalize(
+                    {**self.defaults, "auto_youtube_enabled": value}
+                )
+                self.assertIs(normalized["auto_youtube_enabled"], expected)
+
+        saved = self.repository.save(
+            {"auto_youtube_enabled": True, "youtube_auto_upload": False}
+        )
+        loaded = self.repository.load()
+        self.assertIs(saved["auto_youtube_enabled"], True)
+        self.assertIs(loaded["auto_youtube_enabled"], True)
+        self.assertIs(saved["youtube_auto_upload"], False)
 
     def test_streamer_profiles_round_trip_without_touching_streamer_file(self):
         streamer_file = self.runtime_dir / "streamer.txt"
@@ -334,6 +360,33 @@ class SettingsRepositoryTests(unittest.TestCase):
             ),
             {},
         )
+
+    def test_streamer_auto_youtube_profile_field_is_strict_and_compact(self):
+        raw_profiles = {
+            "YoutubeOnly": {"auto_youtube_upload": True},
+            "AllFields": {
+                "youtube_playlist_id": " PL123 ",
+                "auto_record": True,
+                "auto_vod_download": True,
+                "auto_youtube_upload": True,
+            },
+            "FalseOnly": {"auto_youtube_upload": False},
+            "StringTrue": {"auto_youtube_upload": "true"},
+            "NumericTrue": {"auto_youtube_upload": 1},
+        }
+        expected = {
+            "youtubeonly": {"auto_youtube_upload": True},
+            "allfields": {
+                "youtube_playlist_id": "PL123",
+                "auto_record": True,
+                "auto_vod_download": True,
+                "auto_youtube_upload": True,
+            },
+        }
+        saved = self.repository.save({"streamer_profiles": raw_profiles})
+        loaded = self.repository.load()
+        self.assertEqual(saved["streamer_profiles"], expected)
+        self.assertEqual(loaded["streamer_profiles"], expected)
 
     def test_removing_one_profile_field_preserves_the_other(self):
         playlist_removed = settings.normalize_streamer_profiles(
