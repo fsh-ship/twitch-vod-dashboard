@@ -29,6 +29,7 @@ MAX_TEMPLATE_LENGTH = 8_000
 MAX_TAGS = 100
 MAX_TAG_LENGTH = 100
 MAX_PARTS = 10_000
+MAX_AUTOMATIC_REPLANS = 3
 
 BUNDLE_STATES = frozenset({"intent_pending", "plan_ready", "parts_preparing", "parts_ready", "upload_queued", "video_confirmed", "playlist_pending", "completed", "blocked_youtube", "needs_attention", "cancelled"})
 UPLOAD_STATES = BUNDLE_STATES
@@ -37,7 +38,7 @@ PLAYLIST_STATES = frozenset({"not_requested", "pending", "inserting", "confirmed
 SOURCE_KINDS = frozenset({"original", "generated"})
 SPLIT_MODES = frozenset({"stream_copy"})
 PART_PLAN_VERSION = 1
-REASON_CODES = frozenset({"youtube_not_connected", "token_refresh_failed", "api_unavailable", "local_preparation_failed", "upload_outcome_uncertain", "playlist_failed", "playlist_uncertain", "plan_media_missing", "plan_source_invalid", "plan_preparation_failed", "plan_inputs_missing", "materialization_media_missing", "materialization_source_invalid", "materialization_consistency_error", "multipart_preparation_required", "parts_preparation_failed", "parts_manifest_invalid", "insufficient_storage", "storage_unavailable", "ffmpeg_unavailable", "ffmpeg_failed", "multipart_storage_insufficient", "multipart_storage_unavailable", "multipart_generation_incomplete", "multipart_validation_failed", "multipart_replan_required"})
+REASON_CODES = frozenset({"youtube_not_connected", "token_refresh_failed", "api_unavailable", "local_preparation_failed", "upload_outcome_uncertain", "playlist_failed", "playlist_uncertain", "plan_media_missing", "plan_source_invalid", "plan_preparation_failed", "plan_inputs_missing", "materialization_media_missing", "materialization_source_invalid", "materialization_consistency_error", "multipart_preparation_required", "parts_preparation_failed", "parts_manifest_invalid", "insufficient_storage", "storage_unavailable", "ffmpeg_unavailable", "ffmpeg_failed", "multipart_storage_insufficient", "multipart_storage_unavailable", "multipart_generation_incomplete", "multipart_validation_failed", "multipart_replan_required", "multipart_replan_exhausted", "multipart_replan_source_invalid", "multipart_replan_unsafe", "multipart_replan_failed"})
 
 _VOD_ID_RE = re.compile(rf"\d{{6,{MAX_VOD_ID_LENGTH}}}")
 _IDENTIFIER_RE = re.compile(rf"[A-Za-z0-9][A-Za-z0-9_.-]{{0,{MAX_IDENTIFIER_LENGTH - 1}}}")
@@ -136,10 +137,13 @@ def validate_upload_plan(v: Any) -> Dict[str, Any]:
     return result
 def _split(v: Any) -> Optional[Dict[str, Any]]:
     if v is None: return None
-    if not isinstance(v, Mapping) or set(v) != {"mode", "generation_id", "target_duration_seconds", "target_size_bytes", "split_points_seconds"} or v.get("mode") not in SPLIT_MODES or not isinstance(v.get("split_points_seconds"), list): raise YouTubeUploadStateValidationError("invalid_split")
+    fields = {"mode", "generation_id", "target_duration_seconds", "target_size_bytes", "split_points_seconds"}
+    if not isinstance(v, Mapping) or frozenset(v) not in {frozenset(fields), frozenset(fields | {"replan_count"})} or v.get("mode") not in SPLIT_MODES or not isinstance(v.get("split_points_seconds"), list): raise YouTubeUploadStateValidationError("invalid_split")
     points = [_duration(point, "invalid_split") for point in v["split_points_seconds"]]
     if any(a is None or b is None or a >= b for a, b in zip(points, points[1:])): raise YouTubeUploadStateValidationError("invalid_split")
-    return {"mode": v["mode"], "generation_id": _identifier(v.get("generation_id"), "invalid_split"), "target_duration_seconds": _duration(v.get("target_duration_seconds"), "invalid_split"), "target_size_bytes": _size(v.get("target_size_bytes"), "invalid_split", positive=True), "split_points_seconds": points}
+    replan_count = v.get("replan_count", 0)
+    if isinstance(replan_count, bool) or not isinstance(replan_count, int) or not 0 <= replan_count <= MAX_AUTOMATIC_REPLANS: raise YouTubeUploadStateValidationError("invalid_split")
+    return {"mode": v["mode"], "generation_id": _identifier(v.get("generation_id"), "invalid_split"), "target_duration_seconds": _duration(v.get("target_duration_seconds"), "invalid_split"), "target_size_bytes": _size(v.get("target_size_bytes"), "invalid_split", positive=True), "split_points_seconds": points, "replan_count": replan_count}
 def _part(v: Any, index: int) -> Dict[str, Any]:
     fields = {"index", "media_path", "size_bytes", "duration_seconds", "source_kind", "upload_item_id", "upload_state", "attempts", "youtube_video_id", "playlist_state", "reason"}
     if not isinstance(v, Mapping) or set(v) != fields or v.get("index") != index or v.get("source_kind") not in SOURCE_KINDS or v.get("upload_state") not in PART_UPLOAD_STATES or v.get("playlist_state") not in PLAYLIST_STATES: raise YouTubeUploadStateValidationError("invalid_part")
@@ -273,4 +277,19 @@ class YouTubeUploadStateStore:
             new = deepcopy(old); new.update({"state": "parts_ready", "parts": parts, "reason": None, "updated_at": _now(self._clock)})
             normalized = _record_v2(new, key)
             if not normalized["parts"] or any(part["source_kind"] != "generated" or part["upload_state"] != "ready" for part in normalized["parts"]): raise YouTubeUploadStateValidationError("invalid_generation_finalization")
+            doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+    def replace_split_for_replan(self, streamer: Any, twitch_vod_id: Any, *, expected_generation_id: Any, split: Any) -> UploadRecord:
+        """Atomically replace exactly one proven-invalid multipart generation plan."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        expected = _identifier(expected_generation_id, "invalid_replan_transition")
+        replacement = _split(split)
+        if replacement is None: raise YouTubeUploadStateValidationError("invalid_replan_transition")
+        with self._lock:
+            doc = self._load_locked(); old = doc["uploads"].get(key)
+            if old is None: raise YouTubeUploadStateValidationError("upload_not_found")
+            current = old.get("split")
+            if old["state"] != "needs_attention" or old["reason"] != "multipart_replan_required" or old["upload_job_id"] is not None or old["parts"] or not isinstance(current, Mapping) or current.get("generation_id") != expected: raise YouTubeUploadStateValidationError("invalid_replan_transition")
+            if replacement["generation_id"] == current["generation_id"] or replacement["mode"] != current["mode"] or replacement["target_duration_seconds"] != current["target_duration_seconds"] or replacement["target_size_bytes"] != current["target_size_bytes"] or replacement["replan_count"] != current["replan_count"] + 1 or len(replacement["split_points_seconds"]) != len(current["split_points_seconds"]) + 1: raise YouTubeUploadStateValidationError("invalid_replan_transition")
+            new = deepcopy(old); new.update({"state": "parts_preparing", "split": replacement, "parts": [], "reason": None, "updated_at": _now(self._clock)})
+            normalized = _record_v2(new, key)
             doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)

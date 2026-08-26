@@ -75,6 +75,33 @@ class YouTubeUploadStateStoreTests(unittest.TestCase):
         self.path.write_text(json.dumps(self.document(uploads={"bearlychen:2855270041": self.record(parts=[part], part_plan_version=1, split=split)})), encoding="utf-8")
         with self.assertRaises(state.YouTubeUploadStateLoadError): self.store.load()
 
+    def test_split_replan_count_is_bounded_and_old_v2_defaults_to_zero(self):
+        split = {
+            "mode": "stream_copy", "generation_id": "g1",
+            "target_duration_seconds": 60,
+            "target_size_bytes": 100,
+            "split_points_seconds": [30],
+        }
+        record = self.record(
+            state="parts_preparing", source_duration_seconds=60,
+            part_plan_version=1, split=split,
+        )
+        self.path.write_text(json.dumps(self.document(
+            uploads={"bearlychen:2855270041": record}
+        )), encoding="utf-8")
+        self.assertEqual(
+            self.store.load()["uploads"]["bearlychen:2855270041"]["split"]["replan_count"],
+            0,
+        )
+        for invalid in (-1, state.MAX_AUTOMATIC_REPLANS + 1, True, "1"):
+            with self.subTest(invalid=invalid):
+                changed = dict(split, replan_count=invalid)
+                self.path.write_text(json.dumps(self.document(uploads={
+                    "bearlychen:2855270041": dict(record, split=changed)
+                })), encoding="utf-8")
+                with self.assertRaises(state.YouTubeUploadStateLoadError):
+                    self.store.load()
+
     def test_current_p8_plan_and_deferred_link_remain_supported(self):
         self.create(plan_inputs={"title_template": "{title}", "description_template": "", "description_fallback": "", "privacy_status": "private", "category_id": "20", "tags": []})
         ready = self.store.set_upload_plan("bearlychen", "2855270041", {"title": "title", "description": "", "privacy_status": "private", "category_id": "20", "tags": []})

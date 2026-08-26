@@ -14,7 +14,7 @@ import subprocess
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from vod_dashboard.youtube import sanitize_youtube_description, sanitize_youtube_title
-from vod_dashboard.youtube_upload_state import MAX_DESCRIPTION_LENGTH
+from vod_dashboard.youtube_upload_state import MAX_DESCRIPTION_LENGTH, MAX_PARTS
 
 
 HARD_DURATION_SECONDS = 43_200
@@ -164,18 +164,25 @@ def _ceil_division(value: int | float, divisor: int) -> int:
     return int(math.ceil(value / divisor))
 
 
+def deterministic_split_points(duration_seconds: float, part_count: int) -> tuple[float, ...]:
+    """Return equal, millisecond-rounded split points for an explicit final N."""
+    duration = _positive_duration(duration_seconds)
+    if duration is None or isinstance(part_count, bool) or not isinstance(part_count, int) or not 2 <= part_count <= MAX_PARTS:
+        raise ValueError("invalid_part_count")
+    source = Decimal(str(duration))
+    points = tuple(float((source * Decimal(index) / Decimal(part_count)).quantize(_MILLIS, rounding=ROUND_HALF_UP)) for index in range(1, part_count))
+    if not all(0 < point < duration for point in points) or any(left >= right for left, right in zip(points, points[1:])):
+        raise ValueError("invalid_split_points")
+    return points
+
+
 def plan_multipart_upload(*, duration_seconds: float, size_bytes: int, signature: Sequence[StreamDescriptor] = ()) -> MultipartPlan:
     if _positive_duration(duration_seconds) is None or isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes <= 0:
         raise ValueError("invalid_source_measurement")
     duration = float(duration_seconds)
     required = duration >= HARD_DURATION_SECONDS or size_bytes >= HARD_SIZE_BYTES
     count = 1 if not required else max(2, _ceil_division(duration, TARGET_DURATION_SECONDS), _ceil_division(size_bytes, TARGET_SIZE_BYTES))
-    points: tuple[float, ...] = ()
-    if count > 1:
-        source = Decimal(str(duration))
-        points = tuple(float((source * Decimal(index) / Decimal(count)).quantize(_MILLIS, rounding=ROUND_HALF_UP)) for index in range(1, count))
-        if not all(0 < point < duration for point in points) or any(left >= right for left, right in zip(points, points[1:])):
-            raise ValueError("invalid_split_points")
+    points = deterministic_split_points(duration, count) if count > 1 else ()
     descriptors = tuple(signature)
     return MultipartPlan(required, duration, size_bytes, count, points, TARGET_DURATION_SECONDS, TARGET_SIZE_BYTES, stream_signature(descriptors))
 

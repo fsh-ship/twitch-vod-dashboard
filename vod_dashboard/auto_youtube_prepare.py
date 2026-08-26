@@ -90,7 +90,7 @@ class AutoYouTubePreparationService:
     def _split_document(self, record: Mapping[str, Any], plan: MultipartPlan) -> Dict[str, Any]:
         value = generation_id(record, plan)
         generated_namespace(record, value)
-        return {"mode": "stream_copy", "generation_id": value, "target_duration_seconds": plan.target_duration_seconds, "target_size_bytes": plan.target_size_bytes, "split_points_seconds": list(plan.split_points_seconds)}
+        return {"mode": "stream_copy", "generation_id": value, "target_duration_seconds": plan.target_duration_seconds, "target_size_bytes": plan.target_size_bytes, "split_points_seconds": list(plan.split_points_seconds), "replan_count": 0}
 
     def _one_part(self, record: Mapping[str, Any], plan: MultipartPlan) -> Dict[str, Any]:
         return {"index": 1, "media_path": record["media_path"], "size_bytes": record["size_bytes"], "duration_seconds": plan.source_duration_seconds, "source_kind": "original", "upload_item_id": None, "upload_state": "ready", "attempts": 0, "youtube_video_id": None, "playlist_state": "pending" if record.get("playlist_id") else "not_requested", "reason": None}

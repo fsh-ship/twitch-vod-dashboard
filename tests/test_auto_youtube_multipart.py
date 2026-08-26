@@ -23,6 +23,20 @@ class MultipartPlanningTests(unittest.TestCase):
         self.assertEqual(again.split_points_seconds, (28800.0, 57600.0))
         self.assertTrue(all(a < b for a, b in zip(again.split_points_seconds, again.split_points_seconds[1:])))
 
+    def test_explicit_part_count_uses_same_deterministic_split_contract(self):
+        self.assertEqual(
+            multipart.deterministic_split_points(43_200, 3),
+            (14_400.0, 28_800.0),
+        )
+        self.assertEqual(
+            multipart.deterministic_split_points(10.0, 3),
+            (3.333, 6.667),
+        )
+        for count in (1, multipart.MAX_PARTS + 1, True):
+            with self.subTest(count=count):
+                with self.assertRaises(ValueError):
+                    multipart.deterministic_split_points(10.0, count)
+
     def test_limits_distinguish_original_and_generated(self):
         self.assertTrue(multipart.original_part_within_limits(duration_seconds=11 * 3600 + 59 * 60, size_bytes=200_000_000_000))
         self.assertFalse(multipart.original_part_within_limits(duration_seconds=43200, size_bytes=1))
@@ -76,4 +90,3 @@ class MultipartMetadataTests(unittest.TestCase):
         result = multipart.derive_part_upload_plan(base, index=1, total=2)
         self.assertLessEqual(len(result["title"]), 95); self.assertTrue(result["title"].endswith("(Part 1/2)")); self.assertNotIn("<", result["title"])
         self.assertLessEqual(len(result["description"]), 5000); self.assertTrue(result["description"].startswith("Part 1 of 2."))
-
