@@ -46,6 +46,8 @@ REASON_CODES = frozenset({
     "local_preparation_failed", "upload_outcome_uncertain", "playlist_failed",
     "playlist_uncertain", "plan_media_missing", "plan_source_invalid",
     "plan_preparation_failed", "plan_inputs_missing",
+    "materialization_media_missing", "materialization_source_invalid",
+    "materialization_consistency_error",
 })
 
 _VOD_ID_RE = re.compile(rf"\d{{6,{MAX_VOD_ID_LENGTH}}}")
@@ -288,6 +290,14 @@ def _optional_upload_plan(value: Any) -> Optional[Dict[str, Any]]:
         "category_id": category_id,
         "tags": normalized_tags,
     }
+
+
+def validate_upload_plan(value: Any) -> Dict[str, Any]:
+    """Return the normalized immutable plan, or reject an incomplete value."""
+    normalized = _optional_upload_plan(value)
+    if normalized is None:
+        raise YouTubeUploadStateValidationError("invalid_upload_plan")
+    return normalized
 
 
 def _normalize_record(value: Any, *, key: str) -> UploadRecord:

@@ -40,6 +40,7 @@ MAX_REASON_LENGTH = 64
 MAX_RETURN_CODE = 2_147_483_647
 MAX_SECONDS = 315_576_000.0  # ten years
 MAX_BYTES = 9_223_372_036_854_775_807
+MAX_AUTO_YOUTUBE_KEY_LENGTH = 160
 
 JOB_TYPES = frozenset({"download", "youtube_upload", "recording"})
 JOB_STATES = frozenset(
@@ -94,6 +95,9 @@ _TWITCH_VOD_URL_RE = re.compile(
     r"https://www\.twitch\.tv/videos/([1-9][0-9]{5,19})"
 )
 _VOD_ID_RE = re.compile(r"[1-9][0-9]{0,31}")
+_AUTO_YOUTUBE_KEY_RE = re.compile(
+    rf"[a-z0-9][a-z0-9_-]{{0,63}}:[1-9][0-9]{{5,31}}"
+)
 _WINDOWS_DRIVE_RE = re.compile(r"[A-Za-z]:")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -786,6 +790,60 @@ def _normalize_upload_metadata(value: Any) -> Dict[str, Any]:
     }
 
 
+def _normalize_auto_youtube_context(
+    value: Any,
+    *,
+    urls: list[str],
+    metadata: list[Dict[str, Any]],
+    playlist_id: str,
+    count: int,
+) -> Dict[str, Any]:
+    """Validate the minimal durable identity for one deferred Auto YouTube job."""
+    if not isinstance(value, Mapping) or set(value) != {
+        "streamer",
+        "twitch_vod_id",
+        "source_download_job_id",
+        "source_download_item_id",
+        "media_path",
+    }:
+        raise JobStoreValidationError("invalid_auto_youtube_context")
+    if count != 1 or len(urls) != 1 or len(metadata) != 1:
+        raise JobStoreValidationError("invalid_auto_youtube_context")
+    streamer = canonical_streamer_login(value.get("streamer"))
+    vod_id = value.get("twitch_vod_id")
+    source_job_id = _job_id(
+        value.get("source_download_job_id"), "invalid_auto_youtube_context"
+    )
+    source_item_id = value.get("source_download_item_id")
+    source_item_match = (
+        _ITEM_ID_RE.fullmatch(source_item_id)
+        if isinstance(source_item_id, str)
+        else None
+    )
+    media_path = _relative_media_path(
+        value.get("media_path"), code="invalid_auto_youtube_context"
+    )
+    if (
+        not streamer
+        or not isinstance(vod_id, str)
+        or not _VOD_ID_RE.fullmatch(vod_id)
+        or source_item_match is None
+        or source_item_match.group(1) != source_job_id
+        or media_path != urls[0]
+        or metadata[0].get("streamer") != streamer
+        or metadata[0].get("vod_id") != vod_id
+        or metadata[0].get("youtube_playlist_id") != playlist_id
+    ):
+        raise JobStoreValidationError("invalid_auto_youtube_context")
+    return {
+        "streamer": streamer,
+        "twitch_vod_id": vod_id,
+        "source_download_job_id": source_job_id,
+        "source_download_item_id": source_item_id,
+        "media_path": media_path,
+    }
+
+
 def _normalize_upload(
     job: Mapping[str, Any],
     result: Job,
@@ -802,18 +860,21 @@ def _normalize_upload(
         "misaligned_item_metadata",
         default=lambda: {},
     )
+    urls = [
+        _relative_media_path(value, media_root=media_root)
+        for value in paths
+    ]
+    playlist_id = _playlist_id(
+        job.get("playlist_id", ""), "invalid_playlist_id"
+    )
+    normalized_metadata = [
+        _normalize_upload_metadata(value) for value in metadata
+    ]
     result.update(
         {
-            "urls": [
-                _relative_media_path(value, media_root=media_root)
-                for value in paths
-            ],
-            "playlist_id": _playlist_id(
-                job.get("playlist_id", ""), "invalid_playlist_id"
-            ),
-            "item_metadata": [
-                _normalize_upload_metadata(value) for value in metadata
-            ],
+            "urls": urls,
+            "playlist_id": playlist_id,
+            "item_metadata": normalized_metadata,
             "item_progress": _numeric_array(
                 job, "item_progress", count, minimum=0.0, maximum=100.0
             ),
@@ -828,6 +889,46 @@ def _normalize_upload(
                 minimum=0.0,
                 maximum=MAX_BYTES,
             ),
+        }
+    )
+    auto_fields_present = any(
+        field in job
+        for field in (
+            "origin",
+            "execution_deferred",
+            "auto_youtube_key",
+            "auto_youtube_context",
+        )
+    )
+    if not auto_fields_present:
+        return
+    if (
+        job.get("origin") != "auto_youtube"
+        or job.get("execution_deferred") is not True
+    ):
+        raise JobStoreValidationError("invalid_auto_youtube_job")
+    key = job.get("auto_youtube_key")
+    if (
+        not isinstance(key, str)
+        or len(key) > MAX_AUTO_YOUTUBE_KEY_LENGTH
+        or not _AUTO_YOUTUBE_KEY_RE.fullmatch(key)
+    ):
+        raise JobStoreValidationError("invalid_auto_youtube_job")
+    context = _normalize_auto_youtube_context(
+        job.get("auto_youtube_context"),
+        urls=urls,
+        metadata=normalized_metadata,
+        playlist_id=playlist_id,
+        count=count,
+    )
+    if key != f"{context['streamer']}:{context['twitch_vod_id']}":
+        raise JobStoreValidationError("invalid_auto_youtube_job")
+    result.update(
+        {
+            "origin": "auto_youtube",
+            "execution_deferred": True,
+            "auto_youtube_key": key,
+            "auto_youtube_context": context,
         }
     )
 

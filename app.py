@@ -24,6 +24,7 @@ from vod_dashboard import auto_recording as dashboard_auto_recording
 from vod_dashboard import auto_recording_runtime as dashboard_auto_runtime
 from vod_dashboard import auto_vod as dashboard_auto_vod
 from vod_dashboard import auto_youtube_handoff as dashboard_auto_youtube_handoff
+from vod_dashboard import auto_youtube_materialize as dashboard_auto_youtube_materialize
 from vod_dashboard import auto_youtube_plan as dashboard_auto_youtube_plan
 from vod_dashboard import auto_vod_result as dashboard_auto_vod_result
 from vod_dashboard import auto_vod_coordinator as dashboard_auto_vod_coordinator
@@ -912,6 +913,9 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
 
         auto_youtube_handoff = {"created": 0, "blocked": 0, "pending": 0}
         auto_youtube_plan = {"ready": 0, "attention": 0, "pending": 0}
+        auto_youtube_materialization = {
+            "queued": 0, "attention": 0, "pending": 0, "ignored": 0,
+        }
         try:
             auto_youtube_handoff = _auto_youtube_handoff_service(
                 manager
@@ -925,6 +929,14 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
         except Exception:
             app.logger.error(
                 "Auto YouTube plan reconciliation failed (plan_reconciliation_failed)."
+            )
+        try:
+            auto_youtube_materialization = _auto_youtube_materialization_service(
+                manager
+            ).reconcile()
+        except Exception:
+            app.logger.error(
+                "Auto YouTube job materialization failed (materialization_reconciliation_failed)."
             )
 
         monitor_started = False
@@ -977,6 +989,7 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             "auto_vod_monitor_started": auto_vod_monitor_started,
             "auto_youtube_handoff": auto_youtube_handoff,
             "auto_youtube_plan": auto_youtube_plan,
+            "auto_youtube_materialization": auto_youtube_materialization,
         }
         app.logger.info(
             "Worker runtime initialized: loaded=%d discarded=%d "
@@ -1313,6 +1326,18 @@ def _auto_youtube_plan_service() -> dashboard_auto_youtube_plan.AutoYouTubePlanS
     )
 
 
+def _auto_youtube_materialization_service(
+    manager: Optional[dashboard_jobs.JobManager] = None,
+) -> dashboard_auto_youtube_materialize.AutoYouTubeMaterializationService:
+    return dashboard_auto_youtube_materialize.AutoYouTubeMaterializationService(
+        state_store=dashboard_youtube_upload_state.YouTubeUploadStateStore.from_dashboard_dir(
+            DEFAULT_DASHBOARD_DIR
+        ),
+        job_manager=manager or _job_manager_for_compatibility(),
+        media_policy=dashboard_media.MediaPathPolicy(MEDIA_ROOT),
+    )
+
+
 def admit_auto_youtube_intent(
     job_id: str, item_id: str, completion_settings: Mapping[str, Any]
 ) -> str:
@@ -1325,6 +1350,7 @@ def admit_auto_youtube_intent(
     )
     if outcome in {"created", "pending"}:
         _auto_youtube_plan_service().reconcile()
+        _auto_youtube_materialization_service().reconcile()
     return outcome
 
 

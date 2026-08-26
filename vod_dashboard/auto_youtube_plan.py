@@ -12,6 +12,26 @@ from vod_dashboard.youtube_upload_state import (
 )
 
 
+def validate_completed_auto_youtube_source(
+    record: Mapping[str, Any], media_policy: MediaPathPolicy
+) -> Any:
+    """Revalidate exactly the P8c result without discovering a replacement."""
+    source_path = media_policy.resolve_media_path(
+        record.get("media_path"), must_exist=True, require_file=True
+    )
+    verified = resolve_completed_auto_vod_output(
+        record.get("media_path"), {}, record.get("twitch_vod_id"),
+        media_policy=media_policy,
+    )
+    if (
+        verified.get("completed_media_path") != record.get("media_path")
+        or verified.get("completed_media_size_bytes") != record.get("size_bytes")
+        or verified.get("completed_twitch_vod_id") != record.get("twitch_vod_id")
+    ):
+        raise RuntimeError("Completed Auto VOD source no longer matches ownership.")
+    return source_path
+
+
 def freeze_plan_inputs(settings: Mapping[str, Any]) -> Dict[str, Any]:
     """Capture only deterministic metadata inputs; never secrets or paths."""
     privacy = str(settings.get("youtube_privacy_status") or "private")
@@ -83,24 +103,18 @@ class AutoYouTubePlanService:
         if not isinstance(inputs, Mapping):
             return self._attention(record, "plan_inputs_missing")
         try:
-            source_path = self._media_policy.resolve_media_path(
-                record.get("media_path"), must_exist=False
-            )
-            if not source_path.exists():
-                return self._attention(record, "plan_media_missing")
-            verified = resolve_completed_auto_vod_output(
-                record.get("media_path"),
-                {},
-                record.get("twitch_vod_id"),
-                media_policy=self._media_policy,
+            source_path = validate_completed_auto_youtube_source(
+                record, self._media_policy
             )
         except Exception:
-            return self._attention(record, "plan_source_invalid")
-        if (
-            verified.get("completed_media_path") != record.get("media_path")
-            or verified.get("completed_media_size_bytes") != record.get("size_bytes")
-            or verified.get("completed_twitch_vod_id") != record.get("twitch_vod_id")
-        ):
+            try:
+                source_path = self._media_policy.resolve_media_path(
+                    record.get("media_path"), must_exist=False
+                )
+            except Exception:
+                source_path = None
+            if source_path is not None and not source_path.exists():
+                return self._attention(record, "plan_media_missing")
             return self._attention(record, "plan_source_invalid")
         try:
             metadata = self._metadata_builder(

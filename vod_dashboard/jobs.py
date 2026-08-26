@@ -813,6 +813,15 @@ class JobManager:
             in {"insufficient_storage", "storage_unavailable"}
         )
 
+    @staticmethod
+    def _is_deferred_auto_youtube(job: Job) -> bool:
+        """Deferred P8f ownership jobs must never become process-owned work."""
+        return (
+            job.get("type") == "youtube_upload"
+            and job.get("origin") == "auto_youtube"
+            and job.get("execution_deferred") is True
+        )
+
     def _reconcile_restored_job(
         self, job: Job, reconciliation_time: str
     ) -> int:
@@ -977,6 +986,11 @@ class JobManager:
                         job["item_statuses"][index] = ITEM_STATE_TO_LEGACY[
                             "queued"
                         ]
+                self._recompute_job_state_locked(job)
+                continue
+            if self._is_deferred_auto_youtube(job):
+                # This durable marker is an execution gate, not a paused
+                # queue. It owns no worker and must survive restart queued.
                 self._recompute_job_state_locked(job)
                 continue
             has_nonterminal = any(
@@ -1385,6 +1399,7 @@ class JobManager:
         playlist_id: Optional[str] = None,
         item_metadata: Optional[list[Dict[str, Any]]] = None,
         retry_of: Optional[Dict[str, str]] = None,
+        auto_youtube_context: Optional[Dict[str, Any]] = None,
         counter_getter: Optional[CounterGetter] = None,
         counter_setter: Optional[CounterSetter] = None,
     ) -> str:
@@ -1429,6 +1444,18 @@ class JobManager:
             }
             if playlist_id is not None:
                 job["playlist_id"] = str(playlist_id or "").strip()
+            if auto_youtube_context is not None:
+                context = dict(auto_youtube_context)
+                streamer = str(context.get("streamer") or "").strip()
+                vod_id = str(context.get("twitch_vod_id") or "").strip()
+                job.update(
+                    {
+                        "origin": "auto_youtube",
+                        "execution_deferred": True,
+                        "auto_youtube_key": f"{streamer}:{vod_id}",
+                        "auto_youtube_context": context,
+                    }
+                )
             self.jobs[job_id] = job
             try:
                 self._attach_retry_relationship_locked(job, retry_of)
@@ -1440,9 +1467,55 @@ class JobManager:
         try:
             self._persist_required(snapshot)
         except JobPersistenceRequiredError as exc:
+            if auto_youtube_context is not None:
+                # P8f jobs own no process or external side effect. A required
+                # creation save that failed therefore has no durable admission
+                # and must not leave a locally failed pseudo-upload behind.
+                with self.lock:
+                    self.jobs.pop(job_id, None)
+                    self._mark_dirty_locked()
+                raise
             self._handle_creation_persistence_failure(job_id, exc)
             raise
         return job_id
+
+    def create_auto_youtube_upload_job_deferred(
+        self,
+        *,
+        source: Dict[str, Any],
+        upload_plan: Dict[str, Any],
+        playlist_id: str,
+    ) -> str:
+        """Persist one P8f Auto YouTube job without arming an upload worker."""
+        media_path = str(source.get("media_path") or "")
+        title = str(upload_plan.get("title") or "")
+        metadata = {
+            "streamer": str(source.get("streamer") or ""),
+            "date": "",
+            "title": title,
+            "vod_id": str(source.get("twitch_vod_id") or ""),
+            "name": Path(media_path).name,
+            "size_bytes": source.get("size_bytes"),
+            "size_gb": None,
+            "youtube_playlist_id": str(playlist_id or "").strip(),
+        }
+        context = {
+            key: source.get(key)
+            for key in (
+                "streamer",
+                "twitch_vod_id",
+                "source_download_job_id",
+                "source_download_item_id",
+                "media_path",
+            )
+        }
+        return self.create_upload_job(
+            [media_path],
+            "Preparing for YouTube",
+            playlist_id=str(playlist_id or "").strip(),
+            item_metadata=[metadata],
+            auto_youtube_context=context,
+        )
 
     def append_job_log(
         self,
@@ -1714,6 +1787,18 @@ class JobManager:
                 "retry_block_reason": "",
                 "retry_blocked_reason": "recording_retry_unsupported",
             }
+        if self._is_deferred_auto_youtube(job):
+            return {
+                "can_cancel": False,
+                "can_remove": False,
+                "can_retry": False,
+                "can_resolve": False,
+                "can_stop_after_current": False,
+                "retry_pending": False,
+                "retry_job_id": "",
+                "retry_block_reason": "",
+                "retry_blocked_reason": "execution_deferred",
+            }
         uncertain = (
             job.get("type") == "youtube_upload"
             and failure_kind == "uncertain"
@@ -1831,6 +1916,8 @@ class JobManager:
         for candidate_id, candidate in self.jobs.items():
             if self._lane_for_job(candidate) != lane:
                 continue
+            if self._is_deferred_auto_youtube(candidate):
+                continue
             self._ensure_control_lists_locked(candidate)
             if any(state == "queued" for state in candidate["item_states"]):
                 if (
@@ -1851,6 +1938,9 @@ class JobManager:
                 if job is None:
                     return None
                 self._ensure_control_lists_locked(job)
+                if self._is_deferred_auto_youtube(job):
+                    self._recompute_job_state_locked(job)
+                    return None
                 queued = [
                     index
                     for index, state in enumerate(job["item_states"])
@@ -3182,6 +3272,8 @@ class JobManager:
             paths: set[str] = set()
             for job in self.jobs.values():
                 if job.get("type") != "youtube_upload":
+                    continue
+                if self._is_deferred_auto_youtube(job):
                     continue
                 self._ensure_control_lists_locked(job)
                 states = job.get("item_states") or []
