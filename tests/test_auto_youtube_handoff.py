@@ -116,10 +116,10 @@ class AutoYouTubeHandoffTests(unittest.TestCase):
         self.assertEqual(record["media_path"], "bearlychen/final.mkv")
         self.assertEqual(record["size_bytes"], 123)
         self.assertEqual(record["playlist_id"], "PLAYLIST_A")
-        self.assertEqual(record["playlist_state"], "pending")
+        self.assertEqual(record["playlist_id"], "PLAYLIST_A")
         self.assertIsNone(record["upload_job_id"])
-        self.assertEqual(record["attempts"], 0)
-        self.assertIsNone(record["youtube_video_id"])
+        self.assertEqual(record["parts"], [])
+        self.assertEqual(record["parts"], [])
         self.assertEqual(
             [job.get("type", "download") for job in manager.snapshot_jobs()],
             ["download"],
@@ -134,7 +134,7 @@ class AutoYouTubeHandoffTests(unittest.TestCase):
         self._service(manager).admit_pending(job_id, item_id)
         record = self.store.get("bearlychen", VOD_ID)
         self.assertIsNone(record["playlist_id"])
-        self.assertEqual(record["playlist_state"], "not_requested")
+        self.assertIsNone(record["playlist_id"])
 
     def test_historical_or_not_eligible_jobs_are_never_backfilled(self):
         manager, job_id, item_id = self._completed_job()

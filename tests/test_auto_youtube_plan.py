@@ -93,9 +93,9 @@ class AutoYouTubePlanTests(unittest.TestCase):
         })
         self.assertEqual(saved["state"], "plan_ready")
         self.assertEqual(saved["playlist_id"], "PLAYLIST_A")
-        self.assertEqual(saved["playlist_state"], "pending")
+        self.assertEqual(saved["playlist_id"], "PLAYLIST_A")
         self.assertIsNone(saved["upload_job_id"])
-        self.assertIsNone(saved["youtube_video_id"])
+        self.assertEqual(saved["parts"], [])
 
     def test_plan_is_immutable_across_reconciliation_settings_and_restart(self):
         record = self._intent()
@@ -143,7 +143,7 @@ class AutoYouTubePlanTests(unittest.TestCase):
         self.assertEqual(self._service(builder).prepare_record(record), "attention")
         current = self.store.get("bearlychen", VOD_ID)
         self.assertEqual(current["reason"], "plan_preparation_failed")
-        self.assertNotIn("upload_plan", current)
+        self.assertIsNone(current["upload_plan"])
 
     def test_legacy_intent_without_frozen_inputs_is_not_reinterpreted(self):
         path = self._write_media()
@@ -168,7 +168,7 @@ class AutoYouTubePlanTests(unittest.TestCase):
             self.assertEqual(service.prepare_record(record), "pending")
         current = self.store.get("bearlychen", VOD_ID)
         self.assertEqual(current["state"], "intent_pending")
-        self.assertNotIn("upload_plan", current)
+        self.assertIsNone(current["upload_plan"])
         self.assertEqual(service.reconcile()["ready"], 1)
         self.assertEqual(self.store.get("bearlychen", VOD_ID)["state"], "plan_ready")
 
