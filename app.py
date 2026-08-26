@@ -24,6 +24,7 @@ from vod_dashboard import auto_recording as dashboard_auto_recording
 from vod_dashboard import auto_recording_runtime as dashboard_auto_runtime
 from vod_dashboard import auto_vod as dashboard_auto_vod
 from vod_dashboard import auto_youtube_handoff as dashboard_auto_youtube_handoff
+from vod_dashboard import auto_youtube_plan as dashboard_auto_youtube_plan
 from vod_dashboard import auto_vod_result as dashboard_auto_vod_result
 from vod_dashboard import auto_vod_coordinator as dashboard_auto_vod_coordinator
 from vod_dashboard import auto_vod_runtime as dashboard_auto_vod_runtime
@@ -910,6 +911,7 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             return dict(WORKER_RUNTIME_RESULT)
 
         auto_youtube_handoff = {"created": 0, "blocked": 0, "pending": 0}
+        auto_youtube_plan = {"ready": 0, "attention": 0, "pending": 0}
         try:
             auto_youtube_handoff = _auto_youtube_handoff_service(
                 manager
@@ -917,6 +919,12 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
         except Exception:
             app.logger.error(
                 "Auto YouTube handoff reconciliation failed (handoff_reconciliation_failed)."
+            )
+        try:
+            auto_youtube_plan = _auto_youtube_plan_service().reconcile()
+        except Exception:
+            app.logger.error(
+                "Auto YouTube plan reconciliation failed (plan_reconciliation_failed)."
             )
 
         monitor_started = False
@@ -968,6 +976,7 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             "monitor_started": monitor_started,
             "auto_vod_monitor_started": auto_vod_monitor_started,
             "auto_youtube_handoff": auto_youtube_handoff,
+            "auto_youtube_plan": auto_youtube_plan,
         }
         app.logger.info(
             "Worker runtime initialized: loaded=%d discarded=%d "
@@ -1294,8 +1303,29 @@ def _auto_youtube_handoff_service(
     )
 
 
-def admit_auto_youtube_intent(job_id: str, item_id: str) -> str:
-    return _auto_youtube_handoff_service().admit_pending(job_id, item_id)
+def _auto_youtube_plan_service() -> dashboard_auto_youtube_plan.AutoYouTubePlanService:
+    return dashboard_auto_youtube_plan.AutoYouTubePlanService(
+        state_store=dashboard_youtube_upload_state.YouTubeUploadStateStore.from_dashboard_dir(
+            DEFAULT_DASHBOARD_DIR
+        ),
+        media_policy=dashboard_media.MediaPathPolicy(MEDIA_ROOT),
+        metadata_builder=build_youtube_metadata,
+    )
+
+
+def admit_auto_youtube_intent(
+    job_id: str, item_id: str, completion_settings: Mapping[str, Any]
+) -> str:
+    outcome = _auto_youtube_handoff_service().admit_pending(
+        job_id,
+        item_id,
+        plan_inputs=dashboard_auto_youtube_plan.freeze_plan_inputs(
+            completion_settings
+        ),
+    )
+    if outcome in {"created", "pending"}:
+        _auto_youtube_plan_service().reconcile()
+    return outcome
 
 
 def resolve_completed_recording_output(

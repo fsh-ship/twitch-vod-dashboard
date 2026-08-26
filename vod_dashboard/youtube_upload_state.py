@@ -27,9 +27,14 @@ MAX_IDENTIFIER_LENGTH = 128
 MAX_REASON_LENGTH = 64
 MAX_TIMESTAMP_LENGTH = 40
 MAX_SIZE_BYTES = 2**63 - 1
+MAX_TITLE_LENGTH = 95
+MAX_DESCRIPTION_LENGTH = 5_000
+MAX_TEMPLATE_LENGTH = 8_000
+MAX_TAGS = 100
+MAX_TAG_LENGTH = 100
 
 UPLOAD_STATES = frozenset({
-    "intent_pending", "upload_queued", "transfer_started", "video_confirmed",
+    "intent_pending", "plan_ready", "upload_queued", "transfer_started", "video_confirmed",
     "playlist_pending", "completed", "blocked_youtube", "needs_attention",
     "cancelled",
 })
@@ -39,7 +44,8 @@ PLAYLIST_STATES = frozenset({
 REASON_CODES = frozenset({
     "youtube_not_connected", "token_refresh_failed", "api_unavailable",
     "local_preparation_failed", "upload_outcome_uncertain", "playlist_failed",
-    "playlist_uncertain",
+    "playlist_uncertain", "plan_media_missing", "plan_source_invalid",
+    "plan_preparation_failed", "plan_inputs_missing",
 })
 
 _VOD_ID_RE = re.compile(rf"\d{{6,{MAX_VOD_ID_LENGTH}}}")
@@ -49,7 +55,8 @@ _TIMESTAMP_RE = re.compile(r".+")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 _STATE_TRANSITIONS = {
-    "intent_pending": {"upload_queued", "blocked_youtube", "needs_attention", "cancelled"},
+    "intent_pending": {"plan_ready", "upload_queued", "blocked_youtube", "needs_attention", "cancelled"},
+    "plan_ready": {"upload_queued", "blocked_youtube", "needs_attention", "cancelled"},
     "upload_queued": {"transfer_started", "blocked_youtube", "needs_attention", "cancelled"},
     "transfer_started": {"video_confirmed", "blocked_youtube", "needs_attention"},
     "video_confirmed": {"playlist_pending", "completed", "needs_attention"},
@@ -194,13 +201,107 @@ def _required_attempts(value: Any) -> int:
     return value
 
 
+def _plain_text(value: Any, code: str, *, maximum: int, allow_newlines: bool) -> str:
+    if not isinstance(value, str):
+        raise YouTubeUploadStateValidationError(code)
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    if len(text) > maximum or _CONTROL_RE.search(text.replace("\n", "")):
+        raise YouTubeUploadStateValidationError(code)
+    if not allow_newlines and "\n" in text:
+        raise YouTubeUploadStateValidationError(code)
+    return text
+
+
+def _optional_plan_inputs(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {
+        "title_template", "description_template", "description_fallback",
+        "privacy_status", "category_id", "tags",
+    }:
+        raise YouTubeUploadStateValidationError("invalid_plan_inputs")
+    privacy = value.get("privacy_status")
+    if privacy not in {"private", "unlisted", "public"}:
+        raise YouTubeUploadStateValidationError("invalid_plan_inputs")
+    category_id = _optional_youtube_id(
+        value.get("category_id"), "invalid_plan_inputs"
+    )
+    if category_id is None:
+        raise YouTubeUploadStateValidationError("invalid_plan_inputs")
+    tags = value.get("tags")
+    if not isinstance(tags, list) or len(tags) > MAX_TAGS:
+        raise YouTubeUploadStateValidationError("invalid_plan_inputs")
+    normalized_tags = [
+        _plain_text(tag, "invalid_plan_inputs", maximum=MAX_TAG_LENGTH, allow_newlines=False).strip()
+        for tag in tags
+    ]
+    if any(not tag for tag in normalized_tags):
+        raise YouTubeUploadStateValidationError("invalid_plan_inputs")
+    return {
+        "title_template": _plain_text(value.get("title_template"), "invalid_plan_inputs", maximum=MAX_TEMPLATE_LENGTH, allow_newlines=True),
+        "description_template": _plain_text(value.get("description_template"), "invalid_plan_inputs", maximum=MAX_TEMPLATE_LENGTH, allow_newlines=True),
+        "description_fallback": _plain_text(value.get("description_fallback"), "invalid_plan_inputs", maximum=MAX_TEMPLATE_LENGTH, allow_newlines=True),
+        "privacy_status": privacy,
+        "category_id": category_id,
+        "tags": normalized_tags,
+    }
+
+
+def _optional_upload_plan(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {
+        "title", "description", "privacy_status", "category_id", "tags"
+    }:
+        raise YouTubeUploadStateValidationError("invalid_upload_plan")
+    privacy = value.get("privacy_status")
+    if privacy not in {"private", "unlisted", "public"}:
+        raise YouTubeUploadStateValidationError("invalid_upload_plan")
+    category_id = _optional_youtube_id(
+        value.get("category_id"), "invalid_upload_plan"
+    )
+    if category_id is None:
+        raise YouTubeUploadStateValidationError("invalid_upload_plan")
+    title = _plain_text(
+        value.get("title"), "invalid_upload_plan", maximum=MAX_TITLE_LENGTH,
+        allow_newlines=False,
+    )
+    description = _plain_text(
+        value.get("description"), "invalid_upload_plan",
+        maximum=MAX_DESCRIPTION_LENGTH, allow_newlines=True,
+    )
+    if not title or any(character in "<>" for character in title + description):
+        raise YouTubeUploadStateValidationError("invalid_upload_plan")
+    tags = value.get("tags")
+    if not isinstance(tags, list) or len(tags) > MAX_TAGS:
+        raise YouTubeUploadStateValidationError("invalid_upload_plan")
+    normalized_tags = [
+        _plain_text(tag, "invalid_upload_plan", maximum=MAX_TAG_LENGTH, allow_newlines=False).strip()
+        for tag in tags
+    ]
+    if any(not tag for tag in normalized_tags):
+        raise YouTubeUploadStateValidationError("invalid_upload_plan")
+    return {
+        "title": title,
+        "description": description,
+        "privacy_status": privacy,
+        "category_id": category_id,
+        "tags": normalized_tags,
+    }
+
+
 def _normalize_record(value: Any, *, key: str) -> UploadRecord:
     required_fields = {
         "streamer", "twitch_vod_id", "source_download_job_id", "source_download_item_id",
         "media_path", "size_bytes", "state", "upload_job_id", "attempts",
         "youtube_video_id", "playlist_id", "playlist_state", "reason", "created_at", "updated_at",
     }
-    if not isinstance(value, Mapping) or set(value) != required_fields:
+    allowed_fields = required_fields | {"plan_inputs", "upload_plan"}
+    if not isinstance(value, Mapping) or not (
+        set(value) == required_fields
+        or set(value) == (required_fields | {"plan_inputs"})
+        or set(value) == allowed_fields
+    ):
         raise YouTubeUploadStateLoadError("invalid_record")
     try:
         streamer = _required_streamer(value.get("streamer"))
@@ -224,7 +325,13 @@ def _normalize_record(value: Any, *, key: str) -> UploadRecord:
             raise YouTubeUploadStateValidationError("invalid_record")
         if state in {"video_confirmed", "playlist_pending", "completed"} and youtube_video_id is None:
             raise YouTubeUploadStateValidationError("invalid_record")
-        return {
+        plan_inputs = _optional_plan_inputs(value.get("plan_inputs"))
+        upload_plan = _optional_upload_plan(value.get("upload_plan"))
+        if state == "plan_ready" and upload_plan is None:
+            raise YouTubeUploadStateValidationError("invalid_record")
+        if upload_plan is not None and plan_inputs is None:
+            raise YouTubeUploadStateValidationError("invalid_record")
+        normalized = {
             "streamer": streamer,
             "twitch_vod_id": vod_id,
             "source_download_job_id": _required_identifier(value.get("source_download_job_id"), "invalid_source_download_job_id"),
@@ -241,6 +348,11 @@ def _normalize_record(value: Any, *, key: str) -> UploadRecord:
             "created_at": _required_timestamp(value.get("created_at")),
             "updated_at": _required_timestamp(value.get("updated_at")),
         }
+        if plan_inputs is not None:
+            normalized["plan_inputs"] = plan_inputs
+        if upload_plan is not None:
+            normalized["upload_plan"] = upload_plan
+        return normalized
     except YouTubeUploadStateValidationError as exc:
         raise YouTubeUploadStateLoadError("invalid_record") from exc
 
@@ -343,6 +455,7 @@ class YouTubeUploadStateStore:
         media_path: Any,
         size_bytes: Any,
         playlist_id: Any = None,
+        plan_inputs: Any = None,
     ) -> Tuple[UploadRecord, bool]:
         """Durably claim one VOD once; later calls return its untouched owner."""
         canonical_streamer = _required_streamer(streamer)
@@ -359,6 +472,7 @@ class YouTubeUploadStateStore:
         frozen_playlist_id = _optional_youtube_id(
             playlist_id, "invalid_playlist_id"
         )
+        frozen_plan_inputs = _optional_plan_inputs(plan_inputs)
         with self._lock:
             state = self._load_locked()
             existing = state["uploads"].get(key)
@@ -381,6 +495,8 @@ class YouTubeUploadStateStore:
                 "created_at": now,
                 "updated_at": now,
             }
+            if frozen_plan_inputs is not None:
+                record["plan_inputs"] = frozen_plan_inputs
             state["uploads"][key] = record
             self._write_locked(state)
             return deepcopy(record), True
@@ -442,6 +558,36 @@ class YouTubeUploadStateStore:
                 raise YouTubeUploadStateValidationError("invalid_record") from exc
             if normalized == existing:
                 return deepcopy(existing)
+            document["uploads"][key] = normalized
+            self._write_locked(document)
+            return deepcopy(normalized)
+
+    def set_upload_plan(
+        self, streamer: Any, twitch_vod_id: Any, plan: Any
+    ) -> UploadRecord:
+        """Atomically freeze a first plan and advance one intent to plan_ready."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        normalized_plan = _optional_upload_plan(plan)
+        if normalized_plan is None:
+            raise YouTubeUploadStateValidationError("invalid_upload_plan")
+        with self._lock:
+            document = self._load_locked()
+            existing = document["uploads"].get(key)
+            if existing is None:
+                raise YouTubeUploadStateValidationError("upload_not_found")
+            if existing.get("upload_plan") is not None:
+                return deepcopy(existing)
+            if existing.get("state") != "intent_pending":
+                raise YouTubeUploadStateValidationError("invalid_plan_transition")
+            candidate = deepcopy(existing)
+            candidate["upload_plan"] = normalized_plan
+            candidate["state"] = "plan_ready"
+            candidate["reason"] = None
+            candidate["updated_at"] = _timestamp_from_clock(self._clock)
+            try:
+                normalized = _normalize_record(candidate, key=key)
+            except YouTubeUploadStateLoadError as exc:
+                raise YouTubeUploadStateValidationError("invalid_record") from exc
             document["uploads"][key] = normalized
             self._write_locked(document)
             return deepcopy(normalized)

@@ -3733,6 +3733,7 @@ def run_download_job(
                                 str(job.get("twitch_vod_id") or ""),
                             )
                             decision = None
+                            completion_settings: Optional[Dict[str, Any]] = None
                             if dependencies.auto_youtube_admission_decision is not None:
                                 try:
                                     completion_settings = dependencies.load_settings()
@@ -3795,7 +3796,7 @@ def run_download_job(
                             ):
                                 try:
                                     dependencies.admit_auto_youtube_intent(
-                                        job_id, item_id
+                                        job_id, item_id, completion_settings or {}
                                     )
                                 except Exception:
                                     dependencies.append_log(

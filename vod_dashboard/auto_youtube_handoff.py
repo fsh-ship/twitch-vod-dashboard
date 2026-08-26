@@ -110,7 +110,9 @@ class AutoYouTubeHandoffService:
             return "pending"
         return "blocked"
 
-    def admit_pending(self, job_id: str, item_id: str) -> str:
+    def admit_pending(
+        self, job_id: str, item_id: str, *, plan_inputs: Any = None
+    ) -> str:
         """Claim a durable pending intent after source completion persistence."""
         job = self._job_manager.get_job(job_id) or {}
         source = _completed_source(job, item_id)
@@ -126,7 +128,9 @@ class AutoYouTubeHandoffService:
             return self._block(job_id, item_id, "upload_state_unhealthy")
         try:
             record, _created = self._state_store.create_intent_if_absent(
-                **source, playlist_id=self._playlist_id(job) or None
+                **source,
+                playlist_id=self._playlist_id(job) or None,
+                plan_inputs=plan_inputs,
             )
         except YouTubeUploadStateLoadError:
             return self._block(job_id, item_id, "upload_state_unhealthy")

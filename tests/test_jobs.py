@@ -1774,7 +1774,7 @@ class DownloadWorkerTests(unittest.TestCase):
 
         run_download_job(job_id, self.manager, dependencies)
 
-        admit.assert_called_once_with(job_id, "1-item-1")
+        admit.assert_called_once_with(job_id, "1-item-1", enabled)
         self.assertEqual(
             self.manager.jobs[job_id]["item_auto_youtube_handoffs"],
             ["intent_pending"],
