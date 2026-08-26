@@ -133,7 +133,7 @@ class AutoYouTubeMaterializationService:
 
     def materialize_record(self, record: Mapping[str, Any]) -> str:
         state = record.get("state")
-        if state not in {"plan_ready", "upload_queued"}:
+        if state not in {"parts_ready", "upload_queued"}:
             return "ignored"
         try:
             key = canonical_upload_key(
@@ -155,7 +155,19 @@ class AutoYouTubeMaterializationService:
                 return "queued"
             return self._attention(record, "materialization_consistency_error")
 
-        # A plan-ready record must still describe the exact P8c media result.
+        # Only a finalized one-part manifest is eligible in P8f. Multipart job
+        # materialization remains a later slice.
+        parts = record.get("parts")
+        if (
+            not isinstance(parts, list)
+            or len(parts) != 1
+            or parts[0].get("source_kind") != "original"
+            or parts[0].get("upload_state") != "ready"
+            or parts[0].get("media_path") != record.get("media_path")
+            or parts[0].get("size_bytes") != record.get("size_bytes")
+            or parts[0].get("duration_seconds") != record.get("source_duration_seconds")
+        ):
+            return self._attention(record, "materialization_consistency_error")
         try:
             source_path = self._media_policy.resolve_media_path(
                 record.get("media_path"), must_exist=False

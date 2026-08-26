@@ -37,7 +37,7 @@ PLAYLIST_STATES = frozenset({"not_requested", "pending", "inserting", "confirmed
 SOURCE_KINDS = frozenset({"original", "generated"})
 SPLIT_MODES = frozenset({"stream_copy"})
 PART_PLAN_VERSION = 1
-REASON_CODES = frozenset({"youtube_not_connected", "token_refresh_failed", "api_unavailable", "local_preparation_failed", "upload_outcome_uncertain", "playlist_failed", "playlist_uncertain", "plan_media_missing", "plan_source_invalid", "plan_preparation_failed", "plan_inputs_missing", "materialization_media_missing", "materialization_source_invalid", "materialization_consistency_error", "multipart_preparation_required", "parts_preparation_failed", "parts_manifest_invalid"})
+REASON_CODES = frozenset({"youtube_not_connected", "token_refresh_failed", "api_unavailable", "local_preparation_failed", "upload_outcome_uncertain", "playlist_failed", "playlist_uncertain", "plan_media_missing", "plan_source_invalid", "plan_preparation_failed", "plan_inputs_missing", "materialization_media_missing", "materialization_source_invalid", "materialization_consistency_error", "multipart_preparation_required", "parts_preparation_failed", "parts_manifest_invalid", "insufficient_storage", "storage_unavailable"})
 
 _VOD_ID_RE = re.compile(rf"\d{{6,{MAX_VOD_ID_LENGTH}}}")
 _IDENTIFIER_RE = re.compile(rf"[A-Za-z0-9][A-Za-z0-9_.-]{{0,{MAX_IDENTIFIER_LENGTH - 1}}}")
@@ -160,7 +160,9 @@ def _record_v2(v: Any, key: str) -> UploadRecord:
         plan_version = v.get("part_plan_version")
         if plan_version is not None and (isinstance(plan_version, bool) or plan_version != PART_PLAN_VERSION): raise YouTubeUploadStateValidationError("invalid_record")
         split = _split(v.get("split"))
-        if (parts and plan_version is None) or (not parts and (plan_version is not None or split is not None)): raise YouTubeUploadStateValidationError("invalid_record")
+        if parts and plan_version is None: raise YouTubeUploadStateValidationError("invalid_record")
+        if not parts and (plan_version is None) != (split is None): raise YouTubeUploadStateValidationError("invalid_record")
+        if not parts and split is not None and v.get("state") not in {"parts_preparing", "needs_attention"}: raise YouTubeUploadStateValidationError("invalid_record")
         inputs = _plan_inputs(v.get("plan_inputs")); plan = _upload_plan(v.get("upload_plan"))
         if (plan is not None and inputs is None) or (v["state"] == "plan_ready" and plan is None): raise YouTubeUploadStateValidationError("invalid_record")
         return {"streamer": streamer, "twitch_vod_id": vod_id, "source_download_job_id": _identifier(v.get("source_download_job_id"), "invalid_source_download_job_id"), "source_download_item_id": _identifier(v.get("source_download_item_id"), "invalid_source_download_item_id"), "media_path": _path(v.get("media_path")), "size_bytes": _size(v.get("size_bytes")), "source_duration_seconds": _duration(v.get("source_duration_seconds"), "invalid_source_duration_seconds"), "state": v["state"], "upload_job_id": None if v.get("upload_job_id") is None else _identifier(v.get("upload_job_id"), "invalid_upload_job_id"), "playlist_id": _youtube_id(v.get("playlist_id"), "invalid_playlist_id"), "plan_inputs": inputs, "upload_plan": plan, "part_plan_version": plan_version, "split": split, "parts": parts, "reason": _reason(v.get("reason")), "created_at": _timestamp(v.get("created_at")), "updated_at": _timestamp(v.get("updated_at"))}
@@ -248,3 +250,16 @@ class YouTubeUploadStateStore:
             if old["upload_plan"] is not None: return deepcopy(old)
             if old["state"] != "intent_pending": raise YouTubeUploadStateValidationError("invalid_plan_transition")
             new = deepcopy(old); new.update({"upload_plan": plan, "state": "plan_ready", "reason": None, "updated_at": _now(self._clock)}); doc["uploads"][key] = _record_v2(new, key); self._write_locked(doc); return deepcopy(doc["uploads"][key])
+    def set_preparation(self, streamer: Any, twitch_vod_id: Any, *, source_duration_seconds: Any, state: str, split: Any, parts: Any, reason: Any = None) -> UploadRecord:
+        """Atomically persist one finalized original or pending split plan."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        if state not in {"parts_ready", "parts_preparing", "needs_attention"}: raise YouTubeUploadStateValidationError("invalid_preparation_state")
+        with self._lock:
+            doc = self._load_locked(); old = doc["uploads"].get(key)
+            if old is None: raise YouTubeUploadStateValidationError("upload_not_found")
+            if old["state"] not in {"plan_ready", "parts_preparing", "parts_ready", "needs_attention"}: raise YouTubeUploadStateValidationError("invalid_preparation_transition")
+            new = deepcopy(old); new.update({"source_duration_seconds": source_duration_seconds, "state": state, "part_plan_version": PART_PLAN_VERSION, "split": split, "parts": parts, "reason": reason, "updated_at": _now(self._clock)})
+            normalized = _record_v2(new, key)
+            if old["state"] in {"parts_preparing", "parts_ready", "needs_attention"} and any(normalized[name] != old[name] for name in ("source_duration_seconds", "part_plan_version", "split", "parts")):
+                raise YouTubeUploadStateValidationError("preparation_immutable")
+            doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)

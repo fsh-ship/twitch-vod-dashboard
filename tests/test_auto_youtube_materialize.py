@@ -65,13 +65,28 @@ class AutoYouTubeMaterializationTests(unittest.TestCase):
                 "tags": ["twitch"],
             },
         )
-        return self.ledger.set_upload_plan("bearlychen", VOD_ID, {
+        self.ledger.set_upload_plan("bearlychen", VOD_ID, {
             "title": "Frozen title",
             "description": "Frozen description",
             "privacy_status": "unlisted",
             "category_id": "20",
             "tags": ["twitch"],
         })
+        return self.ledger.set_preparation(
+            "bearlychen", VOD_ID,
+            source_duration_seconds=1.0,
+            state="parts_ready",
+            split=None,
+            parts=[{
+                "index": 1, "media_path": "bearlychen/vod.mkv",
+                "size_bytes": self.path.stat().st_size,
+                "duration_seconds": 1.0, "source_kind": "original",
+                "upload_item_id": None, "upload_state": "ready",
+                "attempts": 0, "youtube_video_id": None,
+                "playlist_state": "pending" if playlist_id else "not_requested",
+                "reason": None,
+            }],
+        )
 
     def _service(self, manager=None):
         return auto_youtube_materialize.AutoYouTubeMaterializationService(
@@ -80,7 +95,7 @@ class AutoYouTubeMaterializationTests(unittest.TestCase):
             media_policy=MediaPathPolicy(self.media_root),
         )
 
-    def test_plan_ready_materializes_one_deferred_job_without_worker_or_api_activity(self):
+    def test_parts_ready_materializes_one_deferred_job_without_worker_or_api_activity(self):
         self._ready_record()
         with mock.patch.object(self.manager, "start_worker") as start_worker:
             self.assertEqual(self._service().reconcile()["queued"], 1)
@@ -89,8 +104,9 @@ class AutoYouTubeMaterializationTests(unittest.TestCase):
         record = self.ledger.get("bearlychen", VOD_ID)
         self.assertEqual(record["state"], "upload_queued")
         self.assertEqual(record["upload_job_id"], "1")
-        self.assertEqual(record["parts"], [])
-        self.assertIsNone(record["source_duration_seconds"])
+        self.assertEqual(len(record["parts"]), 1)
+        self.assertEqual(record["parts"][0]["source_kind"], "original")
+        self.assertEqual(record["source_duration_seconds"], 1.0)
         job = self.manager.get_job("1")
         self.assertEqual(job["origin"], "auto_youtube")
         self.assertTrue(job["execution_deferred"])
@@ -114,7 +130,7 @@ class AutoYouTubeMaterializationTests(unittest.TestCase):
             side_effect=youtube_upload_state.YouTubeUploadStatePersistenceError("full"),
         ):
             self.assertEqual(service.reconcile()["pending"], 1)
-        self.assertEqual(self.ledger.get("bearlychen", VOD_ID)["state"], "plan_ready")
+        self.assertEqual(self.ledger.get("bearlychen", VOD_ID)["state"], "parts_ready")
         self.assertEqual(len(self.manager.snapshot_jobs()), 1)
 
         self.assertEqual(service.reconcile()["queued"], 1)
@@ -182,7 +198,7 @@ class AutoYouTubeMaterializationTests(unittest.TestCase):
         self.assertEqual(self.ledger.get("bearlychen", VOD_ID)["reason"], "materialization_source_invalid")
         self.assertEqual(self.manager.snapshot_jobs(), [])
 
-    def test_job_creation_persistence_failure_leaves_plan_ready_and_no_runtime_job(self):
+    def test_job_creation_persistence_failure_leaves_parts_ready_and_no_runtime_job(self):
         self._ready_record()
         failing_manager = self._manager()
         with mock.patch.object(
@@ -190,14 +206,14 @@ class AutoYouTubeMaterializationTests(unittest.TestCase):
             side_effect=job_store.JobStorePersistenceError("jobs unavailable"),
         ):
             self.assertEqual(self._service(failing_manager).reconcile()["pending"], 1)
-        self.assertEqual(self.ledger.get("bearlychen", VOD_ID)["state"], "plan_ready")
+        self.assertEqual(self.ledger.get("bearlychen", VOD_ID)["state"], "parts_ready")
         self.assertEqual(failing_manager.snapshot_jobs(), [])
 
-    def test_unhealthy_job_store_leaves_plan_ready_without_creating_a_job(self):
+    def test_unhealthy_job_store_leaves_parts_ready_without_creating_a_job(self):
         self._ready_record()
         self.manager._persistence_health["healthy"] = False
         self.assertEqual(self._service().reconcile()["pending"], 1)
-        self.assertEqual(self.ledger.get("bearlychen", VOD_ID)["state"], "plan_ready")
+        self.assertEqual(self.ledger.get("bearlychen", VOD_ID)["state"], "parts_ready")
         self.assertEqual(self.manager.snapshot_jobs(), [])
 
     def test_conflicting_job_context_fails_closed_without_selecting_a_job(self):
