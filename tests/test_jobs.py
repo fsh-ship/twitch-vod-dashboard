@@ -1420,6 +1420,9 @@ class DownloadWorkerTests(unittest.TestCase):
         enqueue=None,
         stdout_lines=None,
         auto_result=None,
+        settings_loader=None,
+        auto_youtube_admission=None,
+        auto_youtube_admit=None,
     ):
         process_calls = []
         returncodes = iter(returncodes)
@@ -1446,7 +1449,7 @@ class DownloadWorkerTests(unittest.TestCase):
         snapshots = iter(({"old.mp4": 1.0}, {"old.mp4": 1.0, "new.mp4": 2.0}) * 10)
         candidate_paths = list(candidates)
         dependencies = DownloadWorkerDependencies(
-            load_settings=lambda: dict(self.settings),
+            load_settings=settings_loader or (lambda: dict(self.settings)),
             clean_postprocess_mode=lambda value: mode or value or "after_each",
             clean_rate_limit=lambda value: str(value or ""),
             append_log=self.manager.append_job_log,
@@ -1464,6 +1467,8 @@ class DownloadWorkerTests(unittest.TestCase):
             clock=lambda: 123.0,
             enqueue_upload_job=enqueue,
             resolve_auto_vod_completed_output=auto_result,
+            auto_youtube_admission_decision=auto_youtube_admission,
+            admit_auto_youtube_intent=auto_youtube_admit,
         )
         return dependencies, process_calls, list_paths
 
@@ -1664,6 +1669,120 @@ class DownloadWorkerTests(unittest.TestCase):
             "example_streamer/video.mp4",
         )
         self.assertIn("download-only", "\n".join(self.manager.jobs[job_id]["log"]))
+
+    def test_auto_youtube_uses_settings_reloaded_at_auto_vod_completion(self):
+        job_id = self.manager.create_download_job(
+            ["https://www.twitch.tv/videos/1234567890"],
+            "Automatic Twitch VOD: example_streamer",
+            origin="auto_vod",
+            streamer="example_streamer",
+            twitch_vod_id="1234567890",
+            attempt=1,
+            post_download_mode="download_only",
+        )
+        settings_at_start = {
+            **self.settings,
+            "auto_youtube_enabled": True,
+            "streamer_profiles": {
+                "example_streamer": {"auto_youtube_upload": True}
+            },
+        }
+        settings_at_completion = {
+            **settings_at_start,
+            "auto_youtube_enabled": False,
+        }
+        settings_loader = mock.Mock(
+            side_effect=[settings_at_start, settings_at_completion]
+        )
+        admission = mock.Mock(
+            side_effect=lambda settings, _streamer: {
+                "handoff": (
+                    "intent_pending"
+                    if settings["auto_youtube_enabled"]
+                    else "not_eligible"
+                ),
+                "reason": "" if settings["auto_youtube_enabled"] else "global_disabled",
+                "playlist_id": "",
+            }
+        )
+        admit = mock.Mock()
+        dependencies, _, _ = self.dependencies(
+            stdout_lines=[
+                "VOD-DASHBOARD-FINAL-FILE=/temporary/example_streamer/video.mp4\n"
+            ],
+            auto_result=lambda *_args: {
+                "completed_media_path": "example_streamer/video.mp4",
+                "completed_media_size_bytes": 123,
+                "completed_twitch_vod_id": "1234567890",
+            },
+            settings_loader=settings_loader,
+            auto_youtube_admission=admission,
+            auto_youtube_admit=admit,
+        )
+
+        run_download_job(job_id, self.manager, dependencies)
+
+        admission.assert_called_once_with(
+            settings_at_completion, "example_streamer"
+        )
+        admit.assert_not_called()
+        self.assertEqual(
+            self.manager.jobs[job_id]["item_auto_youtube_handoffs"],
+            ["not_eligible"],
+        )
+
+    def test_auto_youtube_can_admit_when_enabled_before_completion(self):
+        job_id = self.manager.create_download_job(
+            ["https://www.twitch.tv/videos/1234567890"],
+            "Automatic Twitch VOD: example_streamer",
+            origin="auto_vod",
+            streamer="example_streamer",
+            twitch_vod_id="1234567890",
+            attempt=1,
+            post_download_mode="download_only",
+        )
+        disabled = {**self.settings, "auto_youtube_enabled": False}
+        enabled = {
+            **disabled,
+            "auto_youtube_enabled": True,
+            "streamer_profiles": {
+                "example_streamer": {"auto_youtube_upload": True}
+            },
+        }
+        admit = mock.Mock()
+        dependencies, _, _ = self.dependencies(
+            stdout_lines=[
+                "VOD-DASHBOARD-FINAL-FILE=/temporary/example_streamer/video.mp4\n"
+            ],
+            auto_result=lambda *_args: {
+                "completed_media_path": "example_streamer/video.mp4",
+                "completed_media_size_bytes": 123,
+                "completed_twitch_vod_id": "1234567890",
+            },
+            settings_loader=mock.Mock(side_effect=[disabled, enabled]),
+            auto_youtube_admission=lambda settings, _streamer: {
+                "handoff": (
+                    "intent_pending"
+                    if settings["auto_youtube_enabled"]
+                    else "not_eligible"
+                ),
+                "reason": "" if settings["auto_youtube_enabled"] else "global_disabled",
+                "playlist_id": "PLAYLIST_AT_COMPLETION",
+            },
+            auto_youtube_admit=admit,
+        )
+
+        run_download_job(job_id, self.manager, dependencies)
+
+        admit.assert_called_once_with(job_id, "1-item-1")
+        self.assertEqual(
+            self.manager.jobs[job_id]["item_auto_youtube_handoffs"],
+            ["intent_pending"],
+        )
+        self.assertEqual(
+            self.manager.jobs[job_id]["item_auto_youtube_playlist_ids"],
+            ["PLAYLIST_AT_COMPLETION"],
+        )
 
     def test_missing_subprocess_sets_not_found_returncode(self):
         job_id = self.create_job()

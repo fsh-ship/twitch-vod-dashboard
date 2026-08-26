@@ -342,6 +342,7 @@ class YouTubeUploadStateStore:
         source_download_item_id: Any,
         media_path: Any,
         size_bytes: Any,
+        playlist_id: Any = None,
     ) -> Tuple[UploadRecord, bool]:
         """Durably claim one VOD once; later calls return its untouched owner."""
         canonical_streamer = _required_streamer(streamer)
@@ -355,6 +356,9 @@ class YouTubeUploadStateStore:
             "media_path": _required_relative_media_path(media_path),
             "size_bytes": _required_size_bytes(size_bytes),
         }
+        frozen_playlist_id = _optional_youtube_id(
+            playlist_id, "invalid_playlist_id"
+        )
         with self._lock:
             state = self._load_locked()
             existing = state["uploads"].get(key)
@@ -369,8 +373,10 @@ class YouTubeUploadStateStore:
                 "upload_job_id": None,
                 "attempts": 0,
                 "youtube_video_id": None,
-                "playlist_id": None,
-                "playlist_state": "not_requested",
+                "playlist_id": frozen_playlist_id,
+                "playlist_state": (
+                    "pending" if frozen_playlist_id is not None else "not_requested"
+                ),
                 "reason": None,
                 "created_at": now,
                 "updated_at": now,

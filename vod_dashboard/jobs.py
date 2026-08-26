@@ -16,6 +16,8 @@ import time
 from typing import Any, Callable, Dict, MutableMapping, Optional
 
 from vod_dashboard.job_store import (
+    AUTO_YOUTUBE_HANDOFF_REASONS,
+    AUTO_YOUTUBE_HANDOFF_STATES,
     JobStore,
     JobStoreError,
     JobStoreLoadResult,
@@ -374,6 +376,8 @@ class DownloadWorkerDependencies:
     )
     resolve_auto_vod_completed_output: Optional[Callable[..., Dict[str, Any]]] = None
     download_output_marker: str = DOWNLOAD_FINAL_OUTPUT_MARKER
+    auto_youtube_admission_decision: Optional[Callable[..., Any]] = None
+    admit_auto_youtube_intent: Optional[Callable[..., Any]] = None
 
 
 @dataclass(frozen=True)
@@ -2099,6 +2103,9 @@ class JobManager:
         completed_media_path: str,
         completed_media_size_bytes: int,
         completed_twitch_vod_id: str,
+        auto_youtube_handoff: Optional[str] = None,
+        auto_youtube_handoff_reason: str = "",
+        auto_youtube_playlist_id: str = "",
     ) -> bool:
         """Persist exact Auto VOD media output before exposing completion."""
         with self._condition:
@@ -2119,6 +2126,13 @@ class JobManager:
                 job.get("twitch_vod_id") or ""
             ):
                 raise ValueError("Completed VOD identity does not match the job.")
+            if auto_youtube_handoff is not None:
+                if (
+                    auto_youtube_handoff not in AUTO_YOUTUBE_HANDOFF_STATES
+                    or auto_youtube_handoff_reason
+                    not in AUTO_YOUTUBE_HANDOFF_REASONS
+                ):
+                    raise ValueError("Invalid Auto YouTube handoff state.")
             previous = {
                 key: job.get(key)
                 for key in (
@@ -2127,9 +2141,27 @@ class JobManager:
                     "completed_twitch_vod_id",
                 )
             }
+            previous_handoff = {
+                key: job.get(key)
+                for key in (
+                    "item_auto_youtube_handoffs",
+                    "item_auto_youtube_handoff_reasons",
+                    "item_auto_youtube_playlist_ids",
+                )
+            }
             job["completed_media_path"] = str(completed_media_path)
             job["completed_media_size_bytes"] = completed_media_size_bytes
             job["completed_twitch_vod_id"] = str(completed_twitch_vod_id)
+            if auto_youtube_handoff is not None:
+                job["item_auto_youtube_handoffs"] = [
+                    auto_youtube_handoff
+                ]
+                job["item_auto_youtube_handoff_reasons"] = [
+                    str(auto_youtube_handoff_reason or "")
+                ]
+                job["item_auto_youtube_playlist_ids"] = [
+                    str(auto_youtube_playlist_id or "")
+                ]
             self._set_item_state_locked(job, index, "completed")
             if self._lane_active["download"] == (str(job_id), str(item_id)):
                 self._lane_active["download"] = None
@@ -2155,7 +2187,70 @@ class JobManager:
                             current.pop(key, None)
                         else:
                             current[key] = value
+                    for key, value in previous_handoff.items():
+                        if value is None:
+                            current.pop(key, None)
+                        else:
+                            current[key] = value
                 self._mark_required_failure(str(job_id), item_id)
+                raise
+            self._condition.notify_all()
+            return True
+
+    def set_auto_youtube_handoff(
+        self,
+        job_id: str,
+        item_id: str,
+        handoff: str,
+        *,
+        reason: str = "",
+    ) -> bool:
+        """Durably update one already-completed Auto VOD handoff marker."""
+        if (
+            handoff not in AUTO_YOUTUBE_HANDOFF_STATES
+            or reason not in AUTO_YOUTUBE_HANDOFF_REASONS
+        ):
+            raise ValueError("Invalid Auto YouTube handoff state.")
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if (
+                job is None
+                or job.get("origin") != "auto_vod"
+                or job.get("item_states") != ["completed"]
+                or not all(
+                    job.get(key) is not None
+                    for key in (
+                        "completed_media_path",
+                        "completed_media_size_bytes",
+                        "completed_twitch_vod_id",
+                    )
+                )
+            ):
+                return False
+            index = self._item_index_locked(job, item_id)
+            if index is None:
+                return False
+            handoffs = list(job.get("item_auto_youtube_handoffs") or [""])
+            reasons = list(job.get("item_auto_youtube_handoff_reasons") or [""])
+            playlists = list(job.get("item_auto_youtube_playlist_ids") or [""])
+            if len(handoffs) != 1 or len(reasons) != 1 or len(playlists) != 1:
+                return False
+            if handoff in {"intent_pending", "intent_created"} and reason:
+                raise ValueError("Eligible Auto YouTube handoff cannot have a reason.")
+            previous = (handoffs[0], reasons[0], playlists[0])
+            handoffs[0] = handoff
+            reasons[0] = reason
+            job["item_auto_youtube_handoffs"] = handoffs
+            job["item_auto_youtube_handoff_reasons"] = reasons
+            job["item_auto_youtube_playlist_ids"] = playlists
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            try:
+                self._persist_required(snapshot)
+            except JobPersistenceRequiredError:
+                job["item_auto_youtube_handoffs"] = [previous[0]]
+                job["item_auto_youtube_handoff_reasons"] = [previous[1]]
+                job["item_auto_youtube_playlist_ids"] = [previous[2]]
                 raise
             self._condition.notify_all()
             return True
@@ -3637,6 +3732,39 @@ def run_download_job(
                                 settings,
                                 str(job.get("twitch_vod_id") or ""),
                             )
+                            decision = None
+                            if dependencies.auto_youtube_admission_decision is not None:
+                                try:
+                                    completion_settings = dependencies.load_settings()
+                                    decision = dependencies.auto_youtube_admission_decision(
+                                        completion_settings,
+                                        job.get("streamer"),
+                                    )
+                                except Exception:
+                                    decision = {
+                                        "handoff": "handoff_blocked",
+                                        "reason": "settings_unavailable",
+                                        "playlist_id": "",
+                                    }
+                            decision_handoff = (
+                                getattr(decision, "handoff", None)
+                                if decision is not None
+                                else None
+                            )
+                            decision_reason = (
+                                getattr(decision, "reason", "")
+                                if decision is not None
+                                else ""
+                            )
+                            decision_playlist_id = (
+                                getattr(decision, "playlist_id", "")
+                                if decision is not None
+                                else ""
+                            )
+                            if isinstance(decision, dict):
+                                decision_handoff = decision.get("handoff")
+                                decision_reason = decision.get("reason", "")
+                                decision_playlist_id = decision.get("playlist_id", "")
                             persisted = manager.finish_auto_vod_download_with_result(
                                 job_id,
                                 item_id,
@@ -3649,11 +3777,31 @@ def run_download_job(
                                 completed_twitch_vod_id=str(
                                     result["completed_twitch_vod_id"]
                                 ),
+                                auto_youtube_handoff=decision_handoff,
+                                auto_youtube_handoff_reason=str(
+                                    decision_reason or ""
+                                ),
+                                auto_youtube_playlist_id=str(
+                                    decision_playlist_id or ""
+                                ),
                             )
                             if not persisted:
                                 raise RuntimeError(
                                     "Auto VOD completion could not be persisted."
                                 )
+                            if (
+                                decision_handoff == "intent_pending"
+                                and dependencies.admit_auto_youtube_intent is not None
+                            ):
+                                try:
+                                    dependencies.admit_auto_youtube_intent(
+                                        job_id, item_id
+                                    )
+                                except Exception:
+                                    dependencies.append_log(
+                                        job_id,
+                                        "Automatic YouTube handoff remains pending for safe reconciliation.",
+                                    )
                         except JobPersistenceRequiredError:
                             failed += 1
                             dependencies.append_log(

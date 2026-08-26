@@ -23,6 +23,7 @@ from vod_dashboard import auto_recorder as dashboard_auto_recorder
 from vod_dashboard import auto_recording as dashboard_auto_recording
 from vod_dashboard import auto_recording_runtime as dashboard_auto_runtime
 from vod_dashboard import auto_vod as dashboard_auto_vod
+from vod_dashboard import auto_youtube_handoff as dashboard_auto_youtube_handoff
 from vod_dashboard import auto_vod_result as dashboard_auto_vod_result
 from vod_dashboard import auto_vod_coordinator as dashboard_auto_vod_coordinator
 from vod_dashboard import auto_vod_runtime as dashboard_auto_vod_runtime
@@ -39,6 +40,7 @@ from vod_dashboard import settings as dashboard_settings
 from vod_dashboard import twitch as dashboard_twitch
 from vod_dashboard import vod_search as dashboard_vod_search
 from vod_dashboard import youtube as dashboard_youtube
+from vod_dashboard import youtube_upload_state as dashboard_youtube_upload_state
 from vod_dashboard.twitch import (
     canonical_twitch_vod_url,
     entry_date,
@@ -907,6 +909,16 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             )
             return dict(WORKER_RUNTIME_RESULT)
 
+        auto_youtube_handoff = {"created": 0, "blocked": 0, "pending": 0}
+        try:
+            auto_youtube_handoff = _auto_youtube_handoff_service(
+                manager
+            ).reconcile()
+        except Exception:
+            app.logger.error(
+                "Auto YouTube handoff reconciliation failed (handoff_reconciliation_failed)."
+            )
+
         monitor_started = False
         auto_vod_monitor_started = False
         monitor_reason = ""
@@ -955,6 +967,7 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             "source": restore.source,
             "monitor_started": monitor_started,
             "auto_vod_monitor_started": auto_vod_monitor_started,
+            "auto_youtube_handoff": auto_youtube_handoff,
         }
         app.logger.info(
             "Worker runtime initialized: loaded=%d discarded=%d "
@@ -1254,10 +1267,35 @@ def run_download_job(job_id: str) -> None:
         enqueue_upload_job=lambda paths, label: create_upload_job(paths, label),
         resolve_auto_vod_completed_output=resolve_completed_auto_vod_output,
         download_output_marker=dashboard_twitch.DOWNLOAD_FINAL_OUTPUT_MARKER,
+        auto_youtube_admission_decision=auto_youtube_admission_decision,
+        admit_auto_youtube_intent=admit_auto_youtube_intent,
     )
     dashboard_jobs.run_download_job(
         job_id, _job_manager_for_compatibility(), dependencies
     )
+
+
+def auto_youtube_admission_decision(
+    settings: Mapping[str, Any], streamer: Any
+) -> dashboard_auto_youtube_handoff.AutoYouTubeAdmission:
+    return dashboard_auto_youtube_handoff.completion_admission(
+        settings, streamer
+    )
+
+
+def _auto_youtube_handoff_service(
+    manager: Optional[dashboard_jobs.JobManager] = None,
+) -> dashboard_auto_youtube_handoff.AutoYouTubeHandoffService:
+    return dashboard_auto_youtube_handoff.AutoYouTubeHandoffService(
+        job_manager=manager or _job_manager_for_compatibility(),
+        state_store=dashboard_youtube_upload_state.YouTubeUploadStateStore.from_dashboard_dir(
+            DEFAULT_DASHBOARD_DIR
+        ),
+    )
+
+
+def admit_auto_youtube_intent(job_id: str, item_id: str) -> str:
+    return _auto_youtube_handoff_service().admit_pending(job_id, item_id)
 
 
 def resolve_completed_recording_output(

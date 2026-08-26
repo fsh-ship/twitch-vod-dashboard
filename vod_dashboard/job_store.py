@@ -64,6 +64,22 @@ DOWNLOAD_POST_MODES = frozenset({"default", "download_only"})
 COMPLETED_MEDIA_EXTENSIONS = frozenset(
     {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 )
+AUTO_YOUTUBE_HANDOFF_STATES = frozenset(
+    {"not_eligible", "intent_pending", "intent_created", "handoff_blocked"}
+)
+AUTO_YOUTUBE_HANDOFF_REASONS = frozenset(
+    {
+        "",
+        "global_disabled",
+        "streamer_disabled",
+        "settings_unavailable",
+        "upload_state_unhealthy",
+        "intent_persistence_failed",
+        "intent_conflict",
+        "intent_missing",
+        "invalid_completed_result",
+    }
+)
 AUTO_VOD_STORAGE_BLOCK_REASONS = frozenset(
     {"insufficient_storage", "storage_unavailable"}
 )
@@ -651,6 +667,79 @@ def _normalize_download(job: Mapping[str, Any], result: Job, count: int) -> None
                 "completed_twitch_vod_id": completed_vod_id,
             }
         )
+    handoff_values = {
+        "item_auto_youtube_handoffs": job.get(
+            "item_auto_youtube_handoffs"
+        ),
+        "item_auto_youtube_handoff_reasons": job.get(
+            "item_auto_youtube_handoff_reasons"
+        ),
+        "item_auto_youtube_playlist_ids": job.get(
+            "item_auto_youtube_playlist_ids"
+        ),
+    }
+    if any(value is not None for value in handoff_values.values()):
+        if (
+            origin != "auto_vod"
+            or count != 1
+            or not all(value is not None for value in handoff_values.values())
+            or not all(value is not None for value in completed_values.values())
+        ):
+            raise JobStoreValidationError("invalid_auto_youtube_handoff")
+        handoffs = _aligned_list(
+            handoff_values["item_auto_youtube_handoffs"],
+            count,
+            "misaligned_item_auto_youtube_handoffs",
+            default=lambda: "",
+        )
+        reasons = _aligned_list(
+            handoff_values["item_auto_youtube_handoff_reasons"],
+            count,
+            "misaligned_item_auto_youtube_handoff_reasons",
+            default=lambda: "",
+        )
+        playlists = _aligned_list(
+            handoff_values["item_auto_youtube_playlist_ids"],
+            count,
+            "misaligned_item_auto_youtube_playlist_ids",
+            default=lambda: "",
+        )
+        handoff = handoffs[0]
+        reason = reasons[0]
+        playlist_id = playlists[0]
+        if (
+            not isinstance(handoff, str)
+            or handoff not in AUTO_YOUTUBE_HANDOFF_STATES
+            or not isinstance(reason, str)
+            or reason not in AUTO_YOUTUBE_HANDOFF_REASONS
+            or not isinstance(playlist_id, str)
+            or (playlist_id and not _PLAYLIST_ID_RE.fullmatch(playlist_id))
+        ):
+            raise JobStoreValidationError("invalid_auto_youtube_handoff")
+        if result["item_states"] != ["completed"]:
+            raise JobStoreValidationError("invalid_auto_youtube_handoff")
+        if handoff == "not_eligible":
+            if reason not in {"global_disabled", "streamer_disabled", "settings_unavailable"} or playlist_id:
+                raise JobStoreValidationError("invalid_auto_youtube_handoff")
+        elif handoff in {"intent_pending", "intent_created"}:
+            if reason:
+                raise JobStoreValidationError("invalid_auto_youtube_handoff")
+        elif handoff == "handoff_blocked" and reason not in {
+            "upload_state_unhealthy",
+            "intent_persistence_failed",
+            "intent_conflict",
+            "intent_missing",
+            "invalid_completed_result",
+            "settings_unavailable",
+        }:
+            raise JobStoreValidationError("invalid_auto_youtube_handoff")
+        result.update(
+            {
+                "item_auto_youtube_handoffs": [handoff],
+                "item_auto_youtube_handoff_reasons": [reason],
+                "item_auto_youtube_playlist_ids": [playlist_id],
+            }
+        )
 
 
 def _normalize_upload_metadata(value: Any) -> Dict[str, Any]:
@@ -869,7 +958,23 @@ def apply_retention(
     values = list(jobs)
     if terminal_limit < 0:
         raise JobStoreValidationError("invalid_terminal_limit")
-    terminal = [job for job in values if job.get("state") in TERMINAL_JOB_STATES]
+    protected_pending_handoff = {
+        str(job.get("id") or "")
+        for job in values
+        if (
+            job.get("origin") == "auto_vod"
+            and "intent_pending"
+            in (job.get("item_auto_youtube_handoffs") or [])
+        )
+    }
+    terminal = [
+        job
+        for job in values
+        if (
+            job.get("state") in TERMINAL_JOB_STATES
+            and str(job.get("id") or "") not in protected_pending_handoff
+        )
+    ]
     terminal.sort(key=lambda job: (_retention_timestamp(job), int(job["id"])))
     retained_terminal_ids = {
         job["id"] for job in terminal[-terminal_limit:]
@@ -879,6 +984,7 @@ def apply_retention(
         for job in values
         if job.get("state") not in TERMINAL_JOB_STATES
         or job["id"] in retained_terminal_ids
+        or str(job.get("id") or "") in protected_pending_handoff
     ]
 
 
