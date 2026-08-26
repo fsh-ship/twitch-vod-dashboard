@@ -377,6 +377,14 @@ class LocalVodServiceTests(unittest.TestCase):
         self.assertEqual(result["videos"], [])
         self.assertEqual(result["counts"]["pending"], 0)
 
+    def test_reserved_auto_youtube_parts_are_not_discovered_as_local_vods(self):
+        self.make_video("Normal/visible.mkv")
+        self.make_video(
+            ".auto-youtube/bearlychen/2855270041/generation/parts/part-001-of-002.mkv"
+        )
+        result = self.enumerate(include_uploaded=False)
+        self.assertEqual([item["name"] for item in result["videos"]], ["visible.mkv"])
+
     def test_known_incomplete_video_artifacts_are_not_discovered(self):
         ready = self.make_video("Example/finished.mp4")
         for name in (

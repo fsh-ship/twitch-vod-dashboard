@@ -135,6 +135,21 @@ class AutoYouTubeMaterializationService:
         state = record.get("state")
         if state not in {"parts_ready", "upload_queued"}:
             return "ignored"
+        parts = record.get("parts")
+        if (
+            state == "parts_ready"
+            and isinstance(parts, list)
+            and len(parts) > 1
+            and all(
+                part.get("source_kind") == "generated"
+                and part.get("upload_state") == "ready"
+                for part in parts
+            )
+        ):
+            # P8f intentionally supports only the original one-part manifest.
+            # M4a owns generated multipart bundles through parts_ready and stops
+            # there until a later slice adds multipart job materialization.
+            return "ignored"
         try:
             key = canonical_upload_key(
                 record.get("streamer"), record.get("twitch_vod_id")
@@ -157,7 +172,6 @@ class AutoYouTubeMaterializationService:
 
         # Only a finalized one-part manifest is eligible in P8f. Multipart job
         # materialization remains a later slice.
-        parts = record.get("parts")
         if (
             not isinstance(parts, list)
             or len(parts) != 1

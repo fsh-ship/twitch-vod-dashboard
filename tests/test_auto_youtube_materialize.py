@@ -122,6 +122,70 @@ class AutoYouTubeMaterializationTests(unittest.TestCase):
         self.assertIsNone(self.manager.claim_next_item("1"))
         self.assertEqual(self.manager.get_job("1")["item_states"], ["queued"])
 
+    def test_generated_multipart_parts_ready_stops_before_p8f_job_materialization(self):
+        self.ledger.create_intent_if_absent(
+            "bearlychen",
+            VOD_ID,
+            source_download_job_id="12",
+            source_download_item_id="12-item-1",
+            media_path="bearlychen/vod.mkv",
+            size_bytes=self.path.stat().st_size,
+            playlist_id="PLAYLIST_A",
+            plan_inputs={
+                "title_template": "{title}",
+                "description_template": "{title}",
+                "description_fallback": "",
+                "privacy_status": "unlisted",
+                "category_id": "20",
+                "tags": ["twitch"],
+            },
+        )
+        self.ledger.set_upload_plan("bearlychen", VOD_ID, {
+            "title": "Frozen title",
+            "description": "Frozen description",
+            "privacy_status": "unlisted",
+            "category_id": "20",
+            "tags": ["twitch"],
+        })
+        parts = [
+            {
+                "index": index,
+                "media_path": f".auto-youtube/bearlychen/{VOD_ID}/g1/parts/part-{index:03d}-of-002.mkv",
+                "size_bytes": index,
+                "duration_seconds": 1.0,
+                "source_kind": "generated",
+                "upload_item_id": None,
+                "upload_state": "ready",
+                "attempts": 0,
+                "youtube_video_id": None,
+                "playlist_state": "pending",
+                "reason": None,
+            }
+            for index in (1, 2)
+        ]
+        self.ledger.set_preparation(
+            "bearlychen",
+            VOD_ID,
+            source_duration_seconds=2.0,
+            state="parts_ready",
+            split={
+                "mode": "stream_copy",
+                "generation_id": "g1",
+                "target_duration_seconds": 42300,
+                "target_size_bytes": 250000000000,
+                "split_points_seconds": [1.0],
+            },
+            parts=parts,
+        )
+        manager = mock.Mock()
+
+        self.assertEqual(self._service(manager).reconcile()["ignored"], 1)
+
+        self.assertEqual(self.ledger.get("bearlychen", VOD_ID)["state"], "parts_ready")
+        manager.persistence_status.assert_not_called()
+        manager.snapshot_jobs.assert_not_called()
+        manager.create_auto_youtube_upload_job_deferred.assert_not_called()
+
     def test_reconciliation_restart_and_missing_ledger_attachment_never_duplicate(self):
         self._ready_record()
         service = self._service()

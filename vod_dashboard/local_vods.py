@@ -191,6 +191,10 @@ def enumerate_local_vods(
                 path = media_policy.safe_local_video_path(
                     discovered_path, settings
                 )
+                if media_policy.is_path_inside(
+                    path, media_policy.media_root / ".auto-youtube"
+                ):
+                    continue
                 if media_policy.is_path_inside(path, app_dir):
                     continue
                 if str(path) in unavailable:
