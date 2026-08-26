@@ -24,6 +24,7 @@ from vod_dashboard.job_store import (
     JobStorePersistenceError,
     JobStoreValidationError,
 )
+from vod_dashboard.auto_youtube_multipart import derive_part_upload_plan
 from vod_dashboard.auto_vod_storage import (
     AutoVodStorageStatus,
     assess_auto_vod_storage,
@@ -1400,6 +1401,7 @@ class JobManager:
         item_metadata: Optional[list[Dict[str, Any]]] = None,
         retry_of: Optional[Dict[str, str]] = None,
         auto_youtube_context: Optional[Dict[str, Any]] = None,
+        auto_youtube_parts: Optional[list[Dict[str, Any]]] = None,
         counter_getter: Optional[CounterGetter] = None,
         counter_setter: Optional[CounterSetter] = None,
     ) -> str:
@@ -1456,6 +1458,8 @@ class JobManager:
                         "auto_youtube_context": context,
                     }
                 )
+                if auto_youtube_parts is not None:
+                    job["auto_youtube_parts"] = list(auto_youtube_parts)
             self.jobs[job_id] = job
             try:
                 self._attach_retry_relationship_locked(job, retry_of)
@@ -1485,20 +1489,47 @@ class JobManager:
         source: Dict[str, Any],
         upload_plan: Dict[str, Any],
         playlist_id: str,
+        parts: Optional[list[Dict[str, Any]]] = None,
     ) -> str:
         """Persist one P8f Auto YouTube job without arming an upload worker."""
-        media_path = str(source.get("media_path") or "")
-        title = str(upload_plan.get("title") or "")
-        metadata = {
-            "streamer": str(source.get("streamer") or ""),
-            "date": "",
-            "title": title,
-            "vod_id": str(source.get("twitch_vod_id") or ""),
-            "name": Path(media_path).name,
-            "size_bytes": source.get("size_bytes"),
-            "size_gb": None,
-            "youtube_playlist_id": str(playlist_id or "").strip(),
-        }
+        source_parts = list(parts or [])
+        if not source_parts:
+            media_path = str(source.get("media_path") or "")
+            source_parts = [{
+                "index": 1, "total": 1, "media_path": media_path,
+                "size_bytes": source.get("size_bytes"),
+                "duration_seconds": 1.0, "source_kind": "original",
+            }]
+            persist_parts = None
+        else:
+            persist_parts = []
+        total = len(source_parts)
+        paths: list[str] = []
+        metadata: list[Dict[str, Any]] = []
+        for position, part in enumerate(source_parts, 1):
+            media_path = str(part.get("media_path") or "")
+            derived = derive_part_upload_plan(
+                upload_plan, index=position, total=total
+            )
+            paths.append(media_path)
+            metadata.append({
+                "streamer": str(source.get("streamer") or ""),
+                "date": "",
+                "title": str(derived.get("title") or ""),
+                "vod_id": str(source.get("twitch_vod_id") or ""),
+                "name": Path(media_path).name,
+                "size_bytes": part.get("size_bytes"),
+                "size_gb": None,
+                "youtube_playlist_id": str(playlist_id or "").strip(),
+            })
+            if persist_parts is not None:
+                persist_parts.append({
+                    "index": part.get("index"), "total": part.get("total"),
+                    "media_path": media_path,
+                    "size_bytes": part.get("size_bytes"),
+                    "duration_seconds": part.get("duration_seconds"),
+                    "source_kind": part.get("source_kind"),
+                })
         context = {
             key: source.get(key)
             for key in (
@@ -1510,11 +1541,12 @@ class JobManager:
             )
         }
         return self.create_upload_job(
-            [media_path],
+            paths,
             "Preparing for YouTube",
             playlist_id=str(playlist_id or "").strip(),
-            item_metadata=[metadata],
+            item_metadata=metadata,
             auto_youtube_context=context,
+            auto_youtube_parts=persist_parts,
         )
 
     def append_job_log(

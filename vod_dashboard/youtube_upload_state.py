@@ -278,6 +278,24 @@ class YouTubeUploadStateStore:
             normalized = _record_v2(new, key)
             if not normalized["parts"] or any(part["source_kind"] != "generated" or part["upload_state"] != "ready" for part in normalized["parts"]): raise YouTubeUploadStateValidationError("invalid_generation_finalization")
             doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+    def attach_materialized_upload(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_ids: Any) -> UploadRecord:
+        """Atomically link every finalized ledger part to one deferred job."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        job_id = _identifier(upload_job_id, "invalid_materialization_link")
+        if not isinstance(upload_item_ids, list) or not upload_item_ids:
+            raise YouTubeUploadStateValidationError("invalid_materialization_link")
+        item_ids = [_identifier(item_id, "invalid_materialization_link") for item_id in upload_item_ids]
+        if len(item_ids) != len(set(item_ids)):
+            raise YouTubeUploadStateValidationError("invalid_materialization_link")
+        with self._lock:
+            doc = self._load_locked(); old = doc["uploads"].get(key)
+            if old is None: raise YouTubeUploadStateValidationError("upload_not_found")
+            if old["state"] != "parts_ready" or old["upload_job_id"] is not None or len(old["parts"]) != len(item_ids): raise YouTubeUploadStateValidationError("invalid_materialization_link")
+            if any(part["upload_state"] != "ready" or part["upload_item_id"] is not None or part["attempts"] != 0 or part["youtube_video_id"] is not None for part in old["parts"]): raise YouTubeUploadStateValidationError("invalid_materialization_link")
+            parts = [dict(part, upload_item_id=item_id, upload_state="queued") for part, item_id in zip(old["parts"], item_ids)]
+            new = deepcopy(old); new.update({"state": "upload_queued", "upload_job_id": job_id, "parts": parts, "reason": None, "updated_at": _now(self._clock)})
+            normalized = _record_v2(new, key)
+            doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
     def replace_split_for_replan(self, streamer: Any, twitch_vod_id: Any, *, expected_generation_id: Any, split: Any) -> UploadRecord:
         """Atomically replace exactly one proven-invalid multipart generation plan."""
         key = canonical_upload_key(streamer, twitch_vod_id)

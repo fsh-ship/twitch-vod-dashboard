@@ -798,7 +798,7 @@ def _normalize_auto_youtube_context(
     playlist_id: str,
     count: int,
 ) -> Dict[str, Any]:
-    """Validate the minimal durable identity for one deferred Auto YouTube job."""
+    """Validate the durable ownership provenance for a deferred bundle."""
     if not isinstance(value, Mapping) or set(value) != {
         "streamer",
         "twitch_vod_id",
@@ -807,7 +807,7 @@ def _normalize_auto_youtube_context(
         "media_path",
     }:
         raise JobStoreValidationError("invalid_auto_youtube_context")
-    if count != 1 or len(urls) != 1 or len(metadata) != 1:
+    if count < 1 or len(urls) != count or len(metadata) != count:
         raise JobStoreValidationError("invalid_auto_youtube_context")
     streamer = canonical_streamer_login(value.get("streamer"))
     vod_id = value.get("twitch_vod_id")
@@ -829,10 +829,6 @@ def _normalize_auto_youtube_context(
         or not _VOD_ID_RE.fullmatch(vod_id)
         or source_item_match is None
         or source_item_match.group(1) != source_job_id
-        or media_path != urls[0]
-        or metadata[0].get("streamer") != streamer
-        or metadata[0].get("vod_id") != vod_id
-        or metadata[0].get("youtube_playlist_id") != playlist_id
     ):
         raise JobStoreValidationError("invalid_auto_youtube_context")
     return {
@@ -842,6 +838,81 @@ def _normalize_auto_youtube_context(
         "source_download_item_id": source_item_id,
         "media_path": media_path,
     }
+
+
+def _normalize_auto_youtube_parts(
+    value: Any,
+    *,
+    urls: list[str],
+    metadata: list[Dict[str, Any]],
+    playlist_id: str,
+    context: Mapping[str, Any],
+) -> Optional[list[Dict[str, Any]]]:
+    """Validate explicit ordered part identity without changing manual uploads."""
+    count = len(urls)
+    if value is None:
+        if count != 1 or context["media_path"] != urls[0]:
+            raise JobStoreValidationError("invalid_auto_youtube_parts")
+        item = metadata[0]
+        if (
+            item.get("streamer") != context["streamer"]
+            or item.get("vod_id") != context["twitch_vod_id"]
+            or item.get("youtube_playlist_id") != playlist_id
+        ):
+            raise JobStoreValidationError("invalid_auto_youtube_context")
+        return None
+    if not isinstance(value, list) or len(value) != count:
+        raise JobStoreValidationError("invalid_auto_youtube_parts")
+    normalized: list[Dict[str, Any]] = []
+    paths: set[str] = set()
+    fields = {
+        "index", "total", "media_path", "size_bytes", "duration_seconds",
+        "source_kind",
+    }
+    for index, raw in enumerate(value, 1):
+        if not isinstance(raw, Mapping) or set(raw) != fields:
+            raise JobStoreValidationError("invalid_auto_youtube_parts")
+        media_path = _relative_media_path(
+            raw.get("media_path"), code="invalid_auto_youtube_parts"
+        )
+        size_bytes = _bounded_int(
+            raw.get("size_bytes"), minimum=1, maximum=MAX_BYTES,
+            code="invalid_auto_youtube_parts",
+        )
+        duration_seconds = _bounded_number(
+            raw.get("duration_seconds"), minimum=0.000001,
+            maximum=MAX_SECONDS, code="invalid_auto_youtube_parts",
+        )
+        source_kind = raw.get("source_kind")
+        item = metadata[index - 1]
+        if (
+            raw.get("index") != index
+            or raw.get("total") != count
+            or source_kind not in {"original", "generated"}
+            or media_path != urls[index - 1]
+            or media_path in paths
+            or item.get("streamer") != context["streamer"]
+            or item.get("vod_id") != context["twitch_vod_id"]
+            or item.get("youtube_playlist_id") != playlist_id
+            or item.get("size_bytes") != size_bytes
+            or item.get("name") != Path(media_path).name
+        ):
+            raise JobStoreValidationError("invalid_auto_youtube_parts")
+        paths.add(media_path)
+        normalized.append({
+            "index": index, "total": count, "media_path": media_path,
+            "size_bytes": size_bytes, "duration_seconds": duration_seconds,
+            "source_kind": source_kind,
+        })
+    if count == 1:
+        if (
+            normalized[0]["source_kind"] != "original"
+            or normalized[0]["media_path"] != context["media_path"]
+        ):
+            raise JobStoreValidationError("invalid_auto_youtube_parts")
+    elif any(part["source_kind"] != "generated" for part in normalized):
+        raise JobStoreValidationError("invalid_auto_youtube_parts")
+    return normalized
 
 
 def _normalize_upload(
@@ -898,6 +969,7 @@ def _normalize_upload(
             "execution_deferred",
             "auto_youtube_key",
             "auto_youtube_context",
+            "auto_youtube_parts",
         )
     )
     if not auto_fields_present:
@@ -923,6 +995,10 @@ def _normalize_upload(
     )
     if key != f"{context['streamer']}:{context['twitch_vod_id']}":
         raise JobStoreValidationError("invalid_auto_youtube_job")
+    parts = _normalize_auto_youtube_parts(
+        job.get("auto_youtube_parts"), urls=urls, metadata=normalized_metadata,
+        playlist_id=playlist_id, context=context,
+    )
     result.update(
         {
             "origin": "auto_youtube",
@@ -931,6 +1007,8 @@ def _normalize_upload(
             "auto_youtube_context": context,
         }
     )
+    if parts is not None:
+        result["auto_youtube_parts"] = parts
 
 
 def _normalize_recording(

@@ -109,6 +109,36 @@ class YouTubeUploadStateStoreTests(unittest.TestCase):
         self.assertEqual(ready["state"], "plan_ready")
         self.assertEqual(queued["upload_job_id"], "99")
 
+    def test_attach_materialized_upload_links_every_part_in_one_transition(self):
+        self.create(plan_inputs={"title_template": "{title}", "description_template": "", "description_fallback": "", "privacy_status": "private", "category_id": "20", "tags": []})
+        self.store.set_upload_plan("bearlychen", "2855270041", {"title": "title", "description": "", "privacy_status": "private", "category_id": "20", "tags": []})
+        parts = [
+            {"index": index, "media_path": f".auto-youtube/bearlychen/2855270041/g1/parts/{index}.mp4", "size_bytes": 5, "duration_seconds": 1.0, "source_kind": "generated", "upload_item_id": None, "upload_state": "ready", "attempts": 0, "youtube_video_id": None, "playlist_state": "not_requested", "reason": None}
+            for index in (1, 2)
+        ]
+        self.store.set_preparation(
+            "bearlychen", "2855270041", source_duration_seconds=2.0,
+            state="parts_ready",
+            split={"mode": "stream_copy", "generation_id": "g1", "target_duration_seconds": 60, "target_size_bytes": 100, "split_points_seconds": [1.0]},
+            parts=parts,
+        )
+        queued = self.store.attach_materialized_upload(
+            "bearlychen", "2855270041", upload_job_id="99",
+            upload_item_ids=["99-item-1", "99-item-2"],
+        )
+        self.assertEqual(queued["state"], "upload_queued")
+        self.assertEqual(queued["upload_job_id"], "99")
+        self.assertEqual(
+            [part["upload_item_id"] for part in queued["parts"]],
+            ["99-item-1", "99-item-2"],
+        )
+        self.assertEqual([part["upload_state"] for part in queued["parts"]], ["queued", "queued"])
+        with self.assertRaises(state.YouTubeUploadStateValidationError):
+            self.store.attach_materialized_upload(
+                "bearlychen", "2855270041", upload_job_id="100",
+                upload_item_ids=["100-item-1", "100-item-2"],
+            )
+
     def test_create_rejects_unsafe_source_identity(self):
         for change in ({"twitch_vod_id": "v2855270041"}, {"media_path": "../video.mp4"}, {"media_path": "/srv/video.mp4"}, {"size_bytes": -1}):
             with self.subTest(change=change):
