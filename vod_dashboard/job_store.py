@@ -61,6 +61,9 @@ FAILURE_KINDS = frozenset({"", "known", "uncertain"})
 RECORDING_ORIGINS = frozenset({"manual", "auto"})
 DOWNLOAD_ORIGINS = frozenset({"manual", "auto_vod"})
 DOWNLOAD_POST_MODES = frozenset({"default", "download_only"})
+COMPLETED_MEDIA_EXTENSIONS = frozenset(
+    {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+)
 AUTO_VOD_STORAGE_BLOCK_REASONS = frozenset(
     {"insufficient_storage", "storage_unavailable"}
 )
@@ -599,6 +602,55 @@ def _normalize_download(job: Mapping[str, Any], result: Job, count: int) -> None
         )
     if origin == "auto_vod":
         result.update({"origin": origin, "attempt": attempt, "post_download_mode": post_download_mode, "storage_blocked": storage_blocked, "blocking_reason": blocking_reason})
+    completed_values = {
+        "completed_media_path": job.get("completed_media_path"),
+        "completed_media_size_bytes": job.get("completed_media_size_bytes"),
+        "completed_twitch_vod_id": job.get("completed_twitch_vod_id"),
+    }
+    if any(value is not None for value in completed_values.values()):
+        if (
+            origin != "auto_vod"
+            or count != 1
+            or result["item_states"] != ["completed"]
+            or not all(value is not None for value in completed_values.values())
+        ):
+            raise JobStoreValidationError("invalid_completed_media_result")
+        raw_path = completed_values["completed_media_path"]
+        if not isinstance(raw_path, str):
+            raise JobStoreValidationError("invalid_completed_media_path")
+        candidate_path = raw_path.strip().replace("\\", "/")
+        if Path(candidate_path).is_absolute() or _WINDOWS_DRIVE_RE.match(candidate_path):
+            raise JobStoreValidationError("invalid_completed_media_path")
+        completed_path = _relative_media_path(
+            candidate_path,
+            media_root=None,
+            code="invalid_completed_media_path",
+        )
+        if (
+            PurePosixPath(completed_path).suffix.lower()
+            not in COMPLETED_MEDIA_EXTENSIONS
+        ):
+            raise JobStoreValidationError("invalid_completed_media_path")
+        completed_size = _bounded_int(
+            completed_values["completed_media_size_bytes"],
+            minimum=0,
+            maximum=MAX_BYTES,
+            code="invalid_completed_media_size_bytes",
+        )
+        completed_vod_id = completed_values["completed_twitch_vod_id"]
+        if (
+            not isinstance(completed_vod_id, str)
+            or not _VOD_ID_RE.fullmatch(completed_vod_id)
+            or completed_vod_id != vod_id
+        ):
+            raise JobStoreValidationError("invalid_completed_twitch_vod_id")
+        result.update(
+            {
+                "completed_media_path": completed_path,
+                "completed_media_size_bytes": completed_size,
+                "completed_twitch_vod_id": completed_vod_id,
+            }
+        )
 
 
 def _normalize_upload_metadata(value: Any) -> Dict[str, Any]:

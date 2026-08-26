@@ -73,6 +73,7 @@ ITEM_STATE_TO_LEGACY = {
     "interrupted": "fehler",
 }
 DOWNLOAD_DURATION_MARKER = "VOD-DASHBOARD-DURATION="
+DOWNLOAD_FINAL_OUTPUT_MARKER = "VOD-DASHBOARD-FINAL-FILE="
 _FFMPEG_TIME_RE = re.compile(
     r"(?:^|\s)time=\s*(-?\d+:\d{2}:\d{2}(?:\.\d+)?)",
     re.IGNORECASE,
@@ -180,6 +181,18 @@ def parse_ffmpeg_speed_multiplier(text: Any) -> Optional[float]:
     except (TypeError, ValueError, OverflowError):
         return None
     return speed if math.isfinite(speed) and speed >= 0 else None
+
+
+def parse_download_final_output_marker(
+    line: Any, marker: str = DOWNLOAD_FINAL_OUTPUT_MARKER
+) -> Optional[str]:
+    """Extract one yt-dlp ``after_move`` result without logging its path."""
+    text = str(line or "").rstrip()
+    marker_at = text.find(marker)
+    if marker_at < 0:
+        return None
+    result = text[marker_at + len(marker):].strip()
+    return result or None
 
 
 def ffmpeg_download_metrics(
@@ -359,6 +372,8 @@ class DownloadWorkerDependencies:
     storage_assessor: Callable[[Path], AutoVodStorageStatus] = (
         assess_auto_vod_storage
     )
+    resolve_auto_vod_completed_output: Optional[Callable[..., Dict[str, Any]]] = None
+    download_output_marker: str = DOWNLOAD_FINAL_OUTPUT_MARKER
 
 
 @dataclass(frozen=True)
@@ -399,7 +414,11 @@ class JobManager:
         media_root: Optional[Path] = None,
     ) -> None:
         self.jobs = registry if registry is not None else {}
-        self.lock = lock if lock is not None else threading.Lock()
+        # Some required persistence transitions intentionally hold the queue
+        # lock while recording their durable state.  Use a re-entrant lock so
+        # the persistence health update performed by that same transition can
+        # safely acquire it again.
+        self.lock = lock if lock is not None else threading.RLock()
         self.counter = counter
         self._counter_floor = 0
         self._now = now or datetime.now
@@ -2072,6 +2091,75 @@ class JobManager:
         self._persist_best_effort(snapshot)
         return True
 
+    def finish_auto_vod_download_with_result(
+        self,
+        job_id: str,
+        item_id: str,
+        *,
+        completed_media_path: str,
+        completed_media_size_bytes: int,
+        completed_twitch_vod_id: str,
+    ) -> bool:
+        """Persist exact Auto VOD media output before exposing completion."""
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if (
+                job is None
+                or str(job.get("type") or "download") != "download"
+                or job.get("origin") != "auto_vod"
+            ):
+                return False
+            index = self._item_index_locked(job, item_id)
+            if (
+                index is None
+                or job["item_states"][index] not in {"running", "cancelling"}
+            ):
+                return False
+            if str(completed_twitch_vod_id) != str(
+                job.get("twitch_vod_id") or ""
+            ):
+                raise ValueError("Completed VOD identity does not match the job.")
+            previous = {
+                key: job.get(key)
+                for key in (
+                    "completed_media_path",
+                    "completed_media_size_bytes",
+                    "completed_twitch_vod_id",
+                )
+            }
+            job["completed_media_path"] = str(completed_media_path)
+            job["completed_media_size_bytes"] = completed_media_size_bytes
+            job["completed_twitch_vod_id"] = str(completed_twitch_vod_id)
+            self._set_item_state_locked(job, index, "completed")
+            if self._lane_active["download"] == (str(job_id), str(item_id)):
+                self._lane_active["download"] = None
+            self._download_processes.pop((str(job_id), str(item_id)), None)
+            self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            # Keep the manager lock across this short atomic write. No queue
+            # consumer can observe a completed Auto VOD result until it is
+            # durable in JobStore.
+            try:
+                self._persist_required(snapshot)
+            except JobPersistenceRequiredError:
+                current = self.jobs.get(str(job_id))
+                current_index = (
+                    self._item_index_locked(current, item_id)
+                    if current is not None
+                    else None
+                )
+                if current is not None and current_index is not None:
+                    for key, value in previous.items():
+                        if value is None:
+                            current.pop(key, None)
+                        else:
+                            current[key] = value
+                self._mark_required_failure(str(job_id), item_id)
+                raise
+            self._condition.notify_all()
+            return True
+
     def remove_queued_item(self, job_id: str, item_id: str) -> bool:
         with self._condition:
             job = self.jobs.get(job_id)
@@ -3411,6 +3499,7 @@ def run_download_job(
             started_at = dependencies.clock()
             before_files = dependencies.snapshot_video_files(settings)
             cmd, list_path = dependencies.build_download_command([url], settings)
+            final_output_path: Optional[str] = None
 
             dependencies.append_log(
                 job_id,
@@ -3493,6 +3582,18 @@ def run_download_job(
                     manager.terminate_registered_download(job_id, item_id)
                 assert proc.stdout is not None
                 for line in proc.stdout:
+                    marked_path = parse_download_final_output_marker(
+                        line, dependencies.download_output_marker
+                    )
+                    if marked_path is not None:
+                        if automatic_vod:
+                            final_output_path = marked_path
+                            dependencies.append_log(
+                                job_id, "Captured final Auto VOD output marker."
+                            )
+                        # Do not retain the raw absolute output path in any
+                        # Queue log, including for a manual download.
+                        continue
                     dependencies.append_log(job_id, line)
                 rc = proc.wait()
                 manager.set_returncode(job_id, rc)
@@ -3512,10 +3613,72 @@ def run_download_job(
                         f"VOD {idx}/{total} download cancelled. Partial files were retained.",
                     )
                 elif rc == 0:
+                    if automatic_vod:
+                        if (
+                            final_output_path is None
+                            or dependencies.resolve_auto_vod_completed_output is None
+                        ):
+                            failed += 1
+                            manager.finish_claimed_item(
+                                job_id,
+                                item_id,
+                                "failed",
+                                failure_kind="known",
+                            )
+                            dependencies.append_log(
+                                job_id,
+                                "Automatic VOD download ended without a verified final media result.",
+                            )
+                            continue
+                        try:
+                            job = manager.get_job(job_id) or {}
+                            result = dependencies.resolve_auto_vod_completed_output(
+                                final_output_path,
+                                settings,
+                                str(job.get("twitch_vod_id") or ""),
+                            )
+                            persisted = manager.finish_auto_vod_download_with_result(
+                                job_id,
+                                item_id,
+                                completed_media_path=str(
+                                    result["completed_media_path"]
+                                ),
+                                completed_media_size_bytes=result[
+                                    "completed_media_size_bytes"
+                                ],
+                                completed_twitch_vod_id=str(
+                                    result["completed_twitch_vod_id"]
+                                ),
+                            )
+                            if not persisted:
+                                raise RuntimeError(
+                                    "Auto VOD completion could not be persisted."
+                                )
+                        except JobPersistenceRequiredError:
+                            failed += 1
+                            dependencies.append_log(
+                                job_id,
+                                "Automatic VOD result was not marked complete because required job persistence is unavailable.",
+                            )
+                            continue
+                        except Exception:
+                            failed += 1
+                            manager.finish_claimed_item(
+                                job_id,
+                                item_id,
+                                "failed",
+                                failure_kind="known",
+                            )
+                            dependencies.append_log(
+                                job_id,
+                                "Automatic VOD download completed but its final media result could not be verified.",
+                            )
+                            continue
+                    else:
+                        manager.finish_claimed_item(
+                            job_id, item_id, "completed"
+                        )
                     succeeded += 1
-                    manager.finish_claimed_item(
-                        job_id, item_id, "completed"
-                    )
                     dependencies.append_log(
                         job_id, f"VOD {idx}/{total} download completed."
                     )

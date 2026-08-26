@@ -23,6 +23,7 @@ from vod_dashboard import auto_recorder as dashboard_auto_recorder
 from vod_dashboard import auto_recording as dashboard_auto_recording
 from vod_dashboard import auto_recording_runtime as dashboard_auto_runtime
 from vod_dashboard import auto_vod as dashboard_auto_vod
+from vod_dashboard import auto_vod_result as dashboard_auto_vod_result
 from vod_dashboard import auto_vod_coordinator as dashboard_auto_vod_coordinator
 from vod_dashboard import auto_vod_runtime as dashboard_auto_vod_runtime
 from vod_dashboard import auto_vod_storage as dashboard_auto_vod_storage
@@ -1251,6 +1252,8 @@ def run_download_job(job_id: str) -> None:
         popen=subprocess.Popen,
         clock=time.time,
         enqueue_upload_job=lambda paths, label: create_upload_job(paths, label),
+        resolve_auto_vod_completed_output=resolve_completed_auto_vod_output,
+        download_output_marker=dashboard_twitch.DOWNLOAD_FINAL_OUTPUT_MARKER,
     )
     dashboard_jobs.run_download_job(
         job_id, _job_manager_for_compatibility(), dependencies
@@ -1263,6 +1266,19 @@ def resolve_completed_recording_output(
     policy = dashboard_media.MediaPathPolicy(MEDIA_ROOT)
     path = policy.safe_local_video_path(raw_path, settings, must_exist=True)
     return path.relative_to(policy.media_root).as_posix()
+
+
+def resolve_completed_auto_vod_output(
+    raw_path: Any,
+    settings: Dict[str, Any],
+    expected_twitch_vod_id: str,
+) -> Dict[str, Any]:
+    return dashboard_auto_vod_result.resolve_completed_auto_vod_output(
+        raw_path,
+        settings,
+        expected_twitch_vod_id,
+        media_policy=dashboard_media.MediaPathPolicy(MEDIA_ROOT),
+    )
 
 
 class RecordingStartError(RuntimeError):

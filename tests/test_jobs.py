@@ -1418,6 +1418,8 @@ class DownloadWorkerTests(unittest.TestCase):
         upload=None,
         mode=None,
         enqueue=None,
+        stdout_lines=None,
+        auto_result=None,
     ):
         process_calls = []
         returncodes = iter(returncodes)
@@ -1436,7 +1438,7 @@ class DownloadWorkerTests(unittest.TestCase):
                 self.manager.jobs["1"]["item_statuses"][active_index], "läuft"
             )
             process = mock.Mock()
-            process.stdout = ["yt-dlp output\n"]
+            process.stdout = list(stdout_lines or ["yt-dlp output\n"])
             process.wait.return_value = next(returncodes)
             process_calls.append((command, kwargs, process))
             return process
@@ -1461,6 +1463,7 @@ class DownloadWorkerTests(unittest.TestCase):
             popen=popen,
             clock=lambda: 123.0,
             enqueue_upload_job=enqueue,
+            resolve_auto_vod_completed_output=auto_result,
         )
         return dependencies, process_calls, list_paths
 
@@ -1637,6 +1640,14 @@ class DownloadWorkerTests(unittest.TestCase):
             service=service,
             upload=upload,
             enqueue=enqueue,
+            stdout_lines=[
+                "VOD-DASHBOARD-FINAL-FILE=/temporary/example_streamer/video.mp4\n"
+            ],
+            auto_result=lambda *_args: {
+                "completed_media_path": "example_streamer/video.mp4",
+                "completed_media_size_bytes": 123,
+                "completed_twitch_vod_id": "1234567890",
+            },
         )
 
         run_download_job(job_id, self.manager, dependencies)
@@ -1648,6 +1659,10 @@ class DownloadWorkerTests(unittest.TestCase):
         dependencies.new_video_files.assert_not_called()
         dependencies.recently_changed_video_files.assert_not_called()
         self.assertEqual(self.manager.jobs[job_id]["status"], "fertig")
+        self.assertEqual(
+            self.manager.jobs[job_id]["completed_media_path"],
+            "example_streamer/video.mp4",
+        )
         self.assertIn("download-only", "\n".join(self.manager.jobs[job_id]["log"]))
 
     def test_missing_subprocess_sets_not_found_returncode(self):

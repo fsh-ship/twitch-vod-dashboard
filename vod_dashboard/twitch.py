@@ -252,6 +252,7 @@ _TWITCH_QUALITY_RE = re.compile(
     r"(?<!\d)(\d{3,4})p(?:([1-9]\d{1,2}))?\b", re.IGNORECASE
 )
 LIVE_RECORDING_OUTPUT_MARKER = "VOD-DASHBOARD-RECORDING-FILE="
+DOWNLOAD_FINAL_OUTPUT_MARKER = "VOD-DASHBOARD-FINAL-FILE="
 LIVE_RECORDING_FILENAME_TEMPLATE = (
     "%(upload_date)s - %(uploader)s - LIVE - %(title)s [%(id)s].%(ext)s"
 )
@@ -519,6 +520,8 @@ def build_download_command(
         "m3u8:ffmpeg",
         "--print",
         "before_dl:VOD-DASHBOARD-DURATION=%(duration)s",
+        "--print",
+        f"after_move:{DOWNLOAD_FINAL_OUTPUT_MARKER}%(filepath)s",
         "--no-quiet",
         "-a",
         str(list_path),

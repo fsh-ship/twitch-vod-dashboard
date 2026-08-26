@@ -318,6 +318,8 @@ class YtDlpIntegrationHelperTests(unittest.TestCase):
                     "m3u8:ffmpeg",
                     "--print",
                     "before_dl:VOD-DASHBOARD-DURATION=%(duration)s",
+                    "--print",
+                    "after_move:VOD-DASHBOARD-FINAL-FILE=%(filepath)s",
                     "--no-quiet",
                     "-a",
                     str(url_file),
@@ -348,10 +350,15 @@ class YtDlpIntegrationHelperTests(unittest.TestCase):
                 command[command.index("--downloader") + 1],
                 "m3u8:ffmpeg",
             )
-            self.assertEqual(command.count("--print"), 1)
+            self.assertEqual(command.count("--print"), 2)
             self.assertEqual(
                 command[command.index("--print") + 1],
                 "before_dl:VOD-DASHBOARD-DURATION=%(duration)s",
+            )
+            final_print = command.index("--print", command.index("--print") + 1)
+            self.assertEqual(
+                command[final_print + 1],
+                "after_move:VOD-DASHBOARD-FINAL-FILE=%(filepath)s",
             )
             self.assertEqual(
                 url_file.read_text(encoding="utf-8"),

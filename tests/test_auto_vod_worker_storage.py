@@ -54,7 +54,9 @@ class AutoVodWorkerStorageTests(unittest.TestCase):
 
     def dependencies(self, status, *, popen=None, assessor=None):
         process = mock.Mock()
-        process.stdout = []
+        process.stdout = [
+            "VOD-DASHBOARD-FINAL-FILE=/temporary/alpha/video.mp4\n"
+        ]
         process.wait.return_value = 0
         popen = popen or mock.Mock(return_value=process)
         list_path = self.root / "download-list.txt"
@@ -80,6 +82,11 @@ class AutoVodWorkerStorageTests(unittest.TestCase):
             popen=popen,
             clock=lambda: 1.0,
             storage_assessor=assessor or (lambda path: status),
+            resolve_auto_vod_completed_output=lambda *_args: {
+                "completed_media_path": "alpha/video.mp4",
+                "completed_media_size_bytes": 123,
+                "completed_twitch_vod_id": "2854443252",
+            },
         ), popen
 
     def test_low_and_unavailable_storage_block_before_popen(self):
