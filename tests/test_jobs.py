@@ -1892,6 +1892,30 @@ class UploadWorkerTests(unittest.TestCase):
             self.settings["youtube_playlist_id"], "playlist-changed"
         )
 
+    def test_manual_upload_keeps_legacy_executor_when_auto_executor_is_available(self):
+        video = self.root / "manual.mp4"
+        upload = mock.Mock(return_value="manual-video-id")
+        auto_executor = mock.Mock()
+        job_id = self.manager.create_upload_job([str(video)], "Manual upload")
+        dependencies = UploadWorkerDependencies(
+            load_settings=lambda: dict(self.settings),
+            append_log=self.manager.append_job_log,
+            get_youtube_service=mock.Mock(),
+            safe_local_video_path=mock.Mock(
+                side_effect=lambda raw, _settings: Path(raw)
+            ),
+            upload_to_youtube=upload,
+            auto_youtube_executor=auto_executor,
+        )
+
+        run_upload_job(job_id, self.manager, dependencies)
+
+        upload.assert_called_once_with(
+            video, self.settings, job_id=job_id, item_id=f"{job_id}-item-1"
+        )
+        auto_executor.assert_not_called()
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed"])
+
     def test_explicit_empty_job_playlist_overrides_global_default(self):
         video = self.root / "one.mp4"
         upload = mock.Mock(return_value="id-1")

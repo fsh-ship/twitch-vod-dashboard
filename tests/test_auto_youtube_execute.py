@@ -14,7 +14,12 @@ from vod_dashboard.auto_youtube_execute import (
 from vod_dashboard.auto_youtube_materialize import AutoYouTubeMaterializationService
 from vod_dashboard.auto_youtube_multipart import MediaProbeResult
 from vod_dashboard.job_store import JobStore, JobStorePersistenceError
-from vod_dashboard.jobs import JobManager, JobPersistenceRequiredError
+from vod_dashboard.jobs import (
+    JobManager,
+    JobPersistenceRequiredError,
+    UploadWorkerDependencies,
+    run_upload_job,
+)
 from vod_dashboard.media import MediaPathPolicy
 from vod_dashboard.youtube import (
     create_resumable_video_upload_request,
@@ -200,6 +205,91 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         self.service_getter.assert_not_called()
         self.request_builder.assert_not_called()
         self.request_sender.assert_not_called()
+
+    def test_job_79_release_worker_dispatch_uses_ledger_executor_exclusively(self):
+        self.manager.counter = 78
+        job_id = self.create_bundle(
+            playlist_id="FROZEN_PLAYLIST",
+            streamer="cptmary",
+            vod_id="2857167152",
+        )
+        self.assertEqual(job_id, "79")
+        executor = self.executor()
+        executor.release_auto_youtube_job_for_execution(job_id)
+        manual_upload = mock.Mock(return_value="LEGACY_ID")
+        manual_service = mock.Mock()
+        manual_path = mock.Mock()
+        sender = mock.Mock()
+
+        def send(_request, **_kwargs):
+            durable = YouTubeUploadStateStore(self.store.path).get(
+                "cptmary", "2857167152"
+            )
+            self.assertEqual(durable["parts"][0]["upload_state"], "transfer_started")
+            self.assertEqual(durable["parts"][0]["attempts"], 1)
+            self.assertIsNone(durable["parts"][0]["youtube_video_id"])
+            return "YT_JOB_79"
+
+        sender.side_effect = send
+        executor._request_sender = sender
+        dependencies = UploadWorkerDependencies(
+            load_settings=mock.Mock(),
+            append_log=self.manager.append_job_log,
+            get_youtube_service=manual_service,
+            safe_local_video_path=manual_path,
+            upload_to_youtube=manual_upload,
+            auto_youtube_executor=executor.run_job,
+        )
+
+        class ImmediateThread:
+            def __init__(self, *, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+
+            def start(self):
+                self.target(*self.args)
+
+        self.manager.start_worker(
+            lambda current_job_id: run_upload_job(
+                current_job_id, self.manager, dependencies
+            ),
+            job_id,
+            thread_factory=ImmediateThread,
+        )
+
+        record = YouTubeUploadStateStore(self.store.path).get(
+            "cptmary", "2857167152"
+        )
+        self.assertEqual(record["state"], "playlist_pending")
+        self.assertEqual(record["parts"][0]["upload_state"], "video_confirmed")
+        self.assertEqual(record["parts"][0]["attempts"], 1)
+        self.assertEqual(record["parts"][0]["youtube_video_id"], "YT_JOB_79")
+        job = self.manager.get_job(job_id)
+        self.assertEqual(job["item_states"], ["completed"])
+        self.assertFalse(job["execution_deferred"])
+        sender.assert_called_once()
+        manual_upload.assert_not_called()
+        manual_service.assert_not_called()
+        manual_path.assert_not_called()
+        dependencies.load_settings.assert_not_called()
+        self.assertEqual(len(self.manager.snapshot_jobs()), 1)
+
+        run_upload_job(job_id, self.manager, dependencies)
+        sender.assert_called_once()
+        self.assertEqual(len(self.manager.snapshot_jobs()), 1)
+
+        restored = self.new_manager()
+        restored.restore_from_store()
+        restarted_executor = self.executor(restored)
+        restarted_executor.reconcile()
+        restarted_executor.reconcile()
+        self.assertEqual(restored.get_job(job_id)["item_states"], ["completed"])
+        self.assertIsNone(restored.claim_next_item(job_id))
+        with self.assertRaisesRegex(AutoYouTubeExecutionError, "release_not_allowed"):
+            restarted_executor.release_auto_youtube_job_for_execution(job_id)
+        sender.assert_called_once()
+        self.assertEqual(len(restored.snapshot_jobs()), 1)
 
     def test_release_persistence_failure_leaves_job_deferred_without_api_activity(self):
         job_id = self.create_bundle()
@@ -476,6 +566,32 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         self.assertIsNone(record["parts"][0]["youtube_video_id"])
         self.assertEqual(self.manager.get_job(job_id)["item_states"], ["failed"])
         executor.run_job(job_id)
+        self.assertEqual(self.request_sender.call_count, 1)
+
+    def test_confirmed_video_repairs_after_jobstore_completion_failure_without_reupload(self):
+        job_id = self.create_bundle(playlist_id="FROZEN_PLAYLIST")
+        executor = self.executor()
+        executor.release_auto_youtube_job_for_execution(job_id)
+        with mock.patch.object(
+            self.manager,
+            "complete_auto_youtube_item",
+            side_effect=JobPersistenceRequiredError(),
+        ):
+            executor.run_job(job_id)
+
+        record = self.store.get("bearlychen", VOD_ID)
+        self.assertEqual(record["state"], "playlist_pending")
+        self.assertEqual(record["parts"][0]["upload_state"], "video_confirmed")
+        self.assertEqual(record["parts"][0]["youtube_video_id"], "YT_VIDEO_1")
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["running"])
+        self.assertEqual(self.request_sender.call_count, 1)
+
+        restored = self.new_manager()
+        restored.restore_from_store()
+        restarted_executor = self.executor(restored)
+        self.assertEqual(restarted_executor.reconcile()["confirmed"], 1)
+        self.assertEqual(restored.get_job(job_id)["item_states"], ["completed"])
+        restarted_executor.run_job(job_id)
         self.assertEqual(self.request_sender.call_count, 1)
 
     def test_multipart_executes_in_order_and_stops_at_playlist_pending(self):

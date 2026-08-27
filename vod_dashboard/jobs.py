@@ -13,7 +13,7 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Any, Callable, Dict, MutableMapping, Optional
+from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional
 
 from vod_dashboard.job_store import (
     AUTO_YOUTUBE_HANDOFF_REASONS,
@@ -59,6 +59,9 @@ ITEM_STATES = {
     "interrupted",
 }
 TERMINAL_ITEM_STATES = {"completed", "failed", "cancelled", "interrupted"}
+UPLOAD_EXECUTION_AUTO_YOUTUBE = "auto_youtube"
+UPLOAD_EXECUTION_MANUAL = "manual"
+UPLOAD_EXECUTION_INVALID = "invalid"
 LEGACY_TO_ITEM_STATE = {
     "wartet": "queued",
     "läuft": "running",
@@ -87,6 +90,33 @@ _CLASSIC_DOWNLOAD_RE = re.compile(
     r"(?:.*?\bETA\s+([^\s]+))?",
     re.IGNORECASE,
 )
+
+
+def upload_execution_owner(job: Any) -> str:
+    """Classify the one permitted executor for a YouTube-upload job.
+
+    Historical manual jobs may omit ``type`` or ``origin``. Auto YouTube
+    ownership, however, is explicit and must never degrade to the legacy
+    executor when its durable metadata is incomplete or inconsistent.
+    """
+    if not isinstance(job, Mapping):
+        return UPLOAD_EXECUTION_MANUAL
+    job_type = str(job.get("type") or "")
+    origin = str(job.get("origin") or "")
+    if job_type == "youtube_upload" and origin == "auto_youtube":
+        return UPLOAD_EXECUTION_AUTO_YOUTUBE
+    has_auto_context = any(
+        key in job
+        for key in (
+            "auto_youtube_key",
+            "auto_youtube_context",
+            "auto_youtube_parts",
+            "execution_deferred",
+        )
+    )
+    if origin == "auto_youtube" or has_auto_context:
+        return UPLOAD_EXECUTION_INVALID
+    return UPLOAD_EXECUTION_MANUAL
 
 
 class RecordingConflictError(RuntimeError):
@@ -819,16 +849,14 @@ class JobManager:
     def _is_deferred_auto_youtube(job: Job) -> bool:
         """Deferred P8f ownership jobs must never become process-owned work."""
         return (
-            job.get("type") == "youtube_upload"
-            and job.get("origin") == "auto_youtube"
+            upload_execution_owner(job) == UPLOAD_EXECUTION_AUTO_YOUTUBE
             and job.get("execution_deferred") is True
         )
 
     @staticmethod
     def _is_auto_youtube(job: Job) -> bool:
         return (
-            job.get("type") == "youtube_upload"
-            and job.get("origin") == "auto_youtube"
+            upload_execution_owner(job) == UPLOAD_EXECUTION_AUTO_YOUTUBE
             and isinstance(job.get("execution_deferred"), bool)
         )
 
@@ -4182,7 +4210,8 @@ def run_upload_job(
 ) -> None:
     """Run the existing sequential local YouTube upload lifecycle."""
     initial_job = manager.get_job(job_id) or {}
-    if initial_job.get("origin") == "auto_youtube":
+    execution_owner = upload_execution_owner(initial_job)
+    if execution_owner == UPLOAD_EXECUTION_AUTO_YOUTUBE:
         if initial_job.get("execution_deferred") is not False:
             return
         if dependencies.auto_youtube_executor is None:
@@ -4195,6 +4224,11 @@ def run_upload_job(
                 pass
             return
         dependencies.auto_youtube_executor(job_id)
+        return
+    if execution_owner != UPLOAD_EXECUTION_MANUAL:
+        dependencies.append_log(
+            job_id, "Upload execution ownership is inconsistent; refusing upload."
+        )
         return
     settings = dict(dependencies.load_settings())
     if "playlist_id" in initial_job:

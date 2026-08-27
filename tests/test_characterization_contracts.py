@@ -3713,6 +3713,50 @@ class YouTubeContractTests(IsolatedDashboardTestCase):
             ],
         )
 
+    def test_manual_upload_side_effect_boundary_rejects_auto_youtube_job(self):
+        video = self.make_video().resolve()
+        dashboard.jobs["79"] = {
+            "id": "79",
+            "type": "youtube_upload",
+            "origin": "auto_youtube",
+            "execution_deferred": False,
+            "auto_youtube_key": "cptmary:2857167152",
+            "auto_youtube_context": {
+                "streamer": "cptmary",
+                "twitch_vod_id": "2857167152",
+            },
+        }
+        legacy_upload = mock.Mock()
+        history = mock.Mock()
+        youtube_service = mock.Mock()
+        move = mock.Mock()
+
+        with mock.patch.object(
+            dashboard.dashboard_youtube,
+            "upload_video_to_youtube",
+            legacy_upload,
+        ), mock.patch.object(
+            dashboard, "remember_youtube_uploaded_file", history
+        ), mock.patch.object(
+            dashboard, "get_youtube_service", youtube_service
+        ), mock.patch.object(
+            dashboard, "move_uploaded_vod_to_done_folder", move
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "cannot use the manual upload executor"
+            ):
+                dashboard.upload_video_to_youtube(
+                    video,
+                    self.settings(youtube_enabled=True),
+                    job_id="79",
+                    item_id="79-item-1",
+                )
+
+        legacy_upload.assert_not_called()
+        history.assert_not_called()
+        youtube_service.assert_not_called()
+        move.assert_not_called()
+
     def test_uploaded_history_update_is_persisted(self):
         video = self.make_video().resolve()
         dashboard.save_settings({"youtube_uploaded_files": ["older.mp4"]})

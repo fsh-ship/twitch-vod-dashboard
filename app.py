@@ -725,6 +725,16 @@ def upload_video_to_youtube(
     job_id: Optional[str] = None,
     item_id: Optional[str] = None,
 ) -> Optional[str]:
+    if job_id is not None:
+        manager = _job_manager_for_compatibility()
+        owner = dashboard_jobs.upload_execution_owner(
+            manager.get_job(str(job_id)) or {}
+        )
+        if owner != dashboard_jobs.UPLOAD_EXECUTION_MANUAL:
+            raise RuntimeError(
+                "Automatic YouTube jobs cannot use the manual upload executor."
+            )
+
     def update_progress(uploaded: int, total: int) -> None:
         if job_id is not None:
             _job_manager_for_compatibility().update_active_upload_progress(
