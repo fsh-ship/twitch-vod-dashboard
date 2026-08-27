@@ -277,6 +277,7 @@ let jobOpenState = {};
 let queueDetailOpenState = {};
 const pendingAutoYoutubeReleases = new Set();
 const pendingAutoYoutubePlaylistActions = new Set();
+let autoYoutubePlaylistHistoryAutoOpened = false;
 let autoExpandJobDetails = localStorage.getItem('vodJobAutoExpand') === '1';
 let youtubePlaylistChoices = [];
 let streamerProfileDraft = {};
@@ -2393,6 +2394,19 @@ function renderVodQueue(jobs, queueControls={}, persistenceStatus={}) {
   if ($('queueWaitingCount')) $('queueWaitingCount').textContent = String(waiting.length);
   if ($('queueFailed')) $('queueFailed').textContent = String(errors.length);
   if ($('queueDone')) $('queueDone').textContent = String(completed.length);
+  const hasEligibleAutoYoutubePlaylist = completed.some(item => (
+    item.job?.type === 'youtube_upload'
+    && item.job?.origin === 'auto_youtube'
+    && item.job?.auto_youtube_playlist?.state === 'playlist_pending'
+    && item.job?.auto_youtube_playlist?.eligible === true
+  ));
+  if (!hasEligibleAutoYoutubePlaylist) {
+    autoYoutubePlaylistHistoryAutoOpened = false;
+  } else if (!autoYoutubePlaylistHistoryAutoOpened) {
+    const history = $('queueCompletedDetails');
+    if (history) history.open = true;
+    autoYoutubePlaylistHistoryAutoOpened = true;
+  }
   if ($('queueCancelledCount')) $('queueCancelledCount').textContent = String(cancelled.length);
   if ($('clearCompletedJobs')) {
     $('clearCompletedJobs').disabled = completed.length === 0;

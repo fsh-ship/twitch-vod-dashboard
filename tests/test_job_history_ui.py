@@ -78,6 +78,64 @@ process.stdout.write(JSON.stringify({
     return json.loads(completed.stdout)
 
 
+def _evaluate_completed_history_presentation(jobs: list[dict]) -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for Queue history UI tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const classifierStart = source.indexOf('function parseProgress');
+const classifierEnd = source.indexOf('function renderQueueGroup');
+const historyStart = source.indexOf('function queueHistoryTimestamp');
+const queueRenderStart = source.indexOf('function renderQueuePersistenceStatus');
+const queueRenderEnd = source.indexOf('async function pollJobs');
+if ([classifierStart, classifierEnd, historyStart, queueRenderStart, queueRenderEnd].some(value => value < 0)) throw new Error('Queue history helpers not found');
+const lastResults = [];
+const localVideoCache = new Map();
+const queueDetailOpenState = {};
+let autoYoutubePlaylistHistoryAutoOpened = false;
+function rememberedSearchResults() { return []; }
+function escapeHtml(value) { return String(value ?? ''); }
+function renderProgressBar() { return ''; }
+function element() {
+  return {textContent:'', innerHTML:'', disabled:false, hidden:false, open:false,
+    classList:{add(){}, remove(){}, toggle(){}}};
+}
+const elements = Object.fromEntries([
+  'queueRunning', 'queueWaiting', 'queueErrors', 'queueCompleted',
+  'queueCancelled', 'queueDone', 'queueCancelledCount', 'queueFailed',
+  'queueActive', 'queueWaitingCount', 'clearCompletedJobs',
+  'queueCancelledSection', 'queueErrorsSection', 'queuePersistenceWarning',
+  'queueCompletedDetails'
+].map(id => [id, element()]));
+function $(id) { return elements[id] || null; }
+function renderQueueGroup(id, items) { elements[id].items = items; }
+function renderQueueLaneControls() {}
+function renderOverallRunningEstimate() {}
+eval(source.slice(classifierStart, classifierEnd));
+eval(source.slice(historyStart, queueRenderStart));
+eval(source.slice(queueRenderStart, queueRenderEnd));
+const queue = renderVodQueue(input.jobs || [], {}, {});
+process.stdout.write(JSON.stringify({
+  completedDetailsOpen:elements.queueCompletedDetails.open,
+  completedJobIds:(elements.queueCompleted.items || []).map(item => String(item.job.id)),
+  completedCount:queue.completed.length,
+}));
+"""
+    completed = subprocess.run(
+        [NODE, "-e", runner],
+        cwd=ROOT,
+        input=json.dumps({"jobs": jobs}),
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
 def _evaluate_persistence_ui() -> dict:
     if not NODE:
         raise unittest.SkipTest("Node.js is required for persistence UI tests")
@@ -413,8 +471,12 @@ class JobHistoryUiTests(unittest.TestCase):
 
     def test_completed_auto_youtube_playlist_action_is_eligible_and_bundle_level(self):
         eligible = _upload_job(
-            "87", deferred=False, states=["completed", "completed"]
+            "79", deferred=False, states=["completed", "completed"]
         )
+        eligible["urls"] = [
+            "C:/media/deleted-job-79-part-1.mkv",
+            "C:/media/deleted-job-79-part-2.mkv",
+        ]
         eligible["auto_youtube_playlist"] = {
             "state": "playlist_pending",
             "eligible": True,
@@ -444,16 +506,32 @@ class JobHistoryUiTests(unittest.TestCase):
         for item in result["rendered"]:
             cards.setdefault(item["jobId"], []).append(item["html"])
 
-        self.assertIn("Playlist pending", cards["87"][0])
-        self.assertIn("Video uploaded. Add it to the frozen YouTube playlist when ready.", cards["87"][0])
+        self.assertIn("Playlist pending", cards["79"][0])
+        self.assertIn("Video uploaded. Add it to the frozen YouTube playlist when ready.", cards["79"][0])
         self.assertEqual(
-            sum('data-queue-action="add-auto-youtube-playlist"' in card for card in cards["87"]),
+            sum('data-queue-action="add-auto-youtube-playlist"' in card for card in cards["79"]),
             1,
         )
-        self.assertIn('data-part-count="2"', "".join(cards["87"]))
-        self.assertNotIn('data-queue-action="start-auto-youtube"', "".join(cards["87"]))
+        self.assertIn('data-part-count="2"', "".join(cards["79"]))
+        self.assertNotIn('data-queue-action="start-auto-youtube"', "".join(cards["79"]))
         self.assertNotIn('data-queue-action="add-auto-youtube-playlist"', "".join(cards["88"]))
         self.assertNotIn('data-queue-action="add-auto-youtube-playlist"', "".join(cards["89"]))
+
+    def test_playlist_pending_job_79_opens_completed_history_without_local_media(self):
+        job = _upload_job("79", deferred=False, states=["completed"])
+        job["urls"] = ["C:/media/deleted-job-79.mkv"]
+        job["auto_youtube_playlist"] = {
+            "state": "playlist_pending",
+            "eligible": True,
+            "pending_parts": 1,
+            "part_count": 1,
+        }
+
+        presentation = _evaluate_completed_history_presentation([job])
+
+        self.assertTrue(presentation["completedDetailsOpen"])
+        self.assertEqual(presentation["completedJobIds"], ["79"])
+        self.assertEqual(presentation["completedCount"], 1)
 
     def test_start_upload_interaction_requires_confirmation_and_prevents_duplicates(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
