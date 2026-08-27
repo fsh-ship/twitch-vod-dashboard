@@ -276,6 +276,7 @@ let lastResults = [];
 let jobOpenState = {};
 let queueDetailOpenState = {};
 const pendingAutoYoutubeReleases = new Set();
+const pendingAutoYoutubePlaylistActions = new Set();
 let autoExpandJobDetails = localStorage.getItem('vodJobAutoExpand') === '1';
 let youtubePlaylistChoices = [];
 let streamerProfileDraft = {};
@@ -2073,6 +2074,16 @@ function queueRecoveryPresentation(item) {
     support:'Waiting for manual start.',
     reviewRequired:false,
   };
+  if (
+    type === 'upload'
+    && item.job?.origin === 'auto_youtube'
+    && item.state === 'completed'
+    && item.job?.auto_youtube_playlist?.state === 'playlist_pending'
+  ) return {
+    status:'Playlist pending',
+    support:'Video uploaded. Add it to the frozen YouTube playlist when ready.',
+    reviewRequired:false,
+  };
   if (item.state !== 'interrupted') return {
     status:({running:item.operation, cancelling:'Cancelling...', waiting:'Queued', completed:'Completed', error:'Failed', cancelled:'Cancelled'})[item.state] || 'Queued',
     support:'', reviewRequired:false,
@@ -2166,7 +2177,15 @@ function renderQueueVodItem(item, compact=false) {
     && bundleStates.length > 0
     && bundleStates.every(state => state === 'queued')
     && !bundleFailureKinds.some(kind => kind === 'uncertain');
+  const playlistStatus = item.job?.auto_youtube_playlist || {};
+  const canAddAutoYoutubePlaylist = item.index === 0
+    && item.job?.type === 'youtube_upload'
+    && item.job?.origin === 'auto_youtube'
+    && item.state === 'completed'
+    && item.job?.state === 'completed'
+    && playlistStatus.eligible === true;
   if (canStartAutoYoutube) actionButtons.push(`<button type="button" class="primary queue-item-action" data-queue-action="start-auto-youtube" data-job-id="${escapeHtml(item.job.id)}" data-part-count="${bundleStates.length}" aria-label="Start YouTube upload: ${escapeHtml(accessibleTitle)}">Start upload</button>`);
+  if (canAddAutoYoutubePlaylist) actionButtons.push(`<button type="button" class="primary queue-item-action" data-queue-action="add-auto-youtube-playlist" data-job-id="${escapeHtml(item.job.id)}" data-part-count="${escapeHtml(playlistStatus.part_count || bundleStates.length)}" aria-label="Add ${escapeHtml(accessibleTitle)} to its YouTube playlist">Add to playlist</button>`);
   if (capabilities.can_cancel) actionButtons.push(`<button type="button" class="danger-outline queue-item-action" data-queue-action="cancel" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Cancel ${escapeHtml(accessibleTitle)}">Cancel</button>`);
   if (capabilities.can_stop_after_current) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="stop" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Stop Queue after ${escapeHtml(accessibleTitle)}">Stop after current</button>`);
   if (capabilities.can_remove) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="remove" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Remove ${escapeHtml(accessibleTitle)} from Queue">Remove from Queue</button>`);
@@ -2216,36 +2235,46 @@ function renderQueueGroup(id, items, emptyMessage, compact=false) {
     remove: ['/api/jobs/remove-item', 'Removed from Queue. The local file was not deleted.'],
     retry: ['/api/jobs/retry-item', 'Starting a fresh retry...'],
     'start-auto-youtube': ['/api/jobs/auto-youtube/release', 'Starting YouTube upload...'],
+    'add-auto-youtube-playlist': ['/api/jobs/auto-youtube/playlist', 'Adding to YouTube playlist...'],
   };
   box.querySelectorAll('.queue-item-action').forEach(button => button.addEventListener('click', async () => {
     const action = button.dataset.queueAction;
     const route = actionRoutes[action];
     if (!route) return;
-    const pendingKey = action === 'start-auto-youtube' ? String(button.dataset.jobId || '') : '';
-    if (pendingKey && pendingAutoYoutubeReleases.has(pendingKey)) return;
-    if (action === 'start-auto-youtube') {
+    const pendingKey = ['start-auto-youtube', 'add-auto-youtube-playlist'].includes(action)
+      ? String(button.dataset.jobId || '')
+      : '';
+    const pendingActions = action === 'add-auto-youtube-playlist'
+      ? pendingAutoYoutubePlaylistActions
+      : pendingAutoYoutubeReleases;
+    if (pendingKey && pendingActions.has(pendingKey)) return;
+    if (action === 'start-auto-youtube' || action === 'add-auto-youtube-playlist') {
       const partCount = Number(button.dataset.partCount);
       const partNote = Number.isInteger(partCount) && partCount > 1
         ? `\nThis VOD contains ${partCount} parts.`
         : '';
-      if (!confirm(`Start this YouTube upload now?${partNote}`)) return;
-      pendingAutoYoutubeReleases.add(pendingKey);
+      const question = action === 'add-auto-youtube-playlist'
+        ? `Add this uploaded video to its YouTube playlist now?${partNote}`
+        : `Start this YouTube upload now?${partNote}`;
+      if (!confirm(question)) return;
+      pendingActions.add(pendingKey);
     }
     button.disabled = true;
     showToast(route[1]);
     try {
-      const payload = action === 'start-auto-youtube'
+      const payload = ['start-auto-youtube', 'add-auto-youtube-playlist'].includes(action)
         ? {job_id:button.dataset.jobId}
         : {job_id:button.dataset.jobId, item_id:button.dataset.itemId};
       const result = await api(route[0], {method:'POST', body:JSON.stringify(payload)});
       if (action === 'retry' && result.retry_job_id) showToast(`Retry started as Job ${result.retry_job_id}.`);
       if (action === 'start-auto-youtube') showToast('YouTube upload queued.');
+      if (action === 'add-auto-youtube-playlist') showToast('YouTube playlist updated.');
       await pollJobs();
     } catch (error) {
       button.disabled = false;
       showToast(friendlyQueueActionError(error), 'bad');
     } finally {
-      if (pendingKey) pendingAutoYoutubeReleases.delete(pendingKey);
+      if (pendingKey) pendingActions.delete(pendingKey);
     }
   }));
 }
@@ -2269,6 +2298,10 @@ function friendlyQueueActionError(error) {
     job_store_unavailable:'Job history persistence is unavailable. No upload was started.',
     ownership_store_unavailable:'Auto YouTube upload state is unavailable. No upload was started.',
     release_worker_start_failed:'The upload worker could not be started. Try again.',
+    playlist_not_pending:'This Auto YouTube job is not ready for playlist insertion.',
+    playlist_lookup_failed:'YouTube playlist membership could not be checked.',
+    playlist_persistence_failed:'Playlist state could not be saved safely. No duplicate insert was attempted.',
+    needs_attention:'Playlist membership needs review before another action.',
   };
   return messages[String(error?.reason || '')] || String(error?.message || 'The Queue action could not be completed.');
 }

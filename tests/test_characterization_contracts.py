@@ -272,6 +272,11 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
                 "api_release_auto_youtube_job",
             ),
             (
+                "/api/jobs/auto-youtube/playlist",
+                "POST",
+                "api_add_auto_youtube_playlist",
+            ),
+            (
                 "/api/jobs/clear-completed",
                 "POST",
                 "api_clear_completed_jobs",
@@ -425,6 +430,124 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
         factory.assert_not_called()
         service.release_auto_youtube_job_for_execution.assert_not_called()
 
+    def test_auto_youtube_playlist_action_delegates_without_arming_worker(self):
+        manager = mock.Mock()
+        service = mock.Mock()
+        service.add_to_playlist.return_value = {
+            "status": "completed",
+            "completed": True,
+        }
+        with mock.patch.object(
+            dashboard, "_job_manager_for_compatibility", return_value=manager
+        ), mock.patch.object(
+            dashboard,
+            "_auto_youtube_playlist_service",
+            return_value=service,
+        ) as factory:
+            response = self.client.post(
+                "/api/jobs/auto-youtube/playlist",
+                json={"job_id": "79"},
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {
+            "ok": True,
+            "job_id": "79",
+            "status": "completed",
+            "completed": True,
+        })
+        factory.assert_called_once_with(manager)
+        service.add_to_playlist.assert_called_once_with("79")
+        manager.start_worker.assert_not_called()
+
+    def test_auto_youtube_playlist_rejects_malformed_or_bulk_identity(self):
+        service = mock.Mock()
+        with mock.patch.object(
+            dashboard,
+            "_auto_youtube_playlist_service",
+            return_value=service,
+        ):
+            requests = [
+                None,
+                {},
+                {"job_id": ""},
+                {"job_id": ["79"]},
+                {"job_id": "all"},
+                {"job_id": "79", "job_ids": ["80"]},
+            ]
+            for payload in requests:
+                with self.subTest(payload=payload):
+                    kwargs = (
+                        {"data": "not-json", "content_type": "application/json"}
+                        if payload is None
+                        else {"json": payload}
+                    )
+                    response = self.client.post(
+                        "/api/jobs/auto-youtube/playlist",
+                        headers=self.csrf_headers,
+                        **kwargs,
+                    )
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(
+                        response.get_json()["reason"], "invalid_request"
+                    )
+        service.add_to_playlist.assert_not_called()
+
+    def test_auto_youtube_playlist_get_is_not_a_mutation_path(self):
+        service = mock.Mock()
+        with mock.patch.object(
+            dashboard,
+            "_auto_youtube_playlist_service",
+            return_value=service,
+        ) as factory:
+            response = self.client.get(
+                "/api/jobs/auto-youtube/playlist?job_id=79"
+            )
+        self.assertNotEqual(response.status_code, 200)
+        factory.assert_not_called()
+        service.add_to_playlist.assert_not_called()
+
+    def test_auto_youtube_playlist_returns_safe_service_failures_without_worker(self):
+        manager = mock.Mock()
+        cases = [
+            ("invalid_auto_youtube_job", 404),
+            ("playlist_not_pending", 409),
+            ("needs_attention", 409),
+            ("ownership_mismatch", 409),
+            ("conflicting_ownership", 409),
+            ("playlist_lookup_failed", 503),
+            ("playlist_persistence_failed", 503),
+            ("job_store_unavailable", 503),
+            ("ownership_store_unavailable", 503),
+        ]
+        for reason, expected_status in cases:
+            with self.subTest(reason=reason):
+                service = mock.Mock()
+                service.add_to_playlist.side_effect = (
+                    dashboard.dashboard_auto_youtube_playlist.AutoYouTubePlaylistError(
+                        reason
+                    )
+                )
+                with mock.patch.object(
+                    dashboard,
+                    "_job_manager_for_compatibility",
+                    return_value=manager,
+                ), mock.patch.object(
+                    dashboard,
+                    "_auto_youtube_playlist_service",
+                    return_value=service,
+                ):
+                    response = self.client.post(
+                        "/api/jobs/auto-youtube/playlist",
+                        json={"job_id": "79"},
+                        headers=self.csrf_headers,
+                    )
+                self.assertEqual(response.status_code, expected_status)
+                self.assertEqual(response.get_json()["reason"], reason)
+                self.assertNotIn("C:\\", str(response.get_json()))
+        manager.start_worker.assert_not_called()
+
     def test_queue_snapshot_is_read_only_and_does_not_invoke_repair(self):
         manager = mock.Mock()
         manager.persistence_status.return_value = {
@@ -449,6 +572,51 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
         manager.persistence_status.assert_called_once_with()
         manager.queue_controls_snapshot.assert_called_once_with()
         factory.assert_not_called()
+        manager.start_worker.assert_not_called()
+
+    def test_queue_snapshot_reads_playlist_status_without_playlist_mutation(self):
+        manager = mock.Mock()
+        auto_job = {
+            "id": "79",
+            "type": "youtube_upload",
+            "origin": "auto_youtube",
+            "auto_youtube_context": {
+                "streamer": "cptmary",
+                "twitch_vod_id": "2857167152",
+            },
+        }
+        manager.snapshot_jobs.return_value = [auto_job]
+        manager.persistence_status.return_value = {
+            "enabled": True,
+            "healthy": True,
+            "load_degraded": False,
+        }
+        manager.queue_controls_snapshot.return_value = {}
+        service = mock.Mock()
+        service.status_for_jobs.return_value = {
+            "79": {
+                "state": "playlist_pending",
+                "eligible": True,
+                "pending_parts": 1,
+                "part_count": 1,
+            }
+        }
+        with mock.patch.object(
+            dashboard, "_job_manager_for_compatibility", return_value=manager
+        ), mock.patch.object(
+            dashboard,
+            "_auto_youtube_playlist_service",
+            return_value=service,
+        ):
+            response = self.client.get("/api/jobs")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["jobs"][0]["auto_youtube_playlist"]["state"],
+            "playlist_pending",
+        )
+        service.status_for_jobs.assert_called_once_with([auto_job])
+        service.add_to_playlist.assert_not_called()
         manager.start_worker.assert_not_called()
 
     def test_auto_youtube_release_returns_safe_service_failures_without_worker(self):

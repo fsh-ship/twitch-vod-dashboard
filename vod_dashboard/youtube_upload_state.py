@@ -335,6 +335,67 @@ class YouTubeUploadStateStore:
                 bundle_state = "playlist_pending" if old.get("playlist_id") else "completed"
             new = deepcopy(old); new.update({"state": bundle_state, "parts": parts, "reason": None, "updated_at": _now(self._clock)})
             normalized = _record_v2(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+
+    def begin_part_playlist_insertion(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_id: Any, part_index: Any) -> UploadRecord:
+        """Persist the playlist-insert uncertainty boundary before mutation."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        job_id = _identifier(upload_job_id, "invalid_playlist_start")
+        item_id = _identifier(upload_item_id, "invalid_playlist_start")
+        if isinstance(part_index, bool) or not isinstance(part_index, int) or part_index < 1:
+            raise YouTubeUploadStateValidationError("invalid_playlist_start")
+        with self._lock:
+            doc = self._load_locked(); old = doc["uploads"].get(key)
+            if old is None: raise YouTubeUploadStateValidationError("upload_not_found")
+            if old["state"] != "playlist_pending" or not old.get("playlist_id") or old["upload_job_id"] != job_id or part_index > len(old["parts"]): raise YouTubeUploadStateValidationError("invalid_playlist_start")
+            parts = deepcopy(old["parts"]); current = parts[part_index - 1]
+            if current["upload_item_id"] != item_id or current["upload_state"] not in {"video_confirmed", "completed"} or current["youtube_video_id"] is None or current["playlist_state"] != "pending": raise YouTubeUploadStateValidationError("invalid_playlist_start")
+            if any(part["playlist_state"] != "confirmed" for part in parts[:part_index - 1]): raise YouTubeUploadStateValidationError("invalid_playlist_order")
+            if any(part["playlist_state"] != "pending" for part in parts[part_index:]): raise YouTubeUploadStateValidationError("invalid_playlist_order")
+            current.update({"playlist_state": "inserting", "reason": None})
+            new = deepcopy(old); new.update({"parts": parts, "reason": None, "updated_at": _now(self._clock)})
+            normalized = _record_v2(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+
+    def confirm_part_playlist_membership(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_id: Any, part_index: Any) -> UploadRecord:
+        """Durably record exact playlist membership without changing video state."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        job_id = _identifier(upload_job_id, "invalid_playlist_confirmation")
+        item_id = _identifier(upload_item_id, "invalid_playlist_confirmation")
+        if isinstance(part_index, bool) or not isinstance(part_index, int) or part_index < 1:
+            raise YouTubeUploadStateValidationError("invalid_playlist_confirmation")
+        with self._lock:
+            doc = self._load_locked(); old = doc["uploads"].get(key)
+            if old is None: raise YouTubeUploadStateValidationError("upload_not_found")
+            if old["state"] != "playlist_pending" or not old.get("playlist_id") or old["upload_job_id"] != job_id or part_index > len(old["parts"]): raise YouTubeUploadStateValidationError("invalid_playlist_confirmation")
+            parts = deepcopy(old["parts"]); current = parts[part_index - 1]
+            if current["upload_item_id"] != item_id or current["upload_state"] not in {"video_confirmed", "completed"} or current["youtube_video_id"] is None or current["playlist_state"] not in {"pending", "inserting", "confirmed"}: raise YouTubeUploadStateValidationError("invalid_playlist_confirmation")
+            current.update({"playlist_state": "confirmed", "reason": None})
+            all_confirmed = all(
+                part["upload_state"] in {"video_confirmed", "completed"}
+                and part["youtube_video_id"] is not None
+                and part["playlist_state"] == "confirmed"
+                for part in parts
+            )
+            new = deepcopy(old); new.update({"state": "completed" if all_confirmed else "playlist_pending", "parts": parts, "reason": None, "updated_at": _now(self._clock)})
+            normalized = _record_v2(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+
+    def mark_part_playlist_attention(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_id: Any, part_index: Any, reason: Any) -> UploadRecord:
+        """Fail closed after an ambiguous playlist insertion outcome."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        job_id = _identifier(upload_job_id, "invalid_playlist_attention")
+        item_id = _identifier(upload_item_id, "invalid_playlist_attention")
+        safe_reason = _reason(reason)
+        if safe_reason not in {"playlist_uncertain", "playlist_failed"} or isinstance(part_index, bool) or not isinstance(part_index, int) or part_index < 1:
+            raise YouTubeUploadStateValidationError("invalid_playlist_attention")
+        with self._lock:
+            doc = self._load_locked(); old = doc["uploads"].get(key)
+            if old is None: raise YouTubeUploadStateValidationError("upload_not_found")
+            if old["state"] != "playlist_pending" or old["upload_job_id"] != job_id or part_index > len(old["parts"]): raise YouTubeUploadStateValidationError("invalid_playlist_attention")
+            parts = deepcopy(old["parts"]); current = parts[part_index - 1]
+            if current["upload_item_id"] != item_id or current["playlist_state"] != "inserting": raise YouTubeUploadStateValidationError("invalid_playlist_attention")
+            current.update({"playlist_state": "uncertain", "reason": safe_reason})
+            new = deepcopy(old); new.update({"state": "needs_attention", "parts": parts, "reason": safe_reason, "updated_at": _now(self._clock)})
+            normalized = _record_v2(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+
     def mark_part_attention(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_id: Any, part_index: Any, reason: Any, uncertain: bool) -> UploadRecord:
         """Atomically block a bundle after a known or uncertain part failure."""
         key = canonical_upload_key(streamer, twitch_vod_id)

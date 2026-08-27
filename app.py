@@ -26,6 +26,7 @@ from vod_dashboard import auto_vod as dashboard_auto_vod
 from vod_dashboard import auto_youtube_handoff as dashboard_auto_youtube_handoff
 from vod_dashboard import auto_youtube_generate as dashboard_auto_youtube_generate
 from vod_dashboard import auto_youtube_execute as dashboard_auto_youtube_execute
+from vod_dashboard import auto_youtube_playlist as dashboard_auto_youtube_playlist
 from vod_dashboard import auto_youtube_materialize as dashboard_auto_youtube_materialize
 from vod_dashboard import auto_youtube_plan as dashboard_auto_youtube_plan
 from vod_dashboard import auto_youtube_prepare as dashboard_auto_youtube_prepare
@@ -1449,6 +1450,21 @@ def _auto_youtube_execution_service(
     )
 
 
+def _auto_youtube_playlist_service(
+    manager: Optional[dashboard_jobs.JobManager] = None,
+) -> dashboard_auto_youtube_playlist.AutoYouTubePlaylistService:
+    return dashboard_auto_youtube_playlist.AutoYouTubePlaylistService(
+        state_store=dashboard_youtube_upload_state.YouTubeUploadStateStore.from_dashboard_dir(
+            DEFAULT_DASHBOARD_DIR
+        ),
+        job_manager=manager or _job_manager_for_compatibility(),
+        media_policy=dashboard_media.MediaPathPolicy(MEDIA_ROOT),
+        settings_provider=load_settings,
+        service_getter=get_youtube_service,
+        log=append_job_log,
+    )
+
+
 def admit_auto_youtube_intent(
     job_id: str, item_id: str, completion_settings: Mapping[str, Any]
 ) -> str:
@@ -2536,6 +2552,17 @@ def api_download():
 def api_jobs():
     manager = _job_manager_for_compatibility()
     jobs_snapshot = manager.snapshot_jobs(reverse=True)
+    if any(job.get("origin") == "auto_youtube" for job in jobs_snapshot):
+        try:
+            playlist_statuses = _auto_youtube_playlist_service(
+                manager
+            ).status_for_jobs(jobs_snapshot)
+            for job in jobs_snapshot:
+                status = playlist_statuses.get(str(job.get("id") or ""))
+                if status is not None:
+                    job["auto_youtube_playlist"] = status
+        except Exception:
+            app.logger.warning("Auto YouTube playlist status was unavailable.")
     persistence = manager.persistence_status()
     return jsonify({
         "jobs": jobs_snapshot,
@@ -2640,6 +2667,73 @@ def api_release_auto_youtube_job():
             "reason": "release_worker_start_failed",
         }), 503
     return jsonify({"ok": True, "job_id": job_id, "status": "released"})
+
+
+@app.post("/api/jobs/auto-youtube/playlist")
+def api_add_auto_youtube_playlist():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or set(data) != {"job_id"}:
+        return jsonify({
+            "error": "An exact Auto YouTube job ID is required.",
+            "reason": "invalid_request",
+        }), 400
+    raw_job_id = data.get("job_id")
+    if not isinstance(raw_job_id, str):
+        return jsonify({
+            "error": "An exact Auto YouTube job ID is required.",
+            "reason": "invalid_request",
+        }), 400
+    job_id = raw_job_id.strip()
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", job_id):
+        return jsonify({
+            "error": "An exact Auto YouTube job ID is required.",
+            "reason": "invalid_request",
+        }), 400
+
+    manager = _job_manager_for_compatibility()
+    try:
+        result = _auto_youtube_playlist_service(manager).add_to_playlist(job_id)
+    except dashboard_auto_youtube_playlist.AutoYouTubePlaylistError as exc:
+        responses = {
+            "invalid_auto_youtube_job": (
+                "The Auto YouTube job was not found.", 404
+            ),
+            "ownership_mismatch": (
+                "This Auto YouTube job has inconsistent ownership state.", 409
+            ),
+            "conflicting_ownership": (
+                "This Auto YouTube job has conflicting ownership state.", 409
+            ),
+            "playlist_not_pending": (
+                "This Auto YouTube job is not ready for playlist insertion.", 409
+            ),
+            "needs_attention": (
+                "Playlist membership needs review before another action.", 409
+            ),
+            "playlist_lookup_failed": (
+                "YouTube playlist membership could not be checked.", 503
+            ),
+            "playlist_persistence_failed": (
+                "Playlist state could not be saved safely.", 503
+            ),
+            "job_store_unavailable": (
+                "Job history persistence is unavailable.", 503
+            ),
+            "ownership_store_unavailable": (
+                "Auto YouTube upload state is unavailable.", 503
+            ),
+        }
+        message, status = responses.get(
+            exc.code, ("The playlist action could not be completed.", 409)
+        )
+        return jsonify({"error": message, "reason": exc.code}), status
+    except Exception:
+        app.logger.error("Auto YouTube playlist action failed.")
+        return jsonify({
+            "error": "The playlist action could not be completed.",
+            "reason": "playlist_action_failed",
+        }), 503
+    return jsonify({"ok": True, "job_id": job_id, **result})
 
 
 @app.post("/api/jobs/clear-completed")

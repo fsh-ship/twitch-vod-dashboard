@@ -54,7 +54,8 @@ const reasons = [
   'recording_retry_unsupported', 'already_retried', 'not_retryable',
   'release_not_allowed', 'ownership_mismatch', 'release_media_invalid',
   'job_store_unavailable', 'ownership_store_unavailable',
-  'release_worker_start_failed'
+  'release_worker_start_failed', 'playlist_not_pending',
+  'playlist_lookup_failed', 'playlist_persistence_failed', 'needs_attention'
 ];
 process.stdout.write(JSON.stringify({
   rendered,
@@ -410,12 +411,58 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertIn("86", result["completedOrder"])
         self.assertNotIn("86", result["activeOrder"])
 
+    def test_completed_auto_youtube_playlist_action_is_eligible_and_bundle_level(self):
+        eligible = _upload_job(
+            "87", deferred=False, states=["completed", "completed"]
+        )
+        eligible["auto_youtube_playlist"] = {
+            "state": "playlist_pending",
+            "eligible": True,
+            "pending_parts": 2,
+            "part_count": 2,
+        }
+        ineligible = _upload_job(
+            "88", deferred=False, states=["completed"]
+        )
+        ineligible["auto_youtube_playlist"] = {
+            "state": "playlist_pending",
+            "eligible": False,
+            "pending_parts": 1,
+            "part_count": 1,
+        }
+        manual = _upload_job(
+            "89", origin="manual", deferred=False, states=["completed"]
+        )
+        manual["auto_youtube_playlist"] = {
+            "state": "playlist_pending",
+            "eligible": True,
+            "pending_parts": 1,
+            "part_count": 1,
+        }
+        result = _evaluate_history_ui([eligible, ineligible, manual])
+        cards = {}
+        for item in result["rendered"]:
+            cards.setdefault(item["jobId"], []).append(item["html"])
+
+        self.assertIn("Playlist pending", cards["87"][0])
+        self.assertIn("Video uploaded. Add it to the frozen YouTube playlist when ready.", cards["87"][0])
+        self.assertEqual(
+            sum('data-queue-action="add-auto-youtube-playlist"' in card for card in cards["87"]),
+            1,
+        )
+        self.assertIn('data-part-count="2"', "".join(cards["87"]))
+        self.assertNotIn('data-queue-action="start-auto-youtube"', "".join(cards["87"]))
+        self.assertNotIn('data-queue-action="add-auto-youtube-playlist"', "".join(cards["88"]))
+        self.assertNotIn('data-queue-action="add-auto-youtube-playlist"', "".join(cards["89"]))
+
     def test_start_upload_interaction_requires_confirmation_and_prevents_duplicates(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("Start this YouTube upload now?", source)
         self.assertIn("This VOD contains ${partCount} parts.", source)
-        self.assertIn("pendingAutoYoutubeReleases.has(pendingKey)", source)
-        self.assertIn("pendingAutoYoutubeReleases.add(pendingKey)", source)
+        self.assertIn("const pendingAutoYoutubeReleases = new Set();", source)
+        self.assertIn("const pendingActions = action === 'add-auto-youtube-playlist'", source)
+        self.assertIn("if (pendingKey && pendingActions.has(pendingKey)) return;", source)
+        self.assertIn("pendingActions.add(pendingKey);", source)
         self.assertIn("button.disabled = true", source)
         self.assertIn("'/api/jobs/auto-youtube/release'", source)
         self.assertIn("? {job_id:button.dataset.jobId}", source)
@@ -428,6 +475,23 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertIn(
             ".queue-item-actions { display:grid; grid-template-columns:1fr; width:100%; }",
             STYLESHEET,
+        )
+
+    def test_playlist_interaction_requires_confirmation_and_prevents_duplicates(self):
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("Add this uploaded video to its YouTube playlist now?", source)
+        self.assertIn("const pendingAutoYoutubePlaylistActions = new Set();", source)
+        self.assertIn("? pendingAutoYoutubePlaylistActions", source)
+        self.assertIn("pendingActions.add(pendingKey);", source)
+        self.assertIn("'/api/jobs/auto-youtube/playlist'", source)
+        self.assertIn("YouTube playlist updated.", source)
+        self.assertIn(
+            "not ready for playlist insertion",
+            self.result["friendly"]["playlist_not_pending"],
+        )
+        self.assertIn(
+            "No duplicate insert was attempted.",
+            self.result["friendly"]["playlist_persistence_failed"],
         )
 
     def test_persistence_health_only_warns_for_degradation(self):
