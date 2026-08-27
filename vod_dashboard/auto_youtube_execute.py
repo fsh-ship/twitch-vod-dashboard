@@ -317,8 +317,34 @@ class AutoYouTubeExecutionService:
                     self._job_manager.defer_auto_youtube_job(job_id)
                 except Exception:
                     result["pending"] += 1
-            elif job.get("execution_deferred") is True:
-                result["deferred"] += 1
             else:
-                result["queued"] += 1
+                current = self._job_manager.get_job(job_id) or job
+                parts = list(record.get("parts") or [])
+                item_ids = list(current.get("item_ids") or [])
+                all_confirmed = bool(parts) and len(parts) == len(item_ids) and all(
+                    part.get("upload_state") in {"video_confirmed", "completed"}
+                    and bool(part.get("youtube_video_id"))
+                    for part in parts
+                )
+                if (
+                    all_confirmed
+                    and current.get("execution_deferred") is True
+                    and list(current.get("item_states") or [])
+                    == ["completed"] * len(parts)
+                ):
+                    try:
+                        # No item transition is needed here, but reuse the
+                        # required completion save to converge a stale durable
+                        # deferred gate after a prior confirmed completion.
+                        self._job_manager.complete_auto_youtube_item(
+                            job_id, item_ids[0]
+                        )
+                        current = self._job_manager.get_job(job_id) or current
+                    except Exception:
+                        result["pending"] += 1
+                        return result
+                if current.get("execution_deferred") is True:
+                    result["deferred"] += 1
+                else:
+                    result["queued"] += 1
         return result

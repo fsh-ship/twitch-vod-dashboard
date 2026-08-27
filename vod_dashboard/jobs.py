@@ -1624,6 +1624,14 @@ class JobManager:
             if isinstance(progress, list) and index < len(progress):
                 progress[index] = 100
             self._recompute_job_state_locked(job)
+            if all(
+                state == "completed" for state in job["item_states"]
+            ):
+                # A ledger-confirmed Auto YouTube bundle that has converged
+                # all of its JobStore items is terminal work, not deferred
+                # work. Persist this with the final completion so restart
+                # recovery cannot leave an unreachable playlist-pending job.
+                job["execution_deferred"] = False
             self._mark_dirty_locked(job)
             snapshot = self._snapshot_for_persistence_locked()
             try:

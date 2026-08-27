@@ -6,7 +6,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from vod_dashboard.auto_youtube_execute import AutoYouTubeExecutionService
+from vod_dashboard.auto_youtube_execute import (
+    AutoYouTubeExecutionError,
+    AutoYouTubeExecutionService,
+)
 from vod_dashboard.auto_youtube_materialize import AutoYouTubeMaterializationService
 from vod_dashboard.auto_youtube_multipart import MediaProbeResult
 from vod_dashboard.auto_youtube_playlist import (
@@ -160,10 +163,10 @@ class AutoYouTubePlaylistTests(unittest.TestCase):
         )
         return job_id, streamer, vod_id, video_sender
 
-    def _service(self, *, membership, inserter):
+    def _service(self, *, membership, inserter, manager=None):
         return AutoYouTubePlaylistService(
             state_store=self.store,
-            job_manager=self.manager,
+            job_manager=manager or self.manager,
             media_policy=MediaPathPolicy(self.media_root),
             settings_provider=lambda: dict(self.settings),
             service_getter=mock.Mock(return_value=mock.Mock()),
@@ -232,6 +235,121 @@ class AutoYouTubePlaylistTests(unittest.TestCase):
         inserter.assert_called_once_with(mock.ANY, "FROZEN_PLAYLIST", "VIDEO_1")
         video_sender.assert_called_once()
         self.assertEqual(len(self.manager.snapshot_jobs()), 1)
+
+    def test_job_79_recovery_completes_deferred_gate_then_accepts_playlist_action(self):
+        self.manager.counter = 78
+        job_id, streamer, vod_id, video_sender = self._create_confirmed_bundle()
+        self.assertEqual(job_id, "79")
+        item_id = self.manager.get_job(job_id)["item_ids"][0]
+        self.assertTrue(
+            self.manager.reset_auto_youtube_item_to_queued(job_id, item_id)
+        )
+        self.assertTrue(self.manager.defer_auto_youtube_job(job_id))
+        stale = self.manager.get_job(job_id)
+        self.assertEqual(stale["item_states"], ["queued"])
+        self.assertTrue(stale["execution_deferred"])
+
+        restarted = JobManager(
+            job_store=JobStore(self.root / "jobs.json"),
+            media_root=self.media_root,
+        )
+        restarted.restore_from_store()
+        recovery_sender = mock.Mock()
+        executor = AutoYouTubeExecutionService(
+            state_store=self.store,
+            job_manager=restarted,
+            media_policy=MediaPathPolicy(self.media_root),
+            settings_provider=lambda: dict(self.settings),
+            service_getter=mock.Mock(),
+            request_builder=mock.Mock(),
+            request_sender=recovery_sender,
+            probe=self._probe,
+        )
+
+        self.assertEqual(executor.reconcile()["confirmed"], 1)
+        recovered = restarted.get_job(job_id)
+        self.assertEqual(recovered["item_states"], ["completed"])
+        self.assertFalse(recovered["execution_deferred"])
+        self.assertIsNone(restarted.claim_next_item(job_id))
+        self.assertEqual(
+            self.store.get(streamer, vod_id)["state"], "playlist_pending"
+        )
+        self.assertEqual(
+            self.store.get(streamer, vod_id)["parts"][0]["youtube_video_id"],
+            "VIDEO_1",
+        )
+        before_repeat = restarted.get_job(job_id)
+        self.assertEqual(executor.reconcile()["confirmed"], 1)
+        self.assertEqual(restarted.get_job(job_id), before_repeat)
+        recovery_sender.assert_not_called()
+        video_sender.assert_called_once()
+        self.assertEqual(len(restarted.snapshot_jobs()), 1)
+
+        reloaded = JobManager(
+            job_store=JobStore(self.root / "jobs.json"),
+            media_root=self.media_root,
+        )
+        reloaded.restore_from_store()
+        self.assertEqual(reloaded.get_job(job_id)["item_states"], ["completed"])
+        self.assertFalse(reloaded.get_job(job_id)["execution_deferred"])
+        with self.assertRaisesRegex(
+            AutoYouTubeExecutionError, "release_not_allowed"
+        ):
+            executor = AutoYouTubeExecutionService(
+                state_store=self.store,
+                job_manager=reloaded,
+                media_policy=MediaPathPolicy(self.media_root),
+                settings_provider=lambda: dict(self.settings),
+                service_getter=mock.Mock(),
+                request_builder=mock.Mock(),
+                request_sender=mock.Mock(),
+                probe=self._probe,
+            )
+            executor.release_auto_youtube_job_for_execution(job_id)
+
+        membership = mock.Mock(return_value=True)
+        inserter = mock.Mock()
+        result = self._service(
+            manager=reloaded, membership=membership, inserter=inserter
+        ).add_to_playlist(job_id)
+        record = self.store.get(streamer, vod_id)
+        self.assertEqual(result, {"status": "completed", "completed": True})
+        self.assertEqual(record["state"], "completed")
+        self.assertEqual(record["parts"][0]["playlist_state"], "confirmed")
+        inserter.assert_not_called()
+        membership.assert_called_once()
+
+    def test_recovery_clears_a_stale_deferred_gate_from_an_already_completed_job(self):
+        job_id, streamer, vod_id, video_sender = self._create_confirmed_bundle()
+        self.assertTrue(self.manager.defer_auto_youtube_job(job_id))
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed"])
+        self.assertTrue(self.manager.get_job(job_id)["execution_deferred"])
+
+        restarted = JobManager(
+            job_store=JobStore(self.root / "jobs.json"),
+            media_root=self.media_root,
+        )
+        restarted.restore_from_store()
+        recovery_sender = mock.Mock()
+        executor = AutoYouTubeExecutionService(
+            state_store=self.store,
+            job_manager=restarted,
+            media_policy=MediaPathPolicy(self.media_root),
+            settings_provider=lambda: dict(self.settings),
+            service_getter=mock.Mock(),
+            request_builder=mock.Mock(),
+            request_sender=recovery_sender,
+            probe=self._probe,
+        )
+
+        self.assertEqual(executor.reconcile()["confirmed"], 1)
+        self.assertEqual(restarted.get_job(job_id)["item_states"], ["completed"])
+        self.assertFalse(restarted.get_job(job_id)["execution_deferred"])
+        self.assertEqual(
+            self.store.get(streamer, vod_id)["state"], "playlist_pending"
+        )
+        recovery_sender.assert_not_called()
+        video_sender.assert_called_once()
 
     def test_existing_membership_is_confirmed_without_insert_and_is_idempotent(self):
         job_id, _streamer, _vod_id, video_sender = self._create_confirmed_bundle()

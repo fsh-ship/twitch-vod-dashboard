@@ -387,6 +387,7 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
             upload_item_id=item_ids[0], part_index=1,
             youtube_video_id="YT_1",
         )
+        self.assertTrue(self.manager.defer_auto_youtube_job(job_id))
 
         restarted = self.new_manager()
         restarted.restore_from_store()
@@ -395,6 +396,7 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         job = restarted.get_job(job_id)
         self.assertEqual(job["state"], "queued")
         self.assertEqual(job["item_states"], ["completed", "queued", "queued"])
+        self.assertTrue(job["execution_deferred"])
         record = self.store.get("bearlychen", VOD_ID)
         self.assertEqual(record["state"], "upload_queued")
         self.assertEqual(
