@@ -2085,6 +2085,16 @@ function queueRecoveryPresentation(item) {
     support:'Video uploaded. Add it to the frozen YouTube playlist when ready.',
     reviewRequired:false,
   };
+  if (
+    type === 'upload'
+    && item.job?.origin === 'auto_youtube'
+    && item.state === 'completed'
+    && item.job?.auto_youtube_playlist?.state === 'needs_attention'
+  ) return {
+    status:'Playlist needs attention',
+    support:'Video uploaded, but playlist membership could not be confirmed safely.',
+    reviewRequired:true,
+  };
   if (item.state !== 'interrupted') return {
     status:({running:item.operation, cancelling:'Cancelling...', waiting:'Queued', completed:'Completed', error:'Failed', cancelled:'Cancelled'})[item.state] || 'Queued',
     support:'', reviewRequired:false,

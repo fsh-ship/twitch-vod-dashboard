@@ -1447,6 +1447,9 @@ def _auto_youtube_execution_service(
         ),
         request_sender=dashboard_youtube.send_resumable_video_upload_request,
         log=append_job_log,
+        playlist_chainer=lambda job_id: _auto_youtube_playlist_service(
+            execution_manager
+        ).add_to_playlist(job_id),
     )
 
 

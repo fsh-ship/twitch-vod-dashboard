@@ -517,6 +517,22 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertNotIn('data-queue-action="add-auto-youtube-playlist"', "".join(cards["88"]))
         self.assertNotIn('data-queue-action="add-auto-youtube-playlist"', "".join(cards["89"]))
 
+    def test_automatic_playlist_attention_is_visible_without_a_retry_action(self):
+        job = _upload_job("90", deferred=False, states=["completed"])
+        job["auto_youtube_playlist"] = {
+            "state": "needs_attention",
+            "eligible": False,
+            "pending_parts": 0,
+            "part_count": 1,
+        }
+
+        card = _evaluate_history_ui([job])["rendered"][0]["html"]
+
+        self.assertIn("Playlist needs attention", card)
+        self.assertIn("could not be confirmed safely", card)
+        self.assertIn("Review required", card)
+        self.assertNotIn('data-queue-action="add-auto-youtube-playlist"', card)
+
     def test_playlist_pending_job_79_opens_completed_history_without_local_media(self):
         job = _upload_job("79", deferred=False, states=["completed"])
         job["urls"] = ["C:/media/deleted-job-79.mkv"]

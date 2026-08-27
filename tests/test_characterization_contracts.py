@@ -461,6 +461,21 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
         service.add_to_playlist.assert_called_once_with("79")
         manager.start_worker.assert_not_called()
 
+    def test_auto_youtube_execution_factory_chains_only_through_playlist_service(self):
+        manager = mock.Mock()
+        playlist_service = mock.Mock()
+        with mock.patch.object(
+            dashboard,
+            "_auto_youtube_playlist_service",
+            return_value=playlist_service,
+        ) as factory:
+            executor = dashboard._auto_youtube_execution_service(manager)
+            self.assertIsNotNone(executor._playlist_chainer)
+            executor._playlist_chainer("79")
+
+        factory.assert_called_once_with(manager)
+        playlist_service.add_to_playlist.assert_called_once_with("79")
+
     def test_auto_youtube_playlist_rejects_malformed_or_bulk_identity(self):
         service = mock.Mock()
         with mock.patch.object(

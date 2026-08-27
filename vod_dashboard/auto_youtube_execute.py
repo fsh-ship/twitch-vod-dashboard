@@ -38,6 +38,7 @@ class AutoYouTubeExecutionService:
         request_sender: Callable[..., Optional[str]],
         probe: Callable[[Path], MediaProbeResult] = probe_media,
         log: Optional[Callable[[str, str], None]] = None,
+        playlist_chainer: Optional[Callable[[str], Any]] = None,
     ) -> None:
         self._state_store = state_store
         self._job_manager = job_manager
@@ -48,6 +49,7 @@ class AutoYouTubeExecutionService:
         self._request_sender = request_sender
         self._probe = probe
         self._log = log or (lambda _job_id, _message: None)
+        self._playlist_chainer = playlist_chainer
 
     def _materializer(self) -> AutoYouTubeMaterializationService:
         return AutoYouTubeMaterializationService(
@@ -223,7 +225,7 @@ class AutoYouTubeExecutionService:
             return False
 
         try:
-            self._state_store.confirm_part_video(
+            confirmed_record = self._state_store.confirm_part_video(
                 record["streamer"], record["twitch_vod_id"],
                 upload_job_id=job_id, upload_item_id=item_id,
                 part_index=index + 1, youtube_video_id=video_id,
@@ -241,6 +243,24 @@ class AutoYouTubeExecutionService:
                 pass
             return False
         self._log(job_id, f"Auto YouTube video part {index + 1}/{len(descriptors)} confirmed.")
+        completed_job = self._job_manager.get_job(job_id) or {}
+        if (
+            self._playlist_chainer is not None
+            and confirmed_record.get("state") == "playlist_pending"
+            and list(completed_job.get("item_states") or [])
+            == ["completed"] * len(descriptors)
+        ):
+            try:
+                self._playlist_chainer(job_id)
+            except Exception:
+                # Video ownership is already durable. Playlist handling is a
+                # separate post-upload action and must never roll the upload
+                # back, requeue it, or cause a second video transmission.
+                self._log(
+                    job_id,
+                    "Automatic YouTube playlist processing could not be completed. "
+                    "Review the playlist status before another action.",
+                )
         return True
 
     def run_job(self, job_id: str) -> None:

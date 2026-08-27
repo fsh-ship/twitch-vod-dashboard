@@ -141,7 +141,7 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         self.assertGreaterEqual(materializer.reconcile()["queued"], 1)
         return self.store.get(streamer, vod_id)["upload_job_id"]
 
-    def executor(self, manager=None):
+    def executor(self, manager=None, *, playlist_chainer=None):
         return AutoYouTubeExecutionService(
             state_store=self.store, job_manager=manager or self.manager,
             media_policy=MediaPathPolicy(self.media_root),
@@ -150,6 +150,7 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
             request_builder=self.request_builder,
             request_sender=self.request_sender,
             probe=self.probe,
+            playlist_chainer=playlist_chainer,
         )
 
     def test_deferred_production_style_job_remains_inert_through_reconcile_and_worker_opportunity(self):
@@ -179,6 +180,21 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         manual = self.manager.create_upload_job(["bearlychen/source.mkv"], "Manual")
         with self.assertRaisesRegex(AutoYouTubeExecutionError, "invalid_auto_youtube_job"):
             self.executor().release_auto_youtube_job_for_execution(manual)
+
+    def test_successful_auto_upload_without_frozen_playlist_does_not_chain_playlist_work(self):
+        job_id = self.create_bundle(playlist_id="")
+        playlist_chainer = mock.Mock()
+        executor = self.executor(playlist_chainer=playlist_chainer)
+
+        self.assertTrue(executor.release_auto_youtube_job_for_execution(job_id))
+        executor.run_job(job_id)
+
+        record = self.store.get("bearlychen", VOD_ID)
+        self.assertEqual(record["state"], "completed")
+        self.assertEqual(record["parts"][0]["upload_state"], "video_confirmed")
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed"])
+        playlist_chainer.assert_not_called()
+        self.request_sender.assert_called_once()
 
     def test_job_79_style_release_is_durable_and_changes_only_selected_bundle(self):
         self.manager.counter = 78

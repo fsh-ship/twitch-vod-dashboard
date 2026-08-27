@@ -47,7 +47,14 @@ class AutoYouTubePlaylistTests(unittest.TestCase):
     def _probe(self, _path: Path) -> MediaProbeResult:
         return MediaProbeResult(1.0, (), ())
 
-    def _create_confirmed_bundle(self, total=1, *, streamer="cptmary", vod_id="2857167152"):
+    def _create_confirmed_bundle(
+        self,
+        total=1,
+        *,
+        streamer="cptmary",
+        vod_id="2857167152",
+        playlist_chainer=None,
+    ):
         source = self.media_root / streamer / "source.mkv"
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_bytes(b"source-media")
@@ -155,12 +162,14 @@ class AutoYouTubePlaylistTests(unittest.TestCase):
             request_builder=mock.Mock(return_value={"request": "video"}),
             request_sender=video_sender,
             probe=self._probe,
+            playlist_chainer=playlist_chainer,
         )
         self.assertTrue(executor.release_auto_youtube_job_for_execution(job_id))
         executor.run_job(job_id)
-        self.assertEqual(
-            self.store.get(streamer, vod_id)["state"], "playlist_pending"
-        )
+        if playlist_chainer is None:
+            self.assertEqual(
+                self.store.get(streamer, vod_id)["state"], "playlist_pending"
+            )
         return job_id, streamer, vod_id, video_sender
 
     def _service(self, *, membership, inserter, manager=None):
@@ -173,6 +182,10 @@ class AutoYouTubePlaylistTests(unittest.TestCase):
             membership_lookup=membership,
             playlist_inserter=inserter,
         )
+
+    def _automatic_playlist_chainer(self, *, membership, inserter):
+        service = self._service(membership=membership, inserter=inserter)
+        return mock.Mock(side_effect=service.add_to_playlist)
 
     def test_membership_lookup_paginates_and_matches_the_exact_video_id(self):
         first = mock.Mock()
@@ -235,6 +248,165 @@ class AutoYouTubePlaylistTests(unittest.TestCase):
         inserter.assert_called_once_with(mock.ANY, "FROZEN_PLAYLIST", "VIDEO_1")
         video_sender.assert_called_once()
         self.assertEqual(len(self.manager.snapshot_jobs()), 1)
+
+    def test_successful_video_upload_automatically_confirms_playlist_membership(self):
+        membership = mock.Mock(return_value=False)
+        inserter = mock.Mock(return_value={"id": "PLAYLIST_ITEM_1"})
+        chainer = self._automatic_playlist_chainer(
+            membership=membership, inserter=inserter
+        )
+
+        job_id, streamer, vod_id, video_sender = self._create_confirmed_bundle(
+            playlist_chainer=chainer
+        )
+
+        record = self.store.get(streamer, vod_id)
+        self.assertEqual(record["state"], "completed")
+        self.assertEqual(record["parts"][0]["upload_state"], "video_confirmed")
+        self.assertEqual(record["parts"][0]["youtube_video_id"], "VIDEO_1")
+        self.assertEqual(record["parts"][0]["playlist_state"], "confirmed")
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed"])
+        chainer.assert_called_once_with(job_id)
+        membership.assert_called_once_with(mock.ANY, "FROZEN_PLAYLIST", "VIDEO_1")
+        inserter.assert_called_once_with(mock.ANY, "FROZEN_PLAYLIST", "VIDEO_1")
+        video_sender.assert_called_once()
+        self.assertTrue((self.media_root / streamer / "source.mkv").exists())
+        self.assertEqual(len(self.manager.snapshot_jobs()), 1)
+
+    def test_automatic_playlist_chain_skips_insert_when_video_is_already_present(self):
+        membership = mock.Mock(return_value=True)
+        inserter = mock.Mock()
+        chainer = self._automatic_playlist_chainer(
+            membership=membership, inserter=inserter
+        )
+
+        job_id, streamer, vod_id, video_sender = self._create_confirmed_bundle(
+            playlist_chainer=chainer
+        )
+
+        self.assertEqual(self.store.get(streamer, vod_id)["state"], "completed")
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed"])
+        chainer.assert_called_once_with(job_id)
+        membership.assert_called_once()
+        inserter.assert_not_called()
+        video_sender.assert_called_once()
+
+    def test_automatic_playlist_chain_keeps_confirmed_video_when_preinsert_persistence_fails(self):
+        membership = mock.Mock(return_value=False)
+        inserter = mock.Mock()
+        chainer = self._automatic_playlist_chainer(
+            membership=membership, inserter=inserter
+        )
+        with mock.patch.object(
+            self.store,
+            "begin_part_playlist_insertion",
+            side_effect=YouTubeUploadStatePersistenceError("full"),
+        ):
+            job_id, streamer, vod_id, video_sender = self._create_confirmed_bundle(
+                playlist_chainer=chainer
+            )
+
+        record = self.store.get(streamer, vod_id)
+        self.assertEqual(record["state"], "playlist_pending")
+        self.assertEqual(record["parts"][0]["upload_state"], "video_confirmed")
+        self.assertEqual(record["parts"][0]["youtube_video_id"], "VIDEO_1")
+        self.assertEqual(record["parts"][0]["playlist_state"], "pending")
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed"])
+        chainer.assert_called_once_with(job_id)
+        inserter.assert_not_called()
+        video_sender.assert_called_once()
+
+    def test_automatic_playlist_chain_handles_ambiguous_insert_without_reupload(self):
+        membership = mock.Mock(side_effect=[False, False])
+        inserter = mock.Mock(side_effect=RuntimeError("connection lost"))
+        chainer = self._automatic_playlist_chainer(
+            membership=membership, inserter=inserter
+        )
+
+        job_id, streamer, vod_id, video_sender = self._create_confirmed_bundle(
+            playlist_chainer=chainer
+        )
+
+        record = self.store.get(streamer, vod_id)
+        self.assertEqual(record["state"], "needs_attention")
+        self.assertEqual(record["parts"][0]["upload_state"], "video_confirmed")
+        self.assertEqual(record["parts"][0]["playlist_state"], "uncertain")
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed"])
+        chainer.assert_called_once_with(job_id)
+        self.assertEqual(membership.call_count, 2)
+        inserter.assert_called_once()
+        video_sender.assert_called_once()
+
+    def test_automatic_playlist_chain_confirms_ambiguous_insert_after_membership_recheck(self):
+        membership = mock.Mock(side_effect=[False, True])
+        inserter = mock.Mock(side_effect=RuntimeError("connection lost"))
+        chainer = self._automatic_playlist_chainer(
+            membership=membership, inserter=inserter
+        )
+
+        job_id, streamer, vod_id, video_sender = self._create_confirmed_bundle(
+            playlist_chainer=chainer
+        )
+
+        record = self.store.get(streamer, vod_id)
+        self.assertEqual(record["state"], "completed")
+        self.assertEqual(record["parts"][0]["playlist_state"], "confirmed")
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed"])
+        self.assertEqual(membership.call_count, 2)
+        inserter.assert_called_once()
+        video_sender.assert_called_once()
+
+    def test_automatic_multipart_playlist_chain_confirms_serially_and_skips_present_part(self):
+        membership = mock.Mock(side_effect=[True, False, False])
+        inserter = mock.Mock(side_effect=[
+            {"id": "PLAYLIST_ITEM_2"}, {"id": "PLAYLIST_ITEM_3"}
+        ])
+        chainer = self._automatic_playlist_chainer(
+            membership=membership, inserter=inserter
+        )
+
+        job_id, streamer, vod_id, video_sender = self._create_confirmed_bundle(
+            3, playlist_chainer=chainer
+        )
+
+        record = self.store.get(streamer, vod_id)
+        self.assertEqual(record["state"], "completed")
+        self.assertEqual(
+            [part["playlist_state"] for part in record["parts"]],
+            ["confirmed", "confirmed", "confirmed"],
+        )
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], [
+            "completed", "completed", "completed"
+        ])
+        chainer.assert_called_once_with(job_id)
+        self.assertEqual(inserter.call_count, 2)
+        self.assertEqual(video_sender.call_count, 3)
+
+    def test_automatic_multipart_playlist_chain_is_serial_and_stops_after_ambiguity(self):
+        membership = mock.Mock(side_effect=[False, False, False])
+        inserter = mock.Mock(side_effect=[
+            {"id": "PLAYLIST_ITEM_1"}, RuntimeError("connection lost")
+        ])
+        chainer = self._automatic_playlist_chainer(
+            membership=membership, inserter=inserter
+        )
+
+        job_id, streamer, vod_id, video_sender = self._create_confirmed_bundle(
+            3, playlist_chainer=chainer
+        )
+
+        record = self.store.get(streamer, vod_id)
+        self.assertEqual(record["state"], "needs_attention")
+        self.assertEqual(
+            [part["playlist_state"] for part in record["parts"]],
+            ["confirmed", "uncertain", "pending"],
+        )
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], [
+            "completed", "completed", "completed"
+        ])
+        chainer.assert_called_once_with(job_id)
+        self.assertEqual(inserter.call_count, 2)
+        self.assertEqual(video_sender.call_count, 3)
 
     def test_job_79_recovery_completes_deferred_gate_then_accepts_playlist_action(self):
         self.manager.counter = 78
