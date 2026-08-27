@@ -974,9 +974,10 @@ def _normalize_upload(
     )
     if not auto_fields_present:
         return
+    execution_deferred = job.get("execution_deferred")
     if (
         job.get("origin") != "auto_youtube"
-        or job.get("execution_deferred") is not True
+        or not isinstance(execution_deferred, bool)
     ):
         raise JobStoreValidationError("invalid_auto_youtube_job")
     key = job.get("auto_youtube_key")
@@ -1002,7 +1003,7 @@ def _normalize_upload(
     result.update(
         {
             "origin": "auto_youtube",
-            "execution_deferred": True,
+            "execution_deferred": execution_deferred,
             "auto_youtube_key": key,
             "auto_youtube_context": context,
         }

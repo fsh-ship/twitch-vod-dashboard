@@ -25,6 +25,7 @@ from vod_dashboard import auto_recording_runtime as dashboard_auto_runtime
 from vod_dashboard import auto_vod as dashboard_auto_vod
 from vod_dashboard import auto_youtube_handoff as dashboard_auto_youtube_handoff
 from vod_dashboard import auto_youtube_generate as dashboard_auto_youtube_generate
+from vod_dashboard import auto_youtube_execute as dashboard_auto_youtube_execute
 from vod_dashboard import auto_youtube_materialize as dashboard_auto_youtube_materialize
 from vod_dashboard import auto_youtube_plan as dashboard_auto_youtube_plan
 from vod_dashboard import auto_youtube_prepare as dashboard_auto_youtube_prepare
@@ -931,6 +932,10 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
         auto_youtube_materialization = {
             "queued": 0, "attention": 0, "pending": 0, "ignored": 0,
         }
+        auto_youtube_execution = {
+            "deferred": 0, "queued": 0, "confirmed": 0,
+            "blocked": 0, "pending": 0,
+        }
         try:
             auto_youtube_handoff = _auto_youtube_handoff_service(
                 manager
@@ -970,6 +975,14 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
         except Exception:
             app.logger.error(
                 "Auto YouTube job materialization failed (materialization_reconciliation_failed)."
+            )
+        try:
+            auto_youtube_execution = _auto_youtube_execution_service(
+                manager
+            ).reconcile()
+        except Exception:
+            app.logger.error(
+                "Auto YouTube execution reconciliation failed (execution_reconciliation_failed)."
             )
 
         monitor_started = False
@@ -1026,6 +1039,7 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             "auto_youtube_generation": auto_youtube_generation,
             "auto_youtube_replan": auto_youtube_replan,
             "auto_youtube_materialization": auto_youtube_materialization,
+            "auto_youtube_execution": auto_youtube_execution,
         }
         app.logger.info(
             "Worker runtime initialized: loaded=%d discarded=%d "
@@ -1401,6 +1415,30 @@ def _auto_youtube_materialization_service(
     )
 
 
+def _auto_youtube_execution_service(
+    manager: Optional[dashboard_jobs.JobManager] = None,
+) -> dashboard_auto_youtube_execute.AutoYouTubeExecutionService:
+    execution_manager = manager or _job_manager_for_compatibility()
+    return dashboard_auto_youtube_execute.AutoYouTubeExecutionService(
+        state_store=dashboard_youtube_upload_state.YouTubeUploadStateStore.from_dashboard_dir(
+            DEFAULT_DASHBOARD_DIR
+        ),
+        job_manager=execution_manager,
+        media_policy=dashboard_media.MediaPathPolicy(MEDIA_ROOT),
+        settings_provider=load_settings,
+        service_getter=get_youtube_service,
+        request_builder=lambda service, path, body, settings: dashboard_youtube.create_resumable_video_upload_request(
+            path,
+            body,
+            service=service,
+            media_upload_factory=MediaFileUpload,
+            chunk_size_mb=youtube_chunk_mb(dict(settings)),
+        ),
+        request_sender=dashboard_youtube.send_resumable_video_upload_request,
+        log=append_job_log,
+    )
+
+
 def admit_auto_youtube_intent(
     job_id: str, item_id: str, completion_settings: Mapping[str, Any]
 ) -> str:
@@ -1707,15 +1745,19 @@ def create_upload_job(
 
 
 def run_upload_job(job_id: str) -> None:
+    manager = _job_manager_for_compatibility()
     dependencies = dashboard_jobs.UploadWorkerDependencies(
         load_settings=load_settings,
         append_log=append_job_log,
         get_youtube_service=get_youtube_service,
         safe_local_video_path=safe_local_video_path,
         upload_to_youtube=upload_video_to_youtube,
+        auto_youtube_executor=lambda current_job_id: _auto_youtube_execution_service(
+            manager
+        ).run_job(current_job_id),
     )
     dashboard_jobs.run_upload_job(
-        job_id, _job_manager_for_compatibility(), dependencies
+        job_id, manager, dependencies
     )
 
 

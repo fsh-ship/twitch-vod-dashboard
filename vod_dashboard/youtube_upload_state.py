@@ -296,6 +296,63 @@ class YouTubeUploadStateStore:
             new = deepcopy(old); new.update({"state": "upload_queued", "upload_job_id": job_id, "parts": parts, "reason": None, "updated_at": _now(self._clock)})
             normalized = _record_v2(new, key)
             doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+    def begin_part_transfer(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_id: Any, part_index: Any) -> UploadRecord:
+        """Persist the uncertainty boundary before the first resumable send."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        job_id = _identifier(upload_job_id, "invalid_transfer_start")
+        item_id = _identifier(upload_item_id, "invalid_transfer_start")
+        if isinstance(part_index, bool) or not isinstance(part_index, int) or part_index < 1:
+            raise YouTubeUploadStateValidationError("invalid_transfer_start")
+        with self._lock:
+            doc = self._load_locked(); old = doc["uploads"].get(key)
+            if old is None: raise YouTubeUploadStateValidationError("upload_not_found")
+            if old["state"] != "upload_queued" or old["upload_job_id"] != job_id or part_index > len(old["parts"]): raise YouTubeUploadStateValidationError("invalid_transfer_start")
+            parts = deepcopy(old["parts"]); current = parts[part_index - 1]
+            if current["upload_item_id"] != item_id or current["upload_state"] != "queued" or current["youtube_video_id"] is not None: raise YouTubeUploadStateValidationError("invalid_transfer_start")
+            if any(part["upload_state"] not in {"video_confirmed", "completed"} or part["youtube_video_id"] is None for part in parts[:part_index - 1]): raise YouTubeUploadStateValidationError("invalid_transfer_order")
+            if any(part["upload_state"] != "queued" or part["youtube_video_id"] is not None for part in parts[part_index:]): raise YouTubeUploadStateValidationError("invalid_transfer_order")
+            current.update({"upload_state": "transfer_started", "attempts": current["attempts"] + 1, "reason": None})
+            new = deepcopy(old); new.update({"parts": parts, "reason": None, "updated_at": _now(self._clock)})
+            normalized = _record_v2(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+    def confirm_part_video(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_id: Any, part_index: Any, youtube_video_id: Any) -> UploadRecord:
+        """Persist the confirmed remote ID before JobStore completion."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        job_id = _identifier(upload_job_id, "invalid_video_confirmation")
+        item_id = _identifier(upload_item_id, "invalid_video_confirmation")
+        video_id = _youtube_id(youtube_video_id, "invalid_video_confirmation")
+        if video_id is None or isinstance(part_index, bool) or not isinstance(part_index, int) or part_index < 1:
+            raise YouTubeUploadStateValidationError("invalid_video_confirmation")
+        with self._lock:
+            doc = self._load_locked(); old = doc["uploads"].get(key)
+            if old is None: raise YouTubeUploadStateValidationError("upload_not_found")
+            if old["state"] != "upload_queued" or old["upload_job_id"] != job_id or part_index > len(old["parts"]): raise YouTubeUploadStateValidationError("invalid_video_confirmation")
+            parts = deepcopy(old["parts"]); current = parts[part_index - 1]
+            if current["upload_item_id"] != item_id or current["upload_state"] != "transfer_started" or current["youtube_video_id"] is not None: raise YouTubeUploadStateValidationError("invalid_video_confirmation")
+            current.update({"upload_state": "video_confirmed", "youtube_video_id": video_id, "reason": None})
+            all_confirmed = all(part["upload_state"] in {"video_confirmed", "completed"} and part["youtube_video_id"] is not None for part in parts)
+            bundle_state = old["state"]
+            if all_confirmed:
+                bundle_state = "playlist_pending" if old.get("playlist_id") else "completed"
+            new = deepcopy(old); new.update({"state": bundle_state, "parts": parts, "reason": None, "updated_at": _now(self._clock)})
+            normalized = _record_v2(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+    def mark_part_attention(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_id: Any, part_index: Any, reason: Any, uncertain: bool) -> UploadRecord:
+        """Atomically block a bundle after a known or uncertain part failure."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        job_id = _identifier(upload_job_id, "invalid_part_attention")
+        item_id = _identifier(upload_item_id, "invalid_part_attention")
+        safe_reason = _reason(reason)
+        if safe_reason is None or isinstance(part_index, bool) or not isinstance(part_index, int) or part_index < 1:
+            raise YouTubeUploadStateValidationError("invalid_part_attention")
+        with self._lock:
+            doc = self._load_locked(); old = doc["uploads"].get(key)
+            if old is None: raise YouTubeUploadStateValidationError("upload_not_found")
+            if old["state"] != "upload_queued" or old["upload_job_id"] != job_id or part_index > len(old["parts"]): raise YouTubeUploadStateValidationError("invalid_part_attention")
+            parts = deepcopy(old["parts"]); current = parts[part_index - 1]
+            expected_state = "transfer_started" if uncertain else "queued"
+            if current["upload_item_id"] != item_id or current["upload_state"] != expected_state or current["youtube_video_id"] is not None: raise YouTubeUploadStateValidationError("invalid_part_attention")
+            current.update({"upload_state": "uncertain" if uncertain else "failed_known", "reason": safe_reason})
+            new = deepcopy(old); new.update({"state": "needs_attention", "parts": parts, "reason": safe_reason, "updated_at": _now(self._clock)})
+            normalized = _record_v2(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
     def replace_split_for_replan(self, streamer: Any, twitch_vod_id: Any, *, expected_generation_id: Any, split: Any) -> UploadRecord:
         """Atomically replace exactly one proven-invalid multipart generation plan."""
         key = canonical_upload_key(streamer, twitch_vod_id)

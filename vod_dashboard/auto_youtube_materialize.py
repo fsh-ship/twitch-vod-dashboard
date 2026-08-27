@@ -195,7 +195,7 @@ class AutoYouTubeMaterializationService:
         if (
             job.get("type") != "youtube_upload"
             or job.get("origin") != "auto_youtube"
-            or job.get("execution_deferred") is not True
+            or not isinstance(job.get("execution_deferred"), bool)
             or job.get("auto_youtube_key") != key
             or dict(context) != expected_context
             or job.get("urls") != [part["media_path"] for part in descriptors]

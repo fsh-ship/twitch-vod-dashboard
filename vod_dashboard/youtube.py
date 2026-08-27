@@ -588,6 +588,59 @@ def move_uploaded_vod_to_done_folder(
         return path
 
 
+def create_resumable_video_upload_request(
+    path: Path,
+    body: Mapping[str, Any],
+    *,
+    service: Any,
+    media_upload_factory: Callable[..., Any],
+    chunk_size_mb: int,
+) -> Any:
+    """Build a resumable request without executing or sending a media chunk."""
+    media_path = Path(path)
+    mimetype = mimetypes.guess_type(str(media_path))[0] or "video/mp4"
+    media = media_upload_factory(
+        str(media_path),
+        mimetype=mimetype,
+        chunksize=int(chunk_size_mb) * 1024 * 1024,
+        resumable=True,
+    )
+    return service.videos().insert(
+        part="snippet,status", body=dict(body), media_body=media
+    )
+
+
+def send_resumable_video_upload_request(
+    upload_request: Any,
+    *,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    fallback_total_bytes: Optional[int] = None,
+) -> Optional[str]:
+    """Send resumable chunks; ``next_chunk`` is the first network boundary."""
+    response = None
+    while response is None:
+        status, response = upload_request.next_chunk()
+        if status:
+            total_bytes = getattr(status, "total_size", None)
+            if not isinstance(total_bytes, int) or total_bytes <= 0:
+                total_bytes = fallback_total_bytes
+            bytes_uploaded = getattr(status, "resumable_progress", None)
+            if (
+                not isinstance(bytes_uploaded, int)
+                and isinstance(total_bytes, int)
+                and total_bytes > 0
+            ):
+                bytes_uploaded = int(status.progress() * total_bytes)
+            if (
+                progress_callback
+                and isinstance(bytes_uploaded, int)
+                and isinstance(total_bytes, int)
+                and total_bytes > 0
+            ):
+                progress_callback(bytes_uploaded, total_bytes)
+    return response.get("id") if isinstance(response, Mapping) else None
+
+
 def upload_video_to_youtube(
     path: Path,
     settings: Dict[str, Any],

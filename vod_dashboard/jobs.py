@@ -401,6 +401,7 @@ class UploadWorkerDependencies:
     get_youtube_service: Callable[..., Any]
     safe_local_video_path: Callable[..., Path]
     upload_to_youtube: Callable[..., Optional[str]]
+    auto_youtube_executor: Optional[Callable[[str], None]] = None
 
 
 class JobManager:
@@ -823,6 +824,14 @@ class JobManager:
             and job.get("execution_deferred") is True
         )
 
+    @staticmethod
+    def _is_auto_youtube(job: Job) -> bool:
+        return (
+            job.get("type") == "youtube_upload"
+            and job.get("origin") == "auto_youtube"
+            and isinstance(job.get("execution_deferred"), bool)
+        )
+
     def _reconcile_restored_job(
         self, job: Job, reconciliation_time: str
     ) -> int:
@@ -989,9 +998,10 @@ class JobManager:
                         ]
                 self._recompute_job_state_locked(job)
                 continue
-            if self._is_deferred_auto_youtube(job):
-                # This durable marker is an execution gate, not a paused
-                # queue. It owns no worker and must survive restart queued.
+            if self._is_auto_youtube(job):
+                # The ownership ledger, not generic upload recovery, decides
+                # whether a released Auto YouTube item is safe, confirmed, or
+                # uncertain. Deferred canaries remain untouched and queued.
                 self._recompute_job_state_locked(job)
                 continue
             has_nonterminal = any(
@@ -1548,6 +1558,125 @@ class JobManager:
             auto_youtube_context=context,
             auto_youtube_parts=persist_parts,
         )
+
+    def release_auto_youtube_job_for_execution(self, job_id: str) -> bool:
+        """Durably clear the internal gate; callers must validate ownership first."""
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if job is None or not self._is_deferred_auto_youtube(job):
+                return False
+            job["execution_deferred"] = False
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            try:
+                # Keep the queue lock through the required save. No claimant
+                # may observe the released gate before it is durable.
+                self._persist_required(snapshot)
+            except JobPersistenceRequiredError:
+                current = self.jobs.get(str(job_id))
+                if current is not None and self._is_auto_youtube(current):
+                    current["execution_deferred"] = True
+                    self._mark_dirty_locked(current)
+                self._condition.notify_all()
+                raise
+            self._condition.notify_all()
+            return True
+
+    def complete_auto_youtube_item(self, job_id: str, item_id: str) -> bool:
+        """Required JobStore completion after the ledger owns the video ID."""
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if job is None or not self._is_auto_youtube(job):
+                return False
+            index = self._item_index_locked(job, str(item_id))
+            if index is None:
+                return False
+            self._set_item_state_locked(job, index, "completed")
+            progress = job.get("item_progress")
+            if isinstance(progress, list) and index < len(progress):
+                progress[index] = 100
+            self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            try:
+                self._persist_required(snapshot)
+            except JobPersistenceRequiredError:
+                # The ledger already owns the confirmed video ID. Keep this
+                # process blocked until restart reconciliation can repair it.
+                job["execution_deferred"] = True
+                if self._lane_active.get("youtube_upload") == (str(job_id), str(item_id)):
+                    self._lane_active["youtube_upload"] = None
+                self._mark_dirty_locked(job)
+                self._condition.notify_all()
+                raise
+            if self._lane_active.get("youtube_upload") == (str(job_id), str(item_id)):
+                self._lane_active["youtube_upload"] = None
+            self._condition.notify_all()
+            return True
+
+    def block_auto_youtube_item(
+        self, job_id: str, item_id: str, *, uncertain: bool, reason: str
+    ) -> bool:
+        """Durably reapply the gate and stop the bundle after one bad item."""
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if job is None or not self._is_auto_youtube(job):
+                return False
+            index = self._item_index_locked(job, str(item_id))
+            if index is None:
+                return False
+            job["execution_deferred"] = True
+            self._set_item_state_locked(
+                job, index, "failed",
+                failure_kind="uncertain" if uncertain else "known",
+            )
+            job["item_completion_reasons"][index] = str(reason or "")
+            job["item_recovery_reasons"][index] = str(reason or "")
+            if self._lane_active.get("youtube_upload") == (str(job_id), str(item_id)):
+                self._lane_active["youtube_upload"] = None
+            self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            self._persist_required(snapshot)
+            self._condition.notify_all()
+            return True
+
+    def defer_auto_youtube_job(self, job_id: str) -> bool:
+        """Durably reapply the execution gate without changing item outcomes."""
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if job is None or not self._is_auto_youtube(job):
+                return False
+            job["execution_deferred"] = True
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            self._persist_required(snapshot)
+            self._condition.notify_all()
+            return True
+
+    def reset_auto_youtube_item_to_queued(
+        self, job_id: str, item_id: str
+    ) -> bool:
+        """Required restart repair when the ledger proves transfer never began."""
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if job is None or not self._is_auto_youtube(job):
+                return False
+            index = self._item_index_locked(job, str(item_id))
+            if index is None:
+                return False
+            self._set_item_state_locked(job, index, "queued")
+            job["item_failure_kinds"][index] = ""
+            job["item_completion_reasons"][index] = ""
+            job["item_recovery_reasons"][index] = ""
+            if self._lane_active.get("youtube_upload") == (str(job_id), str(item_id)):
+                self._lane_active["youtube_upload"] = None
+            self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            self._persist_required(snapshot)
+            self._condition.notify_all()
+            return True
 
     def append_job_log(
         self,
@@ -4053,6 +4182,20 @@ def run_upload_job(
 ) -> None:
     """Run the existing sequential local YouTube upload lifecycle."""
     initial_job = manager.get_job(job_id) or {}
+    if initial_job.get("origin") == "auto_youtube":
+        if initial_job.get("execution_deferred") is not False:
+            return
+        if dependencies.auto_youtube_executor is None:
+            dependencies.append_log(
+                job_id, "Automatic YouTube execution is unavailable."
+            )
+            try:
+                manager.defer_auto_youtube_job(job_id)
+            except Exception:
+                pass
+            return
+        dependencies.auto_youtube_executor(job_id)
+        return
     settings = dict(dependencies.load_settings())
     if "playlist_id" in initial_job:
         settings["youtube_playlist_id"] = str(
