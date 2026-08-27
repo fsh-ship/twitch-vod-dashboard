@@ -227,6 +227,41 @@ class ProductionRuntimeTests(unittest.TestCase):
             self.assertEqual(job_id, "1")
             self.assertTrue((self.data / "jobs.json").exists())
 
+    def test_startup_runs_auto_youtube_execution_reconciliation_after_restore(self):
+        events = []
+        manager = JobManager()
+        monitor = FakeMonitor(events)
+        restore_original = manager.restore_from_store
+        execution = mock.Mock()
+        execution.reconcile.side_effect = lambda: events.append(
+            "execution_reconcile"
+        ) or {
+            "deferred": 0,
+            "queued": 0,
+            "confirmed": 1,
+            "blocked": 0,
+            "pending": 0,
+        }
+
+        def restore():
+            events.append("restore")
+            return restore_original()
+
+        with self.runtime_context(manager, monitor), mock.patch.object(
+            manager, "restore_from_store", side_effect=restore
+        ), mock.patch.object(
+            dashboard,
+            "_auto_youtube_execution_service",
+            return_value=execution,
+        ) as factory:
+            result = dashboard.initialize_worker_runtime(worker_count=1)
+
+        self.assertTrue(result["initialized"])
+        factory.assert_called_once_with(manager)
+        execution.reconcile.assert_called_once_with()
+        self.assertLess(events.index("restore"), events.index("execution_reconcile"))
+        self.assertLess(events.index("execution_reconcile"), events.index("monitor"))
+
     def test_full_restart_reconciles_all_types_offline_and_keeps_ids(self):
         first = JobManager()
         with self.runtime_context(first, FakeMonitor()):

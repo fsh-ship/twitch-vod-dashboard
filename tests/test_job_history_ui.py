@@ -51,7 +51,10 @@ const active = items.filter(item => ['running', 'waiting'].includes(item.state))
 const reasons = [
   'source_missing', 'source_changed', 'unsafe_source_path', 'review_required',
   'persistence_unavailable', 'persistence_validation_failed',
-  'recording_retry_unsupported', 'already_retried', 'not_retryable'
+  'recording_retry_unsupported', 'already_retried', 'not_retryable',
+  'release_not_allowed', 'ownership_mismatch', 'release_media_invalid',
+  'job_store_unavailable', 'ownership_store_unavailable',
+  'release_worker_start_failed'
 ];
 process.stdout.write(JSON.stringify({
   rendered,
@@ -168,6 +171,60 @@ def _download_job(
         ],
         "streamer": streamer,
         "display_title": display_title,
+        "log": [],
+    }
+
+
+def _upload_job(
+    job_id: str,
+    *,
+    origin: str = "auto_youtube",
+    deferred: bool = True,
+    states: list[str] | None = None,
+    failure_kinds: list[str] | None = None,
+) -> dict:
+    states = states or ["queued"]
+    failure_kinds = failure_kinds or ["" for _ in states]
+    return {
+        "id": job_id,
+        "label": "Preparing for YouTube",
+        "type": "youtube_upload",
+        "origin": origin,
+        "execution_deferred": deferred,
+        "state": (
+            "running"
+            if "running" in states
+            else "failed"
+            if "failed" in states
+            else "completed"
+            if all(state == "completed" for state in states)
+            else "queued"
+        ),
+        "status": "wartet",
+        "created_at": "2026-08-23T19:00:00Z",
+        "updated_at": "2026-08-23T20:00:00Z",
+        "urls": [f"C:/media/part-{index + 1}.mkv" for index in range(len(states))],
+        "item_ids": [f"{job_id}-item-{index + 1}" for index in range(len(states))],
+        "item_states": states,
+        "item_statuses": [
+            {"queued": "wartet", "running": "läuft", "failed": "fehler", "completed": "fertig"}.get(state, "wartet")
+            for state in states
+        ],
+        "item_failure_kinds": failure_kinds,
+        "item_capabilities": [_capability() for _ in states],
+        "item_metadata": [
+            {
+                "streamer": "cptmary",
+                "title": (
+                    "Canary upload"
+                    if len(states) == 1
+                    else f"Canary upload (Part {index + 1}/{len(states)})"
+                ),
+                "vod_id": "2856000079",
+                "name": f"part-{index + 1}.mkv",
+            }
+            for index in range(len(states))
+        ],
         "log": [],
     }
 
@@ -299,6 +356,79 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertIn("YouTube Studio", friendly["review_required"])
         self.assertIn("persistence", friendly["persistence_unavailable"])
         self.assertNotIn("C:/private", str(friendly))
+
+    def test_deferred_auto_youtube_has_clear_bundle_level_start_action(self):
+        result = _evaluate_history_ui([
+            _upload_job("79"),
+            _upload_job("80", states=["queued", "queued", "queued"]),
+        ])
+        cards_79 = [
+            item["html"] for item in result["rendered"]
+            if item["jobId"] == "79"
+        ]
+        cards_80 = [
+            item["html"] for item in result["rendered"]
+            if item["jobId"] == "80"
+        ]
+        self.assertEqual(len(cards_79), 1)
+        self.assertIn("Ready for YouTube", cards_79[0])
+        self.assertIn("Waiting for manual start.", cards_79[0])
+        self.assertIn('data-queue-action="start-auto-youtube"', cards_79[0])
+        self.assertIn('data-part-count="1"', cards_79[0])
+        self.assertNotIn("Part 1/1", cards_79[0])
+        self.assertEqual(
+            sum('data-queue-action="start-auto-youtube"' in card for card in cards_80),
+            1,
+        )
+        self.assertIn('data-part-count="3"', "".join(cards_80))
+
+    def test_start_action_is_hidden_for_manual_released_running_or_uncertain_jobs(self):
+        jobs = [
+            _upload_job("81", origin="manual"),
+            _upload_job("82", deferred=False),
+            _upload_job("83", deferred=False, states=["running"]),
+            _upload_job("84", states=["failed"], failure_kinds=["uncertain"]),
+            _upload_job("86", deferred=False, states=["completed"]),
+            _download_job("85", "queued"),
+        ]
+        result = _evaluate_history_ui(jobs)
+        cards = {item["jobId"]: item["html"] for item in result["rendered"]}
+        for job_id in ("81", "82", "83", "84", "85", "86"):
+            self.assertNotIn(
+                'data-queue-action="start-auto-youtube"', cards[job_id]
+            )
+        self.assertIn("Queued", cards["82"])
+        self.assertIn("Uploading", cards["83"])
+        self.assertEqual(
+            next(
+                item["state"]
+                for item in result["rendered"]
+                if item["jobId"] == "86"
+            ),
+            "completed",
+        )
+        self.assertIn("86", result["completedOrder"])
+        self.assertNotIn("86", result["activeOrder"])
+
+    def test_start_upload_interaction_requires_confirmation_and_prevents_duplicates(self):
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("Start this YouTube upload now?", source)
+        self.assertIn("This VOD contains ${partCount} parts.", source)
+        self.assertIn("pendingAutoYoutubeReleases.has(pendingKey)", source)
+        self.assertIn("pendingAutoYoutubeReleases.add(pendingKey)", source)
+        self.assertIn("button.disabled = true", source)
+        self.assertIn("'/api/jobs/auto-youtube/release'", source)
+        self.assertIn("? {job_id:button.dataset.jobId}", source)
+        self.assertIn("showToast(friendlyQueueActionError(error), 'bad')", source)
+        self.assertIn("YouTube upload queued.", source)
+        self.assertIn(
+            "The upload worker could not be started. Try again.",
+            self.result["friendly"]["release_worker_start_failed"],
+        )
+        self.assertIn(
+            ".queue-item-actions { display:grid; grid-template-columns:1fr; width:100%; }",
+            STYLESHEET,
+        )
 
     def test_persistence_health_only_warns_for_degradation(self):
         values = _evaluate_persistence_ui()

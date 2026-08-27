@@ -275,6 +275,7 @@ let state = null;
 let lastResults = [];
 let jobOpenState = {};
 let queueDetailOpenState = {};
+const pendingAutoYoutubeReleases = new Set();
 let autoExpandJobDetails = localStorage.getItem('vodJobAutoExpand') === '1';
 let youtubePlaylistChoices = [];
 let streamerProfileDraft = {};
@@ -2062,6 +2063,16 @@ function queueRecoveryPresentation(item) {
     support:'The dashboard restarted while YouTube may have been processing this upload. Check YouTube Studio before uploading it again.',
     reviewRequired:true,
   };
+  if (
+    type === 'upload'
+    && item.job?.origin === 'auto_youtube'
+    && item.job?.execution_deferred === true
+    && item.state === 'waiting'
+  ) return {
+    status:'Ready for YouTube',
+    support:'Waiting for manual start.',
+    reviewRequired:false,
+  };
   if (item.state !== 'interrupted') return {
     status:({running:item.operation, cancelling:'Cancelling...', waiting:'Queued', completed:'Completed', error:'Failed', cancelled:'Cancelled'})[item.state] || 'Queued',
     support:'', reviewRequired:false,
@@ -2145,6 +2156,17 @@ function renderQueueVodItem(item, compact=false) {
   const error = item.state === 'error' && item.error ? `<div class="queue-item-error">${escapeHtml(queueErrorSummary(item.error, item.operation))}</div>` : '';
   const actionButtons = [];
   const accessibleTitle = String(item.title || item.job.label || queueJobTypeLabel(item));
+  const bundleStates = Array.isArray(item.job?.item_states) ? item.job.item_states : [];
+  const bundleFailureKinds = Array.isArray(item.job?.item_failure_kinds) ? item.job.item_failure_kinds : [];
+  const canStartAutoYoutube = item.index === 0
+    && item.job?.type === 'youtube_upload'
+    && item.job?.origin === 'auto_youtube'
+    && item.job?.execution_deferred === true
+    && item.job?.state === 'queued'
+    && bundleStates.length > 0
+    && bundleStates.every(state => state === 'queued')
+    && !bundleFailureKinds.some(kind => kind === 'uncertain');
+  if (canStartAutoYoutube) actionButtons.push(`<button type="button" class="primary queue-item-action" data-queue-action="start-auto-youtube" data-job-id="${escapeHtml(item.job.id)}" data-part-count="${bundleStates.length}" aria-label="Start YouTube upload: ${escapeHtml(accessibleTitle)}">Start upload</button>`);
   if (capabilities.can_cancel) actionButtons.push(`<button type="button" class="danger-outline queue-item-action" data-queue-action="cancel" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Cancel ${escapeHtml(accessibleTitle)}">Cancel</button>`);
   if (capabilities.can_stop_after_current) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="stop" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Stop Queue after ${escapeHtml(accessibleTitle)}">Stop after current</button>`);
   if (capabilities.can_remove) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="remove" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Remove ${escapeHtml(accessibleTitle)} from Queue">Remove from Queue</button>`);
@@ -2193,20 +2215,37 @@ function renderQueueGroup(id, items, emptyMessage, compact=false) {
     stop: ['/api/jobs/stop-after-current', 'Queue will stop after the current item.'],
     remove: ['/api/jobs/remove-item', 'Removed from Queue. The local file was not deleted.'],
     retry: ['/api/jobs/retry-item', 'Starting a fresh retry...'],
+    'start-auto-youtube': ['/api/jobs/auto-youtube/release', 'Starting YouTube upload...'],
   };
   box.querySelectorAll('.queue-item-action').forEach(button => button.addEventListener('click', async () => {
     const action = button.dataset.queueAction;
     const route = actionRoutes[action];
     if (!route) return;
+    const pendingKey = action === 'start-auto-youtube' ? String(button.dataset.jobId || '') : '';
+    if (pendingKey && pendingAutoYoutubeReleases.has(pendingKey)) return;
+    if (action === 'start-auto-youtube') {
+      const partCount = Number(button.dataset.partCount);
+      const partNote = Number.isInteger(partCount) && partCount > 1
+        ? `\nThis VOD contains ${partCount} parts.`
+        : '';
+      if (!confirm(`Start this YouTube upload now?${partNote}`)) return;
+      pendingAutoYoutubeReleases.add(pendingKey);
+    }
     button.disabled = true;
     showToast(route[1]);
     try {
-      const result = await api(route[0], {method:'POST', body:JSON.stringify({job_id:button.dataset.jobId, item_id:button.dataset.itemId})});
+      const payload = action === 'start-auto-youtube'
+        ? {job_id:button.dataset.jobId}
+        : {job_id:button.dataset.jobId, item_id:button.dataset.itemId};
+      const result = await api(route[0], {method:'POST', body:JSON.stringify(payload)});
       if (action === 'retry' && result.retry_job_id) showToast(`Retry started as Job ${result.retry_job_id}.`);
+      if (action === 'start-auto-youtube') showToast('YouTube upload queued.');
       await pollJobs();
     } catch (error) {
       button.disabled = false;
       showToast(friendlyQueueActionError(error), 'bad');
+    } finally {
+      if (pendingKey) pendingAutoYoutubeReleases.delete(pendingKey);
     }
   }));
 }
@@ -2222,6 +2261,14 @@ function friendlyQueueActionError(error) {
     not_retryable:'This Queue item cannot be retried.',
     persistence_unavailable:'Job history persistence is unavailable. No durable change was made.',
     persistence_validation_failed:'Job history could not be saved safely. No durable change was made.',
+    invalid_request:'Select one valid Auto YouTube job to start.',
+    release_not_allowed:'This Auto YouTube job is no longer waiting for manual start.',
+    conflicting_ownership:'This Auto YouTube job cannot start because its ownership state conflicts.',
+    ownership_mismatch:'This Auto YouTube job cannot start because its ownership state is inconsistent.',
+    release_media_invalid:'The prepared upload media is no longer valid.',
+    job_store_unavailable:'Job history persistence is unavailable. No upload was started.',
+    ownership_store_unavailable:'Auto YouTube upload state is unavailable. No upload was started.',
+    release_worker_start_failed:'The upload worker could not be started. Try again.',
   };
   return messages[String(error?.reason || '')] || String(error?.message || 'The Queue action could not be completed.');
 }

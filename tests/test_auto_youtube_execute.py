@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 import tempfile
@@ -57,18 +58,26 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         relative = path.relative_to(self.media_root).as_posix()
         return MediaProbeResult(self.probe_durations.get(relative, 1.0), (), ())
 
-    def create_bundle(self, total=1, playlist_id=""):
-        source_path = self.media_root / "bearlychen" / "source.mkv"
+    def create_bundle(
+        self,
+        total=1,
+        playlist_id="",
+        *,
+        streamer="bearlychen",
+        vod_id=VOD_ID,
+    ):
+        source_path = self.media_root / streamer / "source.mkv"
         source_path.parent.mkdir(parents=True, exist_ok=True)
         source_path.write_bytes(b"source-media")
         source_path.with_suffix(".info.json").write_text(
-            json.dumps({"id": VOD_ID}), encoding="utf-8"
+            json.dumps({"id": vod_id}), encoding="utf-8"
         )
-        self.probe_durations["bearlychen/source.mkv"] = float(total if total == 1 else 1)
+        source_relative = f"{streamer}/source.mkv"
+        self.probe_durations[source_relative] = float(total if total == 1 else 1)
         self.store.create_intent_if_absent(
-            "bearlychen", VOD_ID,
+            streamer, vod_id,
             source_download_job_id="12", source_download_item_id="12-item-1",
-            media_path="bearlychen/source.mkv", size_bytes=source_path.stat().st_size,
+            media_path=source_relative, size_bytes=source_path.stat().st_size,
             playlist_id=playlist_id or None,
             plan_inputs={
                 "title_template": "{title}", "description_template": "{title}",
@@ -81,10 +90,10 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
             "privacy_status": "unlisted", "category_id": "20",
             "tags": ["frozen", "tag"],
         }
-        self.store.set_upload_plan("bearlychen", VOD_ID, frozen)
+        self.store.set_upload_plan(streamer, vod_id, frozen)
         if total == 1:
             parts = [{
-                "index": 1, "media_path": "bearlychen/source.mkv",
+                "index": 1, "media_path": source_relative,
                 "size_bytes": source_path.stat().st_size,
                 "duration_seconds": 1.0, "source_kind": "original",
                 "upload_item_id": None, "upload_state": "ready", "attempts": 0,
@@ -96,7 +105,7 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         else:
             parts = []
             for index in range(1, total + 1):
-                relative = f".auto-youtube/bearlychen/{VOD_ID}/g1/parts/part-{index:03d}.mkv"
+                relative = f".auto-youtube/{streamer}/{vod_id}/g1/parts/part-{index:03d}.mkv"
                 path = self.media_root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(f"part-{index}".encode())
@@ -117,15 +126,15 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
                 "split_points_seconds": [float(value) for value in range(1, total)],
             }
         self.store.set_preparation(
-            "bearlychen", VOD_ID, source_duration_seconds=float(total),
+            streamer, vod_id, source_duration_seconds=float(total),
             state="parts_ready", split=split, parts=parts,
         )
         materializer = AutoYouTubeMaterializationService(
             state_store=self.store, job_manager=self.manager,
             media_policy=MediaPathPolicy(self.media_root), probe=self.probe,
         )
-        self.assertEqual(materializer.reconcile()["queued"], 1)
-        return self.store.get("bearlychen", VOD_ID)["upload_job_id"]
+        self.assertGreaterEqual(materializer.reconcile()["queued"], 1)
+        return self.store.get(streamer, vod_id)["upload_job_id"]
 
     def executor(self, manager=None):
         return AutoYouTubeExecutionService(
@@ -166,6 +175,32 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(AutoYouTubeExecutionError, "invalid_auto_youtube_job"):
             self.executor().release_auto_youtube_job_for_execution(manual)
 
+    def test_job_79_style_release_is_durable_and_changes_only_selected_bundle(self):
+        self.manager.counter = 78
+        job_79 = self.create_bundle(
+            streamer="cptmary", vod_id="2856000079"
+        )
+        other_job = self.create_bundle(
+            streamer="bearlychen", vod_id="2856000080"
+        )
+        self.assertEqual(job_79, "79")
+
+        self.assertTrue(
+            self.executor().release_auto_youtube_job_for_execution(job_79)
+        )
+
+        self.assertFalse(self.manager.get_job(job_79)["execution_deferred"])
+        self.assertTrue(
+            self.manager.get_job(other_job)["execution_deferred"]
+        )
+        restored = self.new_manager()
+        restored.restore_from_store()
+        self.assertFalse(restored.get_job(job_79)["execution_deferred"])
+        self.assertTrue(restored.get_job(other_job)["execution_deferred"])
+        self.service_getter.assert_not_called()
+        self.request_builder.assert_not_called()
+        self.request_sender.assert_not_called()
+
     def test_release_persistence_failure_leaves_job_deferred_without_api_activity(self):
         job_id = self.create_bundle()
         with mock.patch.object(
@@ -176,6 +211,127 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
                 self.executor().release_auto_youtube_job_for_execution(job_id)
         self.assertTrue(self.manager.get_job(job_id)["execution_deferred"])
         self.service_getter.assert_not_called()
+        self.request_sender.assert_not_called()
+
+    def test_confirmed_video_repairs_stale_queued_job_without_second_upload(self):
+        self.manager.counter = 78
+        job_id = self.create_bundle(
+            playlist_id="FROZEN_PLAYLIST",
+            streamer="cptmary",
+            vod_id="2856000079",
+        )
+        self.assertEqual(job_id, "79")
+        executor = self.executor()
+        executor.release_auto_youtube_job_for_execution(job_id)
+        claim = self.manager.claim_next_item(job_id)
+        self.store.begin_part_transfer(
+            "cptmary", "2856000079", upload_job_id=job_id,
+            upload_item_id=claim["item_id"], part_index=1,
+        )
+        self.store.confirm_part_video(
+            "cptmary", "2856000079", upload_job_id=job_id,
+            upload_item_id=claim["item_id"], part_index=1,
+            youtube_video_id="YT_CONFIRMED",
+        )
+        self.assertTrue(
+            self.manager.reset_auto_youtube_item_to_queued(
+                job_id, claim["item_id"]
+            )
+        )
+        self.assertEqual(self.manager.get_job(job_id)["state"], "queued")
+        self.assertEqual(
+            self.store.get("cptmary", "2856000079")["state"],
+            "playlist_pending",
+        )
+
+        restarted = self.new_manager()
+        restarted.restore_from_store()
+        restarted_executor = self.executor(restarted)
+        self.assertEqual(
+            restarted_executor.reconcile()["confirmed"], 1
+        )
+        completed = restarted.get_job(job_id)
+        self.assertEqual(completed["state"], "completed")
+        self.assertEqual(completed["item_states"], ["completed"])
+        self.assertFalse(completed["execution_deferred"])
+        self.assertEqual(
+            restarted.snapshot_jobs()[0]["state"], "completed"
+        )
+        record = self.store.get("cptmary", "2856000079")
+        self.assertEqual(record["state"], "playlist_pending")
+        self.assertEqual(record["upload_job_id"], job_id)
+        self.assertEqual(record["parts"][0]["youtube_video_id"], "YT_CONFIRMED")
+
+        before = restarted.get_job(job_id)
+        self.assertEqual(restarted_executor.reconcile()["confirmed"], 1)
+        self.assertEqual(restarted.get_job(job_id), before)
+        for _attempt in range(2):
+            with self.assertRaises(AutoYouTubeExecutionError) as raised:
+                restarted_executor.release_auto_youtube_job_for_execution(job_id)
+            self.assertEqual(str(raised.exception), "release_not_allowed")
+
+        restarted.pause_queue("youtube_upload")
+        restarted.resume_queue("youtube_upload")
+        self.assertIsNone(restarted.claim_next_item(job_id))
+        restarted_executor.run_job(job_id)
+        self.assertEqual(
+            [job["id"] for job in restarted.snapshot_jobs()], [job_id]
+        )
+        self.service_getter.assert_not_called()
+        self.request_builder.assert_not_called()
+        self.request_sender.assert_not_called()
+
+    def test_confirmed_multipart_repair_finalizes_only_the_confirmed_part(self):
+        job_id = self.create_bundle(3)
+        executor = self.executor()
+        executor.release_auto_youtube_job_for_execution(job_id)
+        item_ids = self.manager.get_job(job_id)["item_ids"]
+        claim = self.manager.claim_next_item(job_id)
+        self.assertEqual(claim["item_id"], item_ids[0])
+        self.store.begin_part_transfer(
+            "bearlychen", VOD_ID, upload_job_id=job_id,
+            upload_item_id=item_ids[0], part_index=1,
+        )
+        self.store.confirm_part_video(
+            "bearlychen", VOD_ID, upload_job_id=job_id,
+            upload_item_id=item_ids[0], part_index=1,
+            youtube_video_id="YT_1",
+        )
+
+        restarted = self.new_manager()
+        restarted.restore_from_store()
+        result = self.executor(restarted).reconcile()
+        self.assertEqual(result["confirmed"], 1)
+        job = restarted.get_job(job_id)
+        self.assertEqual(job["state"], "queued")
+        self.assertEqual(job["item_states"], ["completed", "queued", "queued"])
+        record = self.store.get("bearlychen", VOD_ID)
+        self.assertEqual(record["state"], "upload_queued")
+        self.assertEqual(
+            [part["upload_state"] for part in record["parts"]],
+            ["video_confirmed", "queued", "queued"],
+        )
+        self.assertEqual(
+            [part["youtube_video_id"] for part in record["parts"]],
+            ["YT_1", None, None],
+        )
+        self.request_sender.assert_not_called()
+
+    def test_reconcile_requires_confirmed_youtube_video_id_for_completion(self):
+        job_id = self.create_bundle()
+        executor = self.executor()
+        job = self.manager.get_job(job_id)
+        record = self.store.get("bearlychen", VOD_ID)
+        record["parts"][0]["upload_state"] = "video_confirmed"
+        record["parts"][0]["youtube_video_id"] = None
+
+        with mock.patch.object(
+            executor, "_ownership", return_value=(job, record, [{}])
+        ):
+            result = executor.reconcile()
+
+        self.assertEqual(result["confirmed"], 0)
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["queued"])
         self.request_sender.assert_not_called()
 
     def test_release_rejects_conflicting_or_uncertain_ledger(self):
@@ -429,11 +585,43 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         self.assertTrue(restarted.get_job(job_id)["execution_deferred"])
         self.request_sender.assert_not_called()
 
-    def test_no_flask_route_exposes_the_internal_release_primitive(self):
-        app_source = (Path(__file__).parents[1] / "app.py").read_text(
-            encoding="utf-8"
-        )
-        self.assertNotIn(".release_auto_youtube_job_for_execution(", app_source)
+    def test_only_explicit_post_adapter_and_internal_service_call_release_primitive(self):
+        root = Path(__file__).parents[1]
+        call_sites = []
+        for path in [root / "app.py", *(root / "vod_dashboard").glob("*.py")]:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+
+            class ReleaseCallVisitor(ast.NodeVisitor):
+                def __init__(self):
+                    self.functions = []
+
+                def visit_FunctionDef(self, node):
+                    self.functions.append(node.name)
+                    self.generic_visit(node)
+                    self.functions.pop()
+
+                visit_AsyncFunctionDef = visit_FunctionDef
+
+                def visit_Call(self, node):
+                    if (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr
+                        == "release_auto_youtube_job_for_execution"
+                    ):
+                        call_sites.append(
+                            (path.name, self.functions[-1] if self.functions else "")
+                        )
+                    self.generic_visit(node)
+
+            ReleaseCallVisitor().visit(tree)
+
+        self.assertCountEqual(call_sites, [
+            ("app.py", "api_release_auto_youtube_job"),
+            (
+                "auto_youtube_execute.py",
+                "release_auto_youtube_job_for_execution",
+            ),
+        ])
 
 
 class ResumablePrimitiveTests(unittest.TestCase):

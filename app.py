@@ -2547,6 +2547,91 @@ def api_jobs():
     })
 
 
+@app.post("/api/jobs/auto-youtube/release")
+def api_release_auto_youtube_job():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or set(data) != {"job_id"}:
+        return jsonify({
+            "error": "An exact Auto YouTube job ID is required.",
+            "reason": "invalid_request",
+        }), 400
+    raw_job_id = data.get("job_id")
+    if not isinstance(raw_job_id, str):
+        return jsonify({
+            "error": "An exact Auto YouTube job ID is required.",
+            "reason": "invalid_request",
+        }), 400
+    job_id = raw_job_id.strip()
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", job_id):
+        return jsonify({
+            "error": "An exact Auto YouTube job ID is required.",
+            "reason": "invalid_request",
+        }), 400
+
+    manager = _job_manager_for_compatibility()
+    try:
+        _auto_youtube_execution_service(
+            manager
+        ).release_auto_youtube_job_for_execution(job_id)
+    except dashboard_jobs.JobPersistenceRequiredError as exc:
+        return jsonify({
+            "error": "The upload could not be released because job history persistence is unavailable.",
+            "reason": exc.code,
+        }), 503
+    except dashboard_auto_youtube_execute.AutoYouTubeExecutionError as exc:
+        responses = {
+            "invalid_auto_youtube_job": (
+                "The deferred Auto YouTube job was not found.", 404
+            ),
+            "release_not_allowed": (
+                "This Auto YouTube job is not ready for manual start.", 409
+            ),
+            "conflicting_ownership": (
+                "This Auto YouTube job has conflicting ownership state.", 409
+            ),
+            "ownership_mismatch": (
+                "This Auto YouTube job has inconsistent ownership state.", 409
+            ),
+            "release_media_invalid": (
+                "The prepared upload media is no longer valid.", 409
+            ),
+            "job_store_unavailable": (
+                "Job history persistence is unavailable.", 503
+            ),
+            "ownership_store_unavailable": (
+                "Auto YouTube upload state is unavailable.", 503
+            ),
+        }
+        message, status = responses.get(
+            exc.code,
+            ("The Auto YouTube upload could not be released.", 409),
+        )
+        return jsonify({"error": message, "reason": exc.code}), status
+    except Exception:
+        app.logger.error(
+            "Auto YouTube release failed (release_request_failed)."
+        )
+        return jsonify({
+            "error": "The Auto YouTube upload could not be released.",
+            "reason": "release_request_failed",
+        }), 503
+
+    try:
+        manager.start_worker(run_upload_job, job_id)
+    except Exception:
+        try:
+            manager.defer_auto_youtube_job(job_id)
+        except Exception:
+            app.logger.error(
+                "Auto YouTube release rollback failed (release_worker_start_failed)."
+            )
+        return jsonify({
+            "error": "The upload worker could not be started.",
+            "reason": "release_worker_start_failed",
+        }), 503
+    return jsonify({"ok": True, "job_id": job_id, "status": "released"})
+
+
 @app.post("/api/jobs/clear-completed")
 def api_clear_completed_jobs():
     manager = _job_manager_for_compatibility()

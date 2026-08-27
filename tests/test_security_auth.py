@@ -141,9 +141,13 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
             "/api/live/record/1/stop"
         )
         clear_history = self.client.post("/api/jobs/clear-completed")
+        auto_youtube_release = self.client.post(
+            "/api/jobs/auto-youtube/release", json={"job_id": "79"}
+        )
         self.assertEqual(recording_start.status_code, 401)
         self.assertEqual(recording_stop.status_code, 401)
         self.assertEqual(clear_history.status_code, 401)
+        self.assertEqual(auto_youtube_release.status_code, 401)
 
     def test_successful_login_rotates_session_state_and_sets_secure_cookie_flags(self):
         response, pre_login_token = self.login()
@@ -236,9 +240,15 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
             "/api/jobs/clear-completed",
             headers={"Origin": self.ORIGIN},
         )
+        auto_youtube_release = self.client.post(
+            "/api/jobs/auto-youtube/release",
+            json={"job_id": "79"},
+            headers={"Origin": self.ORIGIN},
+        )
         self.assertEqual(recording_start.status_code, 403)
         self.assertEqual(recording_stop.status_code, 403)
         self.assertEqual(clear_history.status_code, 403)
+        self.assertEqual(auto_youtube_release.status_code, 403)
 
     def test_invalid_csrf_token_is_rejected(self):
         self.assertEqual(self.login()[0].status_code, 302)
@@ -249,6 +259,14 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 403)
         self.assertIn("CSRF", response.get_json()["error"])
+
+        auto_youtube_release = self.client.post(
+            "/api/jobs/auto-youtube/release",
+            json={"job_id": "79"},
+            headers={"Origin": self.ORIGIN, "X-CSRF-Token": "invalid"},
+        )
+        self.assertEqual(auto_youtube_release.status_code, 403)
+        self.assertIn("CSRF", auto_youtube_release.get_json()["error"])
 
     def test_invalid_origin_is_rejected(self):
         self.assertEqual(self.login()[0].status_code, 302)
@@ -271,6 +289,17 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
         )
         self.assertEqual(recording.status_code, 403)
         self.assertIn("origin", recording.get_json()["error"])
+
+        auto_youtube_release = self.client.post(
+            "/api/jobs/auto-youtube/release",
+            json={"job_id": "79"},
+            headers={
+                "Origin": "https://attacker.invalid",
+                "X-CSRF-Token": csrf_token,
+            },
+        )
+        self.assertEqual(auto_youtube_release.status_code, 403)
+        self.assertIn("origin", auto_youtube_release.get_json()["error"])
 
     def test_login_requires_pre_authentication_csrf_token(self):
         response = self.client.post(
