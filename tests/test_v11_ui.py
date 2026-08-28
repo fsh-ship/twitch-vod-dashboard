@@ -1151,6 +1151,33 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn("data-action=", html)
         self.assertNotIn(">Ready<", html)
 
+    def test_auto_youtube_owned_vod_has_status_without_manual_upload_controls(self) -> None:
+        owned = {
+            "path": "C:/media/cptmary/owned.mp4",
+            "name": "owned.mp4",
+            "streamer": "cptmary",
+            "date_de": "27.08.2026",
+            "title": "[Peak-RP] It's Sassy Toni",
+            "size_gb": 12.35,
+            "prepared": False,
+            "already_uploaded": False,
+            "local_file_exists": True,
+            "auto_youtube_managed": True,
+            "auto_youtube_video_confirmed": False,
+            "auto_youtube_status": "Managed by Auto YouTube",
+        }
+
+        html = _evaluate_local_history_ui(owned, [owned])["card"]
+
+        self.assertIn("Managed by Auto YouTube", html)
+        self.assertIn("Automatic upload lifecycle", html)
+        self.assertIn(">Automatic<", html)
+        self.assertNotIn("localvideocheck", html)
+        self.assertNotIn('data-action="upload"', html)
+        self.assertNotIn(">Prepare metadata<", html)
+        self.assertNotIn(">Mark as Uploaded<", html)
+        self.assertIn('data-action="delete"', html)
+
     def test_uploaded_history_initially_limits_rendering_without_deleting_data(self) -> None:
         pending = [
             {"path": f"pending-{index}", "already_uploaded": False}

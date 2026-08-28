@@ -291,6 +291,41 @@ class LocalYouTubeHelperTests(unittest.TestCase):
         self.assertEqual(metadata["url"], "https://www.twitch.tv/nika_livetv")
         self.assertNotIn("/videos/9876543210", metadata["url"])
 
+    def test_growing_twitch_vod_is_not_misclassified_as_live_recording(self):
+        video = self.make_video(
+            "20260827 - cptmary - title 2026-08-27 21_04 [2858027398].mp4",
+            folder="cptmary",
+        )
+        self.write_info(
+            video,
+            {
+                "id": "2858027398",
+                "title": "[Peak-RP] It's Sassy Toni - !bsg !socials",
+                "description": (
+                    "[Peak-RP] It's Sassy Toni - !bsg !socials "
+                    "2026-08-27 21:04"
+                ),
+                "uploader_id": "cptmary",
+                "upload_date": "20260827",
+                "duration": 3365,
+                "webpage_url": "https://www.twitch.tv/videos/2858027398",
+                "is_live": True,
+                "live_status": "is_live",
+            },
+        )
+
+        metadata = self.metadata(video)
+
+        self.assertEqual(
+            metadata["title"],
+            "[Peak-RP] It's Sassy Toni - !bsg !socials",
+        )
+        self.assertEqual(metadata["vod_id"], "2858027398")
+        self.assertEqual(
+            metadata["url"], "https://www.twitch.tv/videos/2858027398"
+        )
+        self.assertNotIn("2026-08-27 21:04", metadata["title"])
+
     def test_live_recording_preserves_source_url_without_synthesizing(self):
         video = self.make_video(
             "20260823 - Nika - LIVE - Nika (live) [9876543210].mp4",

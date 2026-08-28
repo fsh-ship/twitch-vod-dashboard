@@ -4,8 +4,15 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Mapping
 
 from vod_dashboard.auto_vod_result import resolve_completed_auto_vod_output
+from vod_dashboard.auto_youtube_multipart import MediaProbeResult, probe_media
 from vod_dashboard.media import MediaPathPolicy
-from vod_dashboard.youtube import sanitize_youtube_description, sanitize_youtube_title
+from vod_dashboard.twitch import canonical_twitch_vod_url
+from vod_dashboard.youtube import (
+    apply_youtube_template,
+    format_duration,
+    sanitize_youtube_description,
+    sanitize_youtube_title,
+)
 from vod_dashboard.youtube_upload_state import (
     YouTubeUploadStateError,
     YouTubeUploadStateStore,
@@ -76,10 +83,47 @@ class AutoYouTubePlanService:
         state_store: YouTubeUploadStateStore,
         media_policy: MediaPathPolicy,
         metadata_builder: Callable[[Any, Dict[str, Any]], Dict[str, Any]],
+        media_probe: Callable[[Any], MediaProbeResult] = probe_media,
     ) -> None:
         self._state_store = state_store
         self._media_policy = media_policy
         self._metadata_builder = metadata_builder
+        self._media_probe = media_probe
+
+    @staticmethod
+    def _final_metadata(
+        metadata: Mapping[str, Any],
+        record: Mapping[str, Any],
+        inputs: Mapping[str, Any],
+        duration_seconds: float,
+    ) -> Dict[str, str]:
+        """Re-render templates from final structured media/ownership values."""
+        raw_meta = metadata.get("meta")
+        if not isinstance(raw_meta, Mapping):
+            return {
+                "title": str(metadata.get("title") or ""),
+                "description": str(metadata.get("description") or ""),
+            }
+        meta = {key: str(value or "") for key, value in raw_meta.items()}
+        meta.update(
+            {
+                "streamer": str(record["streamer"]),
+                "vod_id": str(record["twitch_vod_id"]),
+                "url": canonical_twitch_vod_url(record["twitch_vod_id"]),
+                "duration": format_duration(duration_seconds),
+            }
+        )
+        fallback_title = str(meta.get("title") or metadata.get("title") or "")
+        return {
+            "title": apply_youtube_template(
+                str(inputs["title_template"]), meta, fallback_title
+            ),
+            "description": apply_youtube_template(
+                str(inputs["description_template"]),
+                meta,
+                str(inputs["description_fallback"]),
+            ),
+        }
 
     def _attention(self, record: Mapping[str, Any], reason: str) -> str:
         try:
@@ -117,16 +161,20 @@ class AutoYouTubePlanService:
                 return self._attention(record, "plan_media_missing")
             return self._attention(record, "plan_source_invalid")
         try:
+            probe = self._media_probe(source_path)
             metadata = self._metadata_builder(
                 self._media_policy.resolve_media_path(
                     record["media_path"], must_exist=True, require_file=True
                 ),
                 _metadata_settings(inputs),
             )
+            final_metadata = self._final_metadata(
+                metadata, record, inputs, probe.duration_seconds
+            )
             plan = {
-                "title": sanitize_youtube_title(metadata.get("title")),
+                "title": sanitize_youtube_title(final_metadata.get("title")),
                 "description": sanitize_youtube_description(
-                    metadata.get("description")
+                    final_metadata.get("description")
                 ),
                 "privacy_status": inputs["privacy_status"],
                 "category_id": inputs["category_id"],

@@ -2225,6 +2225,53 @@ class AppJobCompatibilityTests(unittest.TestCase):
                 job_id = dashboard.create_upload_job([f"C:/media/vod-{index}.mp4"])
             self.assertEqual(dashboard.jobs[job_id]["item_metadata"][0]["vod_id"], expected)
 
+    def test_manual_upload_rejects_auto_youtube_owned_media_before_side_effects(self):
+        settings = {"youtube_uploaded_files": []}
+        metadata = {
+            "streamer": "cptmary",
+            "date_de": "27.08.2026",
+            "title": "[Peak-RP] It's Sassy Toni",
+            "vod_id": "2858027398",
+            "size_bytes": 100,
+            "size_gb": 0.0,
+        }
+        client = dashboard.app.test_client()
+        csrf_token = client.get("/api/auth/status").get_json()["csrf_token"]
+        with mock.patch.object(
+            dashboard, "load_settings", return_value=settings
+        ), mock.patch.object(
+            dashboard,
+            "safe_local_video_path",
+            side_effect=lambda raw, _settings: Path(raw),
+        ), mock.patch.object(
+            dashboard, "local_video_metadata_payload", return_value=metadata
+        ), mock.patch.object(
+            dashboard.dashboard_auto_youtube_ownership,
+            "require_manual_upload_eligible",
+            side_effect=dashboard.dashboard_auto_youtube_ownership.AutoYouTubeOwnedMediaError(),
+        ) as eligibility, mock.patch.object(
+            dashboard.JOB_MANAGER, "create_upload_job"
+        ) as create_job, mock.patch.object(
+            dashboard.JOB_MANAGER, "start_worker"
+        ) as start_worker, mock.patch.object(
+            dashboard, "get_youtube_service"
+        ) as youtube_service:
+            response = client.post(
+                "/api/youtube/upload-local",
+                json={"paths": ["C:/media/cptmary/owned.mp4"]},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.get_json()["error"],
+            "This VOD is managed by Auto YouTube.",
+        )
+        eligibility.assert_called_once()
+        create_job.assert_not_called()
+        start_worker.assert_not_called()
+        youtube_service.assert_not_called()
+
     def test_create_upload_job_freezes_mixed_streamer_playlists_per_item(self):
         configured = {
             "youtube_playlist_id": "GLOBAL",

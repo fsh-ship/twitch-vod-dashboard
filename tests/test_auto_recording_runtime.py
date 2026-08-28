@@ -386,6 +386,11 @@ class LiveStatusLimiterTests(unittest.TestCase):
             monitor._coordinator._live_status_checker,
             dashboard.run_ytdlp_live_status,
         )
+        auto_vod_monitor = dashboard.create_auto_vod_monitor()
+        self.assertIs(
+            auto_vod_monitor._coordinator._live_status_checker,
+            dashboard.run_ytdlp_live_status,
+        )
 
     def test_limiter_does_not_wrap_recording_command_construction(self):
         settings = dashboard.load_settings()

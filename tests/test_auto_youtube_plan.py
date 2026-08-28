@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 from vod_dashboard import auto_youtube_plan as plan_module
+from vod_dashboard.auto_youtube_multipart import MediaProbeResult
 from vod_dashboard.media import MediaPathPolicy
 from vod_dashboard import youtube_upload_state
 
@@ -67,6 +68,7 @@ class AutoYouTubePlanTests(unittest.TestCase):
             state_store=self.store,
             media_policy=MediaPathPolicy(self.media_root),
             metadata_builder=builder,
+            media_probe=lambda _path: MediaProbeResult(90.0, (), ()),
         )
 
     def test_plan_reuses_final_sanitizers_and_frozen_metadata_inputs(self):
@@ -96,6 +98,85 @@ class AutoYouTubePlanTests(unittest.TestCase):
         self.assertEqual(saved["playlist_id"], "PLAYLIST_A")
         self.assertIsNone(saved["upload_job_id"])
         self.assertEqual(saved["parts"], [])
+
+    def test_growing_vod_uses_structured_title_final_duration_and_durable_id(self):
+        path = self._write_media()
+        path.with_suffix(".info.json").write_text(
+            json.dumps(
+                {
+                    "id": "2855270041",
+                    "webpage_url": "https://www.twitch.tv/videos/2855270041",
+                    "title": "[Peak-RP] It's Sassy Toni - !bsg !socials",
+                    "description": (
+                        "[Peak-RP] It's Sassy Toni - !bsg !socials "
+                        "2026-08-27 21:04"
+                    ),
+                    "is_live": True,
+                    "live_status": "is_live",
+                    "uploader_id": "bearlychen",
+                    "upload_date": "20260827",
+                    "duration": 3365,
+                }
+            ),
+            encoding="utf-8",
+        )
+        builder = mock.Mock(
+            return_value={
+                "title": "stale rendered title",
+                "description": "stale rendered description",
+                "meta": {
+                    "title": "[Peak-RP] It's Sassy Toni - !bsg !socials",
+                    "streamer": "bearlychen",
+                    "date": "2026-08-27",
+                    "date_de": "27.08.2026",
+                    "vod_id": "",
+                    "url": "",
+                    "duration": "56:05",
+                },
+            }
+        )
+        self.settings.update(
+            {
+                "youtube_title_template": "{streamer} VOD - {date_de} - {title}",
+                "youtube_description_template": (
+                    "{title}\n{url}\nVOD-ID: {vod_id}\nDauer: {duration}"
+                ),
+            }
+        )
+        # Freeze the incident-specific templates in the already-created intent.
+        self.store = youtube_upload_state.YouTubeUploadStateStore(
+            self.root / "incident-state.json"
+        )
+        record = self.store.create_intent_if_absent(
+            "bearlychen",
+            VOD_ID,
+            source_download_job_id="86",
+            source_download_item_id="86-item-1",
+            media_path="bearlychen/vod.mkv",
+            size_bytes=path.stat().st_size,
+            plan_inputs=plan_module.freeze_plan_inputs(self.settings),
+        )[0]
+        service = plan_module.AutoYouTubePlanService(
+            state_store=self.store,
+            media_policy=MediaPathPolicy(self.media_root),
+            metadata_builder=builder,
+            media_probe=lambda _path: MediaProbeResult(16160.0, (), ()),
+        )
+
+        self.assertEqual(service.prepare_record(record), "ready")
+        upload_plan = self.store.get("bearlychen", VOD_ID)["upload_plan"]
+        self.assertEqual(
+            upload_plan["title"],
+            "bearlychen VOD - 27.08.2026 - [Peak-RP] It's Sassy Toni - !bsg !socials",
+        )
+        self.assertNotIn("2026-08-27 21:04", upload_plan["title"])
+        self.assertIn("VOD-ID: 2855270041", upload_plan["description"])
+        self.assertIn("Dauer: 04:29:20", upload_plan["description"])
+        self.assertNotIn("Dauer: 56:05", upload_plan["description"])
+        self.assertIn(
+            "https://www.twitch.tv/videos/2855270041",
+            upload_plan["description"],
+        )
 
     def test_plan_is_immutable_across_reconciliation_settings_and_restart(self):
         record = self._intent()

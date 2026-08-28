@@ -73,6 +73,9 @@ class AutoVodCoordinator:
         storage_provider: Optional[
             Callable[[Dict[str, Any]], AutoVodStorageStatus]
         ] = None,
+        live_status_checker: Optional[
+            Callable[[str, Dict[str, Any]], Mapping[str, Any]]
+        ] = None,
     ) -> None:
         self._settings_provider = settings_provider
         self._streamer_provider = streamer_provider
@@ -86,6 +89,7 @@ class AutoVodCoordinator:
         self._worker_starter = worker_starter or self._default_worker_starter
         self._should_stop = should_stop or (lambda: False)
         self._storage_provider = storage_provider
+        self._live_status_checker = live_status_checker
 
     def _default_jobs(self) -> Iterable[Mapping[str, Any]]:
         return list(getattr(self._job_manager, "jobs", {}).values())
@@ -109,6 +113,8 @@ class AutoVodCoordinator:
             "baseline_initialized_count": 0,
             "baseline_pending_count": 0,
             "storage_blocked_count": 0,
+            "live_deferred_count": 0,
+            "live_status_unavailable_count": 0,
             "storage_state": "not_checked",
             "storage_free_bytes": None,
             "storage_required_bytes": None,
@@ -307,6 +313,7 @@ class AutoVodCoordinator:
             discovered = list(executor.map(discover, selected))
         by_streamer = dict(discovered)
         discovered_titles: Dict[tuple[str, str], str] = {}
+        discovered_ids: Dict[str, set[str]] = {}
         stop_scheduling = False
         candidates_by_streamer: list[tuple[str, list[str]]] = []
 
@@ -325,6 +332,7 @@ class AutoVodCoordinator:
                 vod_id = normalize_auto_vod_id(vod.get("twitch_vod_id"))
                 if vod_id:
                     discovered_titles[(streamer, vod_id)] = str(vod.get("title") or "").strip()
+                    discovered_ids.setdefault(streamer, set()).add(vod_id)
             result["discovered_count"] += len(vods)
             current_bucket = self._state_store.snapshot()["streamers"].get(streamer)
             if current_bucket is None or current_bucket.get("baseline_initialized") is not True:
@@ -436,6 +444,50 @@ class AutoVodCoordinator:
             for streamer, candidates in candidates_by_streamer:
                 if stop_scheduling:
                     break
+                if candidates:
+                    try:
+                        if self._live_status_checker is None:
+                            raise RuntimeError("live_status_checker_unavailable")
+                        live_status = self._live_status_checker(streamer, settings)
+                        live_state = (
+                            str(live_status.get("state") or "")
+                            if isinstance(live_status, Mapping)
+                            else ""
+                        )
+                        if live_state not in {"live", "offline"}:
+                            raise RuntimeError("live_status_indeterminate")
+                    except Exception:
+                        live_state = "unavailable"
+
+                    if live_state != "offline":
+                        reason = (
+                            "live_deferred"
+                            if live_state == "live"
+                            else "live_status_unavailable"
+                        )
+                        count_key = (
+                            "live_deferred_count"
+                            if live_state == "live"
+                            else "live_status_unavailable_count"
+                        )
+                        for vod_id in candidates:
+                            record = self._state_store.get_vod(streamer, vod_id)
+                            if record is None or record["disposition"] != "pending":
+                                continue
+                            self._state_store.set_pending(
+                                streamer,
+                                vod_id,
+                                reason=reason,
+                                attempts=int(record["attempts"]),
+                                retry_after=record["retry_after"],
+                            )
+                            result[count_key] += 1
+                        result["action"] = reason
+                        if live_state == "unavailable":
+                            errors.append(
+                                {"streamer": streamer, "code": reason}
+                            )
+                        continue
                 for vod_id in candidates:
                     if self._should_stop():
                         result["action"] = "shutdown_requested"
@@ -444,6 +496,12 @@ class AutoVodCoordinator:
                     try:
                         record = self._state_store.get_vod(streamer, vod_id)
                         if record is None or record["disposition"] != "pending":
+                            continue
+                        if (
+                            record.get("reason")
+                            in {"live_deferred", "live_status_unavailable"}
+                            and vod_id not in discovered_ids.get(streamer, set())
+                        ):
                             continue
                         if vod_id in archive_ids:
                             self._state_store.set_handled(

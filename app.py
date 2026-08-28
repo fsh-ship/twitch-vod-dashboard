@@ -24,6 +24,7 @@ from vod_dashboard import auto_recording as dashboard_auto_recording
 from vod_dashboard import auto_recording_runtime as dashboard_auto_runtime
 from vod_dashboard import auto_vod as dashboard_auto_vod
 from vod_dashboard import auto_youtube_handoff as dashboard_auto_youtube_handoff
+from vod_dashboard import auto_youtube_ownership as dashboard_auto_youtube_ownership
 from vod_dashboard import auto_youtube_generate as dashboard_auto_youtube_generate
 from vod_dashboard import auto_youtube_execute as dashboard_auto_youtube_execute
 from vod_dashboard import auto_youtube_playlist as dashboard_auto_youtube_playlist
@@ -862,6 +863,7 @@ def create_auto_vod_monitor() -> dashboard_auto_vod_runtime.AutoVodMonitor:
         storage_provider=lambda settings: dashboard_auto_vod_storage.assess_auto_vod_storage(
             download_path(settings)
         ),
+        live_status_checker=run_ytdlp_live_status,
     )
     return dashboard_auto_vod_runtime.AutoVodMonitor(
         coordinator, settings_provider=load_settings, stop_event=stop_event, log=log_line
@@ -1715,6 +1717,15 @@ def create_upload_job(
         or ""
     ).strip()
     manager = _job_manager_for_compatibility()
+    ownership_store = (
+        dashboard_youtube_upload_state.YouTubeUploadStateStore.from_dashboard_dir(
+            DEFAULT_DASHBOARD_DIR
+        )
+    )
+    ownership_records = dashboard_auto_youtube_ownership.load_ownership_records(
+        ownership_store
+    )
+    media_policy = dashboard_media.MediaPathPolicy(MEDIA_ROOT)
     unfinished = manager.unfinished_upload_paths()
     uploaded = set(map(str, settings.get("youtube_uploaded_files") or []))
     clean_paths = []
@@ -1730,6 +1741,13 @@ def create_upload_job(
         if str(p) in unfinished:
             raise RuntimeError("This VOD is already queued for upload.")
         payload = local_video_metadata_payload(p, settings, uploaded)
+        dashboard_auto_youtube_ownership.require_manual_upload_eligible(
+            p,
+            streamer=payload.get("streamer"),
+            twitch_vod_id=payload.get("vod_id"),
+            records=ownership_records,
+            media_policy=media_policy,
+        )
         if payload.get("already_uploaded"):
             raise RuntimeError("This VOD is already in uploaded history.")
         clean_paths.append(str(p))
@@ -1840,6 +1858,29 @@ def local_video_metadata_payload(path: Path, settings: Dict[str, Any], uploaded_
 def enumerate_local_vods(
     settings: Dict[str, Any], include_uploaded: bool
 ) -> Dict[str, Any]:
+    media_policy = dashboard_media.MediaPathPolicy(MEDIA_ROOT)
+    ownership_records = dashboard_auto_youtube_ownership.load_ownership_records(
+        dashboard_youtube_upload_state.YouTubeUploadStateStore.from_dashboard_dir(
+            DEFAULT_DASHBOARD_DIR
+        )
+    )
+
+    def ownership_payload(
+        path: Path, payload: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        ownership = dashboard_auto_youtube_ownership.ownership_for_local_media(
+            path,
+            streamer=payload.get("streamer"),
+            twitch_vod_id=payload.get("vod_id"),
+            records=ownership_records,
+            media_policy=media_policy,
+        )
+        return {
+            "auto_youtube_managed": ownership.managed,
+            "auto_youtube_video_confirmed": ownership.video_confirmed,
+            "auto_youtube_status": ownership.status,
+        }
+
     return dashboard_local_vods.enumerate_local_vods(
         settings,
         include_uploaded,
@@ -1851,6 +1892,7 @@ def enumerate_local_vods(
             _job_manager_for_compatibility().unfinished_upload_paths()
         ),
         log_callback=log_line,
+        ownership_resolver=ownership_payload,
     )
 
 

@@ -851,6 +851,15 @@ def parse_info_json(
 def _is_live_recording_info(info: Dict[str, Any]) -> bool:
     """Identify metadata captured while a source was actively live."""
 
+    for key in ("webpage_url", "original_url", "url"):
+        if re.search(
+            r"https?://(?:www\.)?twitch\.tv/videos/[1-9][0-9]{5,31}(?:\D|$)",
+            str(info.get(key) or ""),
+            flags=re.IGNORECASE,
+        ):
+            # A growing Twitch archive may still be marked is_live by yt-dlp.
+            # It remains a canonical VOD, not a channel live-recording sidecar.
+            return False
     live_status = str(info.get("live_status") or "").strip().lower()
     return info.get("is_live") is True or live_status == "is_live"
 

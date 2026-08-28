@@ -2537,6 +2537,7 @@ function updateLocalUploadButton() {
 }
 
 function workspaceStatusClass(video) {
+  if (video.auto_youtube_managed) return video.auto_youtube_video_confirmed ? 'good' : 'accent';
   if (video.local_file_exists === false) return 'warn';
   if (video.already_uploaded) return 'good';
   if (video.in_uploaded_folder) return 'accent';
@@ -2546,6 +2547,7 @@ function workspaceStatusClass(video) {
 }
 
 function workspaceStatusLabel(video) {
+  if (video.auto_youtube_managed) return video.auto_youtube_status || 'Managed by Auto YouTube';
   return video.status || 'Ready';
 }
 
@@ -2556,13 +2558,16 @@ function localVideoByPath(path) {
 function renderLocalVideoCard(v) {
   const uploaded = !!v.already_uploaded;
   const hasLocalFile = v.local_file_exists !== false;
-  const uploadable = !v.already_uploaded && hasLocalFile;
+  const autoYouTubeManaged = !!v.auto_youtube_managed;
+  const uploadable = !v.already_uploaded && !autoYouTubeManaged && hasLocalFile;
   const statusClassName = workspaceStatusClass(v);
-  const secondaryStatus = uploaded
+  const secondaryStatus = autoYouTubeManaged
+    ? (v.auto_youtube_video_confirmed ? 'Uploaded to YouTube' : 'Automatic upload lifecycle')
+    : uploaded
     ? 'Uploaded to YouTube'
     : (v.prepared ? 'Metadata ready' : 'Metadata needed');
   return `<article class="video-workspace-card ${uploaded ? 'is-uploaded' : ''} ${hasLocalFile ? '' : 'is-local-removed'}" data-video-path="${escapeHtml(v.path)}">
-    ${uploadable ? `<label class="video-select"><input class="localvideocheck" type="checkbox" data-path="${escapeHtml(v.path)}" checked><span>Select</span></label>` : '<span class="video-select muted">History</span>'}
+    ${uploadable ? `<label class="video-select"><input class="localvideocheck" type="checkbox" data-path="${escapeHtml(v.path)}" checked><span>Select</span></label>` : `<span class="video-select muted">${autoYouTubeManaged ? 'Automatic' : 'History'}</span>`}
     <div class="video-person"><strong>${escapeHtml(v.streamer || 'Unknown streamer')}</strong><span>${escapeHtml(v.date_de || 'Unknown date')}</span></div>
     <strong class="video-display-title">${escapeHtml(v.title || v.youtube_title || v.name)}</strong>
     <span class="video-size">${hasLocalFile ? `${escapeHtml(v.size_gb)} GB` : 'Size unavailable'}</span>

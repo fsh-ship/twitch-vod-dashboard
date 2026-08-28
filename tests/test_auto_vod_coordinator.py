@@ -75,6 +75,7 @@ class AutoVodCoordinatorTests(unittest.TestCase):
         worker_starter=None,
         storage_provider=None,
         should_stop=None,
+        live_status_checker=None,
     ):
         def discover(streamer, settings, *, limit):
             self.discovery_calls.append((streamer, limit, settings))
@@ -92,6 +93,10 @@ class AutoVodCoordinatorTests(unittest.TestCase):
             storage_provider=storage_provider
             or (lambda settings: AutoVodStorageStatus("sufficient", 100, 200, 50)),
             should_stop=should_stop,
+            live_status_checker=(
+                live_status_checker
+                or (lambda streamer, settings: {"streamer": streamer, "state": "offline"})
+            ),
         )
 
     def establish_baseline(self, streamer="alpha", vod_ids=()):
@@ -333,6 +338,125 @@ class AutoVodCoordinatorTests(unittest.TestCase):
 
         self.coordinator(discovery).run_once()
         self.assertEqual(len(self.manager.created), 1)
+
+    def test_growing_vod_is_deferred_while_live_then_admitted_once_offline(self):
+        self.establish_baseline("alpha", ["2857000000"])
+        live_state = {"state": "live"}
+        vod = {
+            **self.vod("2858027398"),
+            "title": "[Peak-RP] It's Sassy Toni - !bsg !socials",
+            "duration": 3365,
+        }
+
+        def discovery(streamer):
+            return {"vods": [vod]} if streamer == "alpha" else {"vods": []}
+
+        checker = mock.Mock(
+            side_effect=lambda streamer, settings: {
+                "streamer": streamer,
+                "state": live_state["state"],
+            }
+        )
+        first = self.coordinator(
+            discovery, live_status_checker=checker
+        ).run_once()
+        second = self.coordinator(
+            discovery, live_status_checker=checker
+        ).run_once()
+
+        self.assertEqual(first["action"], "live_deferred")
+        self.assertEqual(second["action"], "live_deferred")
+        self.assertEqual(self.manager.created, [])
+        self.assertEqual(self.manager.started, [])
+        deferred = self.store.get_vod("alpha", "2858027398")
+        self.assertEqual(deferred["disposition"], "pending")
+        self.assertEqual(deferred["reason"], "live_deferred")
+        self.assertEqual(deferred["attempts"], 0)
+        self.assertEqual(
+            self.store.get_vod("alpha", "2857000000")["reason"],
+            "baseline_existing",
+        )
+
+        live_state["state"] = "offline"
+        final_vod = {**vod, "duration": 16160}
+        result = self.coordinator(
+            lambda streamer: {"vods": [final_vod]}
+            if streamer == "alpha"
+            else {"vods": []},
+            live_status_checker=checker,
+        ).run_once()
+
+        self.assertEqual(result["action"], "queued")
+        self.assertEqual(len(self.manager.created), 1)
+        self.assertEqual(self.manager.created[0]["twitch_vod_id"], "2858027398")
+        self.assertEqual(self.manager.created[0]["display_title"], vod["title"])
+        self.assertEqual(self.manager.started, ["1"])
+
+        self.coordinator(
+            lambda streamer: {"vods": [final_vod]}
+            if streamer == "alpha"
+            else {"vods": []},
+            live_status_checker=checker,
+        ).run_once()
+        self.assertEqual(len(self.manager.created), 1)
+
+    def test_live_status_failure_defers_without_losing_restart_eligibility(self):
+        self.establish_baseline("alpha", [])
+        vod = self.vod("2858027398")
+        discovery = lambda streamer: {
+            "vods": [vod] if streamer == "alpha" else []
+        }
+
+        result = self.coordinator(
+            discovery,
+            live_status_checker=mock.Mock(
+                side_effect=RuntimeError("private live-status detail")
+            ),
+        ).run_once()
+
+        self.assertEqual(result["action"], "live_status_unavailable")
+        self.assertEqual(
+            result["errors"],
+            [{"streamer": "alpha", "code": "live_status_unavailable"}],
+        )
+        self.assertEqual(self.manager.created, [])
+        record = self.store.get_vod("alpha", "2858027398")
+        self.assertEqual(record["disposition"], "pending")
+        self.assertEqual(record["reason"], "live_status_unavailable")
+
+        restarted_store = AutoVodStateStore(
+            self.store.path, clock=lambda: NOW
+        )
+        self.coordinator(
+            discovery,
+            state_store=restarted_store,
+            live_status_checker=lambda streamer, settings: {
+                "streamer": streamer,
+                "state": "offline",
+            },
+        ).run_once()
+        self.assertEqual(len(self.manager.created), 1)
+        self.assertEqual(self.manager.created[0]["twitch_vod_id"], "2858027398")
+
+    def test_live_deferred_vod_requires_fresh_rediscovery_before_admission(self):
+        self.establish_baseline("alpha", [])
+        self.store.ensure_pending(
+            "alpha", "2858027398", reason="live_deferred"
+        )
+
+        self.coordinator(
+            lambda streamer: {"vods": []},
+            live_status_checker=lambda streamer, settings: {
+                "streamer": streamer,
+                "state": "offline",
+            },
+        ).run_once()
+
+        self.assertEqual(self.manager.created, [])
+        self.assertEqual(
+            self.store.get_vod("alpha", "2858027398")["disposition"],
+            "pending",
+        )
 
     def test_empty_first_discovery_baselines_and_failure_does_not(self):
         self.coordinator(lambda streamer: {"vods": []}).run_once()

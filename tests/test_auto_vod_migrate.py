@@ -335,6 +335,10 @@ class AutoVodMigrationTests(unittest.TestCase):
             storage_provider=lambda settings: AutoVodStorageStatus(
                 "sufficient", 100, 200, 50
             ),
+            live_status_checker=lambda streamer, current: {
+                "streamer": streamer,
+                "state": "offline",
+            },
         )
 
         coordinator.run_once()

@@ -168,6 +168,9 @@ def enumerate_local_vods(
     ],
     unfinished_upload_paths: Set[str] | None = None,
     log_callback: Callable[[str], None] | None = None,
+    ownership_resolver: Callable[
+        [Path, Mapping[str, Any]], Mapping[str, Any]
+    ] | None = None,
 ) -> Dict[str, Any]:
     root = media_policy.download_path(settings)
     uploaded_root = media_policy.uploaded_vods_folder(
@@ -205,6 +208,8 @@ def enumerate_local_vods(
                 ):
                     continue
                 payload = payload_builder(path, settings, uploaded)
+                if ownership_resolver is not None:
+                    payload.update(dict(ownership_resolver(path, payload)))
                 if not include_uploaded and payload.get("already_uploaded"):
                     continue
                 items.append(payload)
@@ -255,7 +260,16 @@ def enumerate_local_vods(
                     )
 
     pending = [
-        item for item in items if not item.get("already_uploaded")
+        item
+        for item in items
+        if not item.get("already_uploaded")
+        and not item.get("auto_youtube_managed")
+    ]
+    managed = [
+        item
+        for item in items
+        if not item.get("already_uploaded")
+        and item.get("auto_youtube_managed")
     ]
     marked = [item for item in items if item.get("already_uploaded")]
     pending.sort(key=lambda item: str(item.get("mtime") or ""))
@@ -279,7 +293,7 @@ def enumerate_local_vods(
         ),
         reverse=True,
     )
-    items = pending + timestamped + legacy
+    items = pending + managed + timestamped + legacy
     total_bytes = sum(
         int(item.get("size_bytes") or 0) for item in items
     )

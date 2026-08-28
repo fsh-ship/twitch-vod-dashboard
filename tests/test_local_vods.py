@@ -160,7 +160,9 @@ class LocalVodServiceTests(unittest.TestCase):
             sidecar_loader=self.policy.local_video_sidecars,
         )
 
-    def enumerate(self, include_uploaded=False, app_dir=None):
+    def enumerate(
+        self, include_uploaded=False, app_dir=None, ownership_resolver=None
+    ):
         return local_vods.enumerate_local_vods(
             self.settings,
             include_uploaded,
@@ -171,6 +173,7 @@ class LocalVodServiceTests(unittest.TestCase):
                 path, uploaded
             ),
             log_callback=self.logs.append,
+            ownership_resolver=ownership_resolver,
         )
 
     def test_module_boundary_has_no_framework_or_application_imports(self):
@@ -375,6 +378,31 @@ class LocalVodServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(result["videos"], [])
+        self.assertEqual(result["counts"]["pending"], 0)
+
+    def test_auto_youtube_owned_media_remains_visible_but_not_ready(self):
+        owned = self.make_video("cptmary/owned.mp4")
+        self.write_info(
+            owned,
+            id="2858027398",
+            uploader="cptmary",
+            webpage_url="https://www.twitch.tv/videos/2858027398",
+        )
+
+        result = self.enumerate(
+            ownership_resolver=lambda path, payload: {
+                "auto_youtube_managed": path == owned,
+                "auto_youtube_video_confirmed": False,
+                "auto_youtube_status": "Managed by Auto YouTube",
+            }
+        )
+
+        self.assertEqual(len(result["videos"]), 1)
+        self.assertTrue(result["videos"][0]["auto_youtube_managed"])
+        self.assertEqual(
+            result["videos"][0]["auto_youtube_status"],
+            "Managed by Auto YouTube",
+        )
         self.assertEqual(result["counts"]["pending"], 0)
 
     def test_reserved_auto_youtube_parts_are_not_discovered_as_local_vods(self):

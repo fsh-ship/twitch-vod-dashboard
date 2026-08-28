@@ -24,6 +24,8 @@ PUBLIC_ACTIONS = frozenset(
         "job_persistence_failed",
         "state_persistence_failed",
         "worker_start_failed",
+        "live_deferred",
+        "live_status_unavailable",
         "coordinator_error",
         "monitor_error",
     }
@@ -36,6 +38,8 @@ COUNT_FIELDS = (
     "retry_wait_count",
     "error_count",
     "storage_blocked_count",
+    "live_deferred_count",
+    "live_status_unavailable_count",
     "outstanding_auto_vod_jobs",
     "baseline_established_count",
     "baseline_initialized_count",
