@@ -476,6 +476,54 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
         factory.assert_called_once_with(manager)
         playlist_service.add_to_playlist.assert_called_once_with("79")
 
+    def test_live_handoff_reconciles_materialization_before_automatic_release(self):
+        manager = mock.Mock()
+        handoff = mock.Mock()
+        handoff.admit_pending.return_value = "created"
+        execution = mock.Mock()
+        events = []
+        stages = [mock.Mock() for _ in range(5)]
+        for name, service in zip(
+            ("plan", "preparation", "generation", "replan", "materialization"),
+            stages,
+        ):
+            service.reconcile.side_effect = lambda current=name: events.append(current)
+        execution.release_automatic_jobs_for_execution.side_effect = (
+            lambda starter: events.append("automatic_release") or {}
+        )
+        with mock.patch.object(
+            dashboard, "_job_manager_for_compatibility", return_value=manager
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_handoff_service", return_value=handoff
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_plan_service", return_value=stages[0]
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_preparation_service", return_value=stages[1]
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_generation_service", return_value=stages[2]
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_replan_service", return_value=stages[3]
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_materialization_service", return_value=stages[4]
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_execution_service", return_value=execution
+        ):
+            outcome = dashboard.admit_auto_youtube_intent(
+                "12", "12-item-1", {}
+            )
+            starter = (
+                execution.release_automatic_jobs_for_execution.call_args.args[0]
+            )
+            starter("79")
+
+        self.assertEqual(outcome, "created")
+        self.assertEqual(events, [
+            "plan", "preparation", "generation", "replan",
+            "materialization", "automatic_release",
+        ])
+        execution.release_automatic_jobs_for_execution.assert_called_once()
+        manager.start_worker.assert_called_once_with(dashboard.run_upload_job, "79")
+
     def test_auto_youtube_playlist_rejects_malformed_or_bulk_identity(self):
         service = mock.Mock()
         with mock.patch.object(

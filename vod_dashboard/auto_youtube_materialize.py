@@ -197,6 +197,8 @@ class AutoYouTubeMaterializationService:
             or job.get("origin") != "auto_youtube"
             or not isinstance(job.get("execution_deferred"), bool)
             or job.get("auto_youtube_key") != key
+            or job.get("auto_youtube_execution_policy", "manual")
+            != record.get("execution_policy")
             or dict(context) != expected_context
             or job.get("urls") != [part["media_path"] for part in descriptors]
             or job.get("playlist_id", "") != str(record.get("playlist_id") or "")
@@ -304,6 +306,7 @@ class AutoYouTubeMaterializationService:
                 source=self._source(record), upload_plan=plan,
                 playlist_id=str(record.get("playlist_id") or ""),
                 parts=descriptors,
+                execution_policy=str(record.get("execution_policy") or "manual"),
             )
             job = self._job_manager.get_job(job_id)
         except Exception:

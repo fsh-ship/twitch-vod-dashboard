@@ -81,6 +81,7 @@ AUTO_YOUTUBE_HANDOFF_REASONS = frozenset(
         "invalid_completed_result",
     }
 )
+AUTO_YOUTUBE_EXECUTION_POLICIES = frozenset({"manual", "automatic"})
 AUTO_VOD_STORAGE_BLOCK_REASONS = frozenset(
     {"insufficient_storage", "storage_unavailable"}
 )
@@ -681,8 +682,14 @@ def _normalize_download(job: Mapping[str, Any], result: Job, count: int) -> None
         "item_auto_youtube_playlist_ids": job.get(
             "item_auto_youtube_playlist_ids"
         ),
+        "item_auto_youtube_execution_policies": job.get(
+            "item_auto_youtube_execution_policies"
+        ),
     }
     if any(value is not None for value in handoff_values.values()):
+        policy_values = handoff_values.pop(
+            "item_auto_youtube_execution_policies"
+        )
         if (
             origin != "auto_vod"
             or count != 1
@@ -708,9 +715,20 @@ def _normalize_download(job: Mapping[str, Any], result: Job, count: int) -> None
             "misaligned_item_auto_youtube_playlist_ids",
             default=lambda: "",
         )
+        policies = (
+            ["manual"]
+            if policy_values is None
+            else _aligned_list(
+                policy_values,
+                count,
+                "misaligned_item_auto_youtube_execution_policies",
+                default=lambda: "manual",
+            )
+        )
         handoff = handoffs[0]
         reason = reasons[0]
         playlist_id = playlists[0]
+        execution_policy = policies[0]
         if (
             not isinstance(handoff, str)
             or handoff not in AUTO_YOUTUBE_HANDOFF_STATES
@@ -718,12 +736,13 @@ def _normalize_download(job: Mapping[str, Any], result: Job, count: int) -> None
             or reason not in AUTO_YOUTUBE_HANDOFF_REASONS
             or not isinstance(playlist_id, str)
             or (playlist_id and not _PLAYLIST_ID_RE.fullmatch(playlist_id))
+            or execution_policy not in AUTO_YOUTUBE_EXECUTION_POLICIES
         ):
             raise JobStoreValidationError("invalid_auto_youtube_handoff")
         if result["item_states"] != ["completed"]:
             raise JobStoreValidationError("invalid_auto_youtube_handoff")
         if handoff == "not_eligible":
-            if reason not in {"global_disabled", "streamer_disabled", "settings_unavailable"} or playlist_id:
+            if reason not in {"global_disabled", "streamer_disabled", "settings_unavailable"} or playlist_id or execution_policy != "manual":
                 raise JobStoreValidationError("invalid_auto_youtube_handoff")
         elif handoff in {"intent_pending", "intent_created"}:
             if reason:
@@ -742,6 +761,7 @@ def _normalize_download(job: Mapping[str, Any], result: Job, count: int) -> None
                 "item_auto_youtube_handoffs": [handoff],
                 "item_auto_youtube_handoff_reasons": [reason],
                 "item_auto_youtube_playlist_ids": [playlist_id],
+                "item_auto_youtube_execution_policies": [execution_policy],
             }
         )
 
@@ -970,14 +990,17 @@ def _normalize_upload(
             "auto_youtube_key",
             "auto_youtube_context",
             "auto_youtube_parts",
+            "auto_youtube_execution_policy",
         )
     )
     if not auto_fields_present:
         return
     execution_deferred = job.get("execution_deferred")
+    execution_policy = job.get("auto_youtube_execution_policy", "manual")
     if (
         job.get("origin") != "auto_youtube"
         or not isinstance(execution_deferred, bool)
+        or execution_policy not in AUTO_YOUTUBE_EXECUTION_POLICIES
     ):
         raise JobStoreValidationError("invalid_auto_youtube_job")
     key = job.get("auto_youtube_key")
@@ -1006,6 +1029,7 @@ def _normalize_upload(
             "execution_deferred": execution_deferred,
             "auto_youtube_key": key,
             "auto_youtube_context": context,
+            "auto_youtube_execution_policy": execution_policy,
         }
     )
     if parts is not None:

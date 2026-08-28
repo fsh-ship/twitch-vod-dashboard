@@ -242,6 +242,13 @@ class ProductionRuntimeTests(unittest.TestCase):
             "blocked": 0,
             "pending": 0,
         }
+        execution.release_automatic_jobs_for_execution.side_effect = (
+            lambda _starter, **kwargs: events.append("automatic_release")
+            or {
+                "released": 0, "recovered": 0, "already_started": 0,
+                "pending": 0, "ignored": 0,
+            }
+        )
 
         def restore():
             events.append("restore")
@@ -259,8 +266,15 @@ class ProductionRuntimeTests(unittest.TestCase):
         self.assertTrue(result["initialized"])
         factory.assert_called_once_with(manager)
         execution.reconcile.assert_called_once_with()
+        execution.release_automatic_jobs_for_execution.assert_called_once()
+        self.assertTrue(
+            execution.release_automatic_jobs_for_execution.call_args.kwargs[
+                "recover_released"
+            ]
+        )
         self.assertLess(events.index("restore"), events.index("execution_reconcile"))
-        self.assertLess(events.index("execution_reconcile"), events.index("monitor"))
+        self.assertLess(events.index("execution_reconcile"), events.index("automatic_release"))
+        self.assertLess(events.index("automatic_release"), events.index("monitor"))
 
     def test_full_restart_reconciles_all_types_offline_and_keeps_ids(self):
         first = JobManager()

@@ -2071,8 +2071,23 @@ function queueRecoveryPresentation(item) {
     && item.job?.execution_deferred === true
     && item.state === 'waiting'
   ) return {
-    status:'Ready for YouTube',
-    support:'Waiting for manual start.',
+    status:item.job?.auto_youtube_execution_policy === 'automatic'
+      ? 'Preparing automatic upload'
+      : 'Ready for YouTube',
+    support:item.job?.auto_youtube_execution_policy === 'automatic'
+      ? 'Automatic release is pending.'
+      : 'Waiting for manual start.',
+    reviewRequired:false,
+  };
+  if (
+    type === 'upload'
+    && item.job?.origin === 'auto_youtube'
+    && item.job?.auto_youtube_execution_policy === 'automatic'
+    && item.job?.execution_deferred === false
+    && item.state === 'waiting'
+  ) return {
+    status:'Upload queued automatically',
+    support:'Waiting for the upload queue.',
     reviewRequired:false,
   };
   if (
@@ -2183,6 +2198,7 @@ function renderQueueVodItem(item, compact=false) {
   const canStartAutoYoutube = item.index === 0
     && item.job?.type === 'youtube_upload'
     && item.job?.origin === 'auto_youtube'
+    && item.job?.auto_youtube_execution_policy !== 'automatic'
     && item.job?.execution_deferred === true
     && item.job?.state === 'queued'
     && bundleStates.length > 0

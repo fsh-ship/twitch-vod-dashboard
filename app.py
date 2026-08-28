@@ -949,6 +949,10 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             "deferred": 0, "queued": 0, "confirmed": 0,
             "blocked": 0, "pending": 0,
         }
+        auto_youtube_automatic_release = {
+            "released": 0, "recovered": 0, "already_started": 0,
+            "pending": 0, "ignored": 0,
+        }
         try:
             auto_youtube_handoff = _auto_youtube_handoff_service(
                 manager
@@ -989,13 +993,23 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             app.logger.error(
                 "Auto YouTube job materialization failed (materialization_reconciliation_failed)."
             )
+        execution_service = _auto_youtube_execution_service(manager)
         try:
-            auto_youtube_execution = _auto_youtube_execution_service(
-                manager
-            ).reconcile()
+            auto_youtube_execution = execution_service.reconcile()
         except Exception:
             app.logger.error(
                 "Auto YouTube execution reconciliation failed (execution_reconciliation_failed)."
+            )
+        try:
+            auto_youtube_automatic_release = (
+                execution_service.release_automatic_jobs_for_execution(
+                    lambda job_id: manager.start_worker(run_upload_job, job_id),
+                    recover_released=True,
+                )
+            )
+        except Exception:
+            app.logger.error(
+                "Auto YouTube automatic release failed (automatic_release_reconciliation_failed)."
             )
 
         monitor_started = False
@@ -1053,6 +1067,7 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             "auto_youtube_replan": auto_youtube_replan,
             "auto_youtube_materialization": auto_youtube_materialization,
             "auto_youtube_execution": auto_youtube_execution,
+            "auto_youtube_automatic_release": auto_youtube_automatic_release,
         }
         app.logger.info(
             "Worker runtime initialized: loaded=%d discarded=%d "
@@ -1486,6 +1501,11 @@ def admit_auto_youtube_intent(
         _auto_youtube_generation_service().reconcile()
         _auto_youtube_replan_service().reconcile()
         _auto_youtube_materialization_service().reconcile()
+        _auto_youtube_execution_service().release_automatic_jobs_for_execution(
+            lambda upload_job_id: _job_manager_for_compatibility().start_worker(
+                run_upload_job, upload_job_id
+            )
+        )
     return outcome
 
 

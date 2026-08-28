@@ -4,6 +4,7 @@ import ast
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -70,6 +71,7 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         *,
         streamer="bearlychen",
         vod_id=VOD_ID,
+        execution_policy="manual",
     ):
         source_path = self.media_root / streamer / "source.mkv"
         source_path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +86,7 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
             source_download_job_id="12", source_download_item_id="12-item-1",
             media_path=source_relative, size_bytes=source_path.stat().st_size,
             playlist_id=playlist_id or None,
+            execution_policy=execution_policy,
             plan_inputs={
                 "title_template": "{title}", "description_template": "{title}",
                 "description_fallback": "", "privacy_status": "unlisted",
@@ -180,6 +183,200 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         manual = self.manager.create_upload_job(["bearlychen/source.mkv"], "Manual")
         with self.assertRaisesRegex(AutoYouTubeExecutionError, "invalid_auto_youtube_job"):
             self.executor().release_auto_youtube_job_for_execution(manual)
+
+    def test_new_automatic_one_part_bundle_releases_and_executes_once(self):
+        job_id = self.create_bundle(
+            playlist_id="FROZEN_PLAYLIST", execution_policy="automatic"
+        )
+        transfer_states = []
+
+        def send_after_transfer(*_args, **_kwargs):
+            transfer_states.append(
+                self.store.get("bearlychen", VOD_ID)["parts"][0]["upload_state"]
+            )
+            return "YT_VIDEO_1"
+
+        self.request_sender.side_effect = send_after_transfer
+
+        def finish_playlist(current_job_id):
+            current = self.store.get("bearlychen", VOD_ID)
+            item_id = current["parts"][0]["upload_item_id"]
+            self.store.begin_part_playlist_insertion(
+                "bearlychen", VOD_ID,
+                upload_job_id=current_job_id,
+                upload_item_id=item_id,
+                part_index=1,
+            )
+            self.store.confirm_part_playlist_membership(
+                "bearlychen", VOD_ID,
+                upload_job_id=current_job_id,
+                upload_item_id=item_id,
+                part_index=1,
+            )
+
+        playlist_chainer = mock.Mock(side_effect=finish_playlist)
+        executor = self.executor(playlist_chainer=playlist_chainer)
+        workers = []
+
+        result = executor.release_automatic_jobs_for_execution(
+            lambda current: workers.append(
+                self.manager.start_worker(executor.run_job, current)
+            )
+        )
+        workers[0].join(2.0)
+
+        self.assertEqual(result["released"], 1)
+        self.assertFalse(workers[0].is_alive())
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed"])
+        self.assertFalse(self.manager.get_job(job_id)["execution_deferred"])
+        record = self.store.get("bearlychen", VOD_ID)
+        self.assertEqual(record["state"], "completed")
+        self.assertEqual(record["parts"][0]["youtube_video_id"], "YT_VIDEO_1")
+        self.assertEqual(record["parts"][0]["playlist_state"], "confirmed")
+        self.assertEqual(transfer_states, ["transfer_started"])
+        playlist_chainer.assert_called_once_with(job_id)
+        self.request_sender.assert_called_once()
+        repeated = executor.release_automatic_jobs_for_execution(
+            lambda current: workers.append(
+                self.manager.start_worker(executor.run_job, current)
+            )
+        )
+        self.assertEqual(repeated["released"], 0)
+        self.request_sender.assert_called_once()
+
+    def test_new_automatic_multipart_bundle_uses_one_worker_and_ordered_parts(self):
+        job_id = self.create_bundle(
+            total=2,
+            playlist_id="FROZEN_PLAYLIST",
+            execution_policy="automatic",
+        )
+        self.request_sender.side_effect = ["YT_PART_1", "YT_PART_2"]
+
+        def finish_playlist(current_job_id):
+            current = self.store.get("bearlychen", VOD_ID)
+            for index, part in enumerate(current["parts"], 1):
+                self.store.begin_part_playlist_insertion(
+                    "bearlychen", VOD_ID,
+                    upload_job_id=current_job_id,
+                    upload_item_id=part["upload_item_id"],
+                    part_index=index,
+                )
+                self.store.confirm_part_playlist_membership(
+                    "bearlychen", VOD_ID,
+                    upload_job_id=current_job_id,
+                    upload_item_id=part["upload_item_id"],
+                    part_index=index,
+                )
+
+        playlist_chainer = mock.Mock(side_effect=finish_playlist)
+        executor = self.executor(playlist_chainer=playlist_chainer)
+        starter = mock.Mock(side_effect=executor.run_job)
+
+        result = executor.release_automatic_jobs_for_execution(starter)
+
+        self.assertEqual(result["released"], 1)
+        starter.assert_called_once_with(job_id)
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed", "completed"])
+        self.assertEqual(
+            [part["youtube_video_id"] for part in self.store.get("bearlychen", VOD_ID)["parts"]],
+            ["YT_PART_1", "YT_PART_2"],
+        )
+        self.assertEqual(self.store.get("bearlychen", VOD_ID)["state"], "completed")
+        playlist_chainer.assert_called_once_with(job_id)
+        self.assertEqual(self.request_sender.call_count, 2)
+
+    def test_manual_policy_is_never_retroactively_automatic(self):
+        job_id = self.create_bundle(execution_policy="manual")
+        starter = mock.Mock()
+
+        result = self.executor().release_automatic_jobs_for_execution(starter)
+
+        self.assertEqual(result["released"], 0)
+        self.assertTrue(self.manager.get_job(job_id)["execution_deferred"])
+        starter.assert_not_called()
+        self.service_getter.assert_not_called()
+
+    def test_automatic_release_persistence_failure_never_starts_worker(self):
+        job_id = self.create_bundle(execution_policy="automatic")
+        starter = mock.Mock()
+        with mock.patch.object(
+            self.manager.job_store,
+            "save",
+            side_effect=JobStorePersistenceError("full"),
+        ):
+            result = self.executor().release_automatic_jobs_for_execution(starter)
+
+        self.assertEqual(result["pending"], 1)
+        self.assertTrue(self.manager.get_job(job_id)["execution_deferred"])
+        starter.assert_not_called()
+        self.service_getter.assert_not_called()
+
+    def test_startup_recovers_durably_released_automatic_job_without_new_lineage(self):
+        job_id = self.create_bundle(execution_policy="automatic")
+        self.executor().release_auto_youtube_job_for_execution(job_id)
+        restarted = self.new_manager()
+        restarted.restore_from_store()
+        executor = self.executor(restarted)
+        executor.reconcile()
+        starter = mock.Mock()
+
+        result = executor.release_automatic_jobs_for_execution(
+            starter, recover_released=True
+        )
+
+        self.assertEqual(result["recovered"], 1)
+        starter.assert_called_once_with(job_id)
+        self.assertEqual(len(restarted.snapshot_jobs()), 1)
+        self.service_getter.assert_not_called()
+        self.request_sender.assert_not_called()
+
+    def test_startup_releases_deferred_automatic_job_once(self):
+        job_id = self.create_bundle(execution_policy="automatic")
+        restarted = self.new_manager()
+        restarted.restore_from_store()
+        executor = self.executor(restarted)
+        executor.reconcile()
+        starter = mock.Mock()
+
+        result = executor.release_automatic_jobs_for_execution(
+            starter, recover_released=True
+        )
+        repeated = executor.release_automatic_jobs_for_execution(
+            starter, recover_released=True
+        )
+
+        self.assertEqual(result["released"], 1)
+        self.assertEqual(repeated["already_started"], 1)
+        starter.assert_called_once_with(job_id)
+        self.assertFalse(restarted.get_job(job_id)["execution_deferred"])
+        self.assertEqual(len(restarted.snapshot_jobs()), 1)
+        self.service_getter.assert_not_called()
+        self.request_sender.assert_not_called()
+
+    def test_paused_upload_queue_blocks_automatic_worker_until_resume(self):
+        job_id = self.create_bundle(execution_policy="automatic")
+        sent = threading.Event()
+        self.request_sender.side_effect = lambda *_args, **_kwargs: (
+            sent.set() or "YT_VIDEO_1"
+        )
+        executor = self.executor()
+        self.manager.pause_queue("youtube_upload")
+        workers = []
+
+        result = executor.release_automatic_jobs_for_execution(
+            lambda current: workers.append(
+                self.manager.start_worker(executor.run_job, current)
+            )
+        )
+
+        self.assertEqual(result["released"], 1)
+        self.assertFalse(sent.wait(0.1))
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["queued"])
+        self.manager.resume_queue("youtube_upload")
+        self.assertTrue(sent.wait(2.0))
+        workers[0].join(2.0)
+        self.assertFalse(workers[0].is_alive())
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed"])
 
     def test_successful_auto_upload_without_frozen_playlist_does_not_chain_playlist_work(self):
         job_id = self.create_bundle(playlist_id="")
@@ -754,6 +951,10 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
             (
                 "auto_youtube_execute.py",
                 "release_auto_youtube_job_for_execution",
+            ),
+            (
+                "auto_youtube_execute.py",
+                "release_automatic_jobs_for_execution",
             ),
         ])
 

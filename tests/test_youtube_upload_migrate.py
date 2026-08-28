@@ -7,9 +7,13 @@ import tempfile
 import unittest
 
 from vod_dashboard.youtube_upload_migrate import (
-    YouTubeUploadMigrationError, convert_v1_state, run_migration,
+    YouTubeUploadMigrationError, convert_v1_state, convert_v2_state,
+    run_migration,
 )
-from vod_dashboard.youtube_upload_state import YOUTUBE_UPLOAD_STATE_FILE_NAME
+from vod_dashboard.youtube_upload_state import (
+    YOUTUBE_UPLOAD_STATE_FILE_NAME,
+    YOUTUBE_UPLOAD_STATE_VERSION,
+)
 
 
 class YouTubeUploadMigrationTests(unittest.TestCase):
@@ -36,9 +40,11 @@ class YouTubeUploadMigrationTests(unittest.TestCase):
         self.write(); report = run_migration(self.root, apply=True, now=datetime(2026, 8, 26, tzinfo=timezone.utc))
         self.assertEqual(report.action, "applied"); self.assertTrue(Path(report.backup_path).is_dir())
         converted = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(converted["version"], 2); self.assertEqual(converted["uploads"]["bearlychen:2855270041"]["playlist_id"], "PL1")
+        self.assertEqual(converted["version"], YOUTUBE_UPLOAD_STATE_VERSION); self.assertEqual(converted["uploads"]["bearlychen:2855270041"]["playlist_id"], "PL1")
+        self.assertEqual(converted["uploads"]["bearlychen:2855270041"]["execution_policy"], "manual")
         self.assertEqual(converted["uploads"]["bearlychen:2855270041"]["upload_plan"]["title"], "title")
         self.assertTrue((Path(report.backup_path) / YOUTUBE_UPLOAD_STATE_FILE_NAME).exists())
+        self.assertEqual(run_migration(self.root, apply=True).action, "already_migrated")
 
     def test_confirmed_video_is_never_lost(self):
         converted, report = convert_v1_state({"version": 1, "uploads": {"bearlychen:2855270041": self.record(state="completed", youtube_video_id="video_1", attempts=2, playlist_state="confirmed")}})
@@ -50,6 +56,45 @@ class YouTubeUploadMigrationTests(unittest.TestCase):
         self.path.write_bytes(b"{bad"); before = self.path.read_bytes()
         with self.assertRaises(YouTubeUploadMigrationError): run_migration(self.root, apply=True)
         self.assertEqual(self.path.read_bytes(), before)
-        self.path.write_text(json.dumps({"version": 2, "uploads": {}}), encoding="utf-8")
+        self.path.write_text(json.dumps({"version": 3, "uploads": {}}), encoding="utf-8")
         self.assertEqual(run_migration(self.root, apply=True).action, "already_migrated")
 
+    def test_v2_migration_makes_every_historical_owner_manual(self):
+        converted_v3, _ = convert_v1_state({
+            "version": 1,
+            "uploads": {"bearlychen:2855270041": self.record(
+                state="completed",
+                youtube_video_id="YT_EXISTING",
+                playlist_state="confirmed",
+            )},
+        })
+        v2 = {
+            "version": 2,
+            "uploads": {
+                key: {
+                    field: value
+                    for field, value in record.items()
+                    if field != "execution_policy"
+                }
+                for key, record in converted_v3["uploads"].items()
+            },
+        }
+        converted, report = convert_v2_state(v2)
+        self.assertEqual(report.source_schema, 2)
+        self.assertEqual(report.records_migrated, 1)
+        self.assertEqual(
+            converted["uploads"]["bearlychen:2855270041"]["execution_policy"],
+            "manual",
+        )
+        self.assertEqual(
+            converted["uploads"]["bearlychen:2855270041"]["parts"][0][
+                "youtube_video_id"
+            ],
+            "YT_EXISTING",
+        )
+        self.assertEqual(
+            converted["uploads"]["bearlychen:2855270041"]["parts"][0][
+                "playlist_state"
+            ],
+            "confirmed",
+        )

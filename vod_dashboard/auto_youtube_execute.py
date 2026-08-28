@@ -50,6 +50,7 @@ class AutoYouTubeExecutionService:
         self._probe = probe
         self._log = log or (lambda _job_id, _message: None)
         self._playlist_chainer = playlist_chainer
+        self._automatic_worker_starts: set[str] = set()
 
     def _materializer(self) -> AutoYouTubeMaterializationService:
         return AutoYouTubeMaterializationService(
@@ -97,15 +98,19 @@ class AutoYouTubeExecutionService:
             raise AutoYouTubeExecutionError("ownership_mismatch")
         return job, record, descriptors
 
-    def release_auto_youtube_job_for_execution(self, job_id: str) -> bool:
-        """The only P8g1 release primitive; it has no route or automatic caller."""
+    def _validate_release_candidate(
+        self, job_id: str, *, deferred: Optional[bool]
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
         if self._state_store.health().get("healthy") is not True:
             raise AutoYouTubeExecutionError("ownership_store_unavailable")
         health = self._job_manager.persistence_status()
         if health.get("enabled") is not True or health.get("healthy") is not True:
             raise AutoYouTubeExecutionError("job_store_unavailable")
         job, record, descriptors = self._ownership(str(job_id))
-        if job.get("execution_deferred") is not True or record.get("state") != "upload_queued":
+        if (
+            (deferred is not None and job.get("execution_deferred") is not deferred)
+            or record.get("state") != "upload_queued"
+        ):
             raise AutoYouTubeExecutionError("release_not_allowed")
         lineage = [
             candidate for candidate in self._job_manager.snapshot_jobs()
@@ -126,9 +131,73 @@ class AutoYouTubeExecutionService:
             self._materializer()._validate_media(record, descriptors)
         except (_MissingMaterializationMedia, _InvalidMaterializationMedia) as exc:
             raise AutoYouTubeExecutionError("release_media_invalid") from exc
+        return job, record
+
+    def release_auto_youtube_job_for_execution(self, job_id: str) -> bool:
+        """Validate ownership, then durably clear the existing execution gate."""
+        self._validate_release_candidate(str(job_id), deferred=True)
         if not self._job_manager.release_auto_youtube_job_for_execution(str(job_id)):
             raise AutoYouTubeExecutionError("release_not_allowed")
         return True
+
+    def release_automatic_jobs_for_execution(
+        self,
+        worker_starter: Callable[[str], Any],
+        *,
+        recover_released: bool = False,
+    ) -> Dict[str, int]:
+        """Release only owners with frozen automatic policy, then arm workers."""
+        result = {
+            "released": 0,
+            "recovered": 0,
+            "already_started": 0,
+            "pending": 0,
+            "ignored": 0,
+        }
+        try:
+            records = self._state_store.list_records()
+        except Exception:
+            result["pending"] += 1
+            return result
+        for record in records.values():
+            if (
+                record.get("execution_policy") != "automatic"
+                or record.get("state") != "upload_queued"
+                or not record.get("upload_job_id")
+            ):
+                result["ignored"] += 1
+                continue
+            job_id = str(record["upload_job_id"])
+            if job_id in self._automatic_worker_starts:
+                result["already_started"] += 1
+                continue
+            released_now = False
+            try:
+                job = self._job_manager.get_job(job_id) or {}
+                if job.get("execution_deferred") is True:
+                    self.release_auto_youtube_job_for_execution(job_id)
+                    released_now = True
+                elif recover_released:
+                    self._validate_release_candidate(job_id, deferred=False)
+                    if "queued" not in list(job.get("item_states") or []):
+                        result["ignored"] += 1
+                        continue
+                else:
+                    result["ignored"] += 1
+                    continue
+                self._automatic_worker_starts.add(job_id)
+                worker_starter(job_id)
+            except Exception:
+                self._automatic_worker_starts.discard(job_id)
+                if released_now or recover_released:
+                    try:
+                        self._job_manager.defer_auto_youtube_job(job_id)
+                    except Exception:
+                        pass
+                result["pending"] += 1
+                continue
+            result["released" if released_now else "recovered"] += 1
+        return result
 
     def _block(
         self,

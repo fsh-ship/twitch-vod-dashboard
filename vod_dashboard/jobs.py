@@ -16,6 +16,7 @@ import time
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional
 
 from vod_dashboard.job_store import (
+    AUTO_YOUTUBE_EXECUTION_POLICIES,
     AUTO_YOUTUBE_HANDOFF_REASONS,
     AUTO_YOUTUBE_HANDOFF_STATES,
     JobStore,
@@ -112,6 +113,7 @@ def upload_execution_owner(job: Any) -> str:
             "auto_youtube_context",
             "auto_youtube_parts",
             "execution_deferred",
+            "auto_youtube_execution_policy",
         )
     )
     if origin == "auto_youtube" or has_auto_context:
@@ -1440,6 +1442,7 @@ class JobManager:
         retry_of: Optional[Dict[str, str]] = None,
         auto_youtube_context: Optional[Dict[str, Any]] = None,
         auto_youtube_parts: Optional[list[Dict[str, Any]]] = None,
+        auto_youtube_execution_policy: str = "manual",
         counter_getter: Optional[CounterGetter] = None,
         counter_setter: Optional[CounterSetter] = None,
     ) -> str:
@@ -1485,6 +1488,8 @@ class JobManager:
             if playlist_id is not None:
                 job["playlist_id"] = str(playlist_id or "").strip()
             if auto_youtube_context is not None:
+                if auto_youtube_execution_policy not in AUTO_YOUTUBE_EXECUTION_POLICIES:
+                    raise ValueError("Invalid Auto YouTube execution policy.")
                 context = dict(auto_youtube_context)
                 streamer = str(context.get("streamer") or "").strip()
                 vod_id = str(context.get("twitch_vod_id") or "").strip()
@@ -1494,6 +1499,7 @@ class JobManager:
                         "execution_deferred": True,
                         "auto_youtube_key": f"{streamer}:{vod_id}",
                         "auto_youtube_context": context,
+                        "auto_youtube_execution_policy": auto_youtube_execution_policy,
                     }
                 )
                 if auto_youtube_parts is not None:
@@ -1528,6 +1534,7 @@ class JobManager:
         upload_plan: Dict[str, Any],
         playlist_id: str,
         parts: Optional[list[Dict[str, Any]]] = None,
+        execution_policy: str = "manual",
     ) -> str:
         """Persist one P8f Auto YouTube job without arming an upload worker."""
         source_parts = list(parts or [])
@@ -1585,6 +1592,7 @@ class JobManager:
             item_metadata=metadata,
             auto_youtube_context=context,
             auto_youtube_parts=persist_parts,
+            auto_youtube_execution_policy=execution_policy,
         )
 
     def release_auto_youtube_job_for_execution(self, job_id: str) -> bool:
@@ -2393,6 +2401,7 @@ class JobManager:
         auto_youtube_handoff: Optional[str] = None,
         auto_youtube_handoff_reason: str = "",
         auto_youtube_playlist_id: str = "",
+        auto_youtube_execution_policy: str = "manual",
     ) -> bool:
         """Persist exact Auto VOD media output before exposing completion."""
         with self._condition:
@@ -2418,6 +2427,8 @@ class JobManager:
                     auto_youtube_handoff not in AUTO_YOUTUBE_HANDOFF_STATES
                     or auto_youtube_handoff_reason
                     not in AUTO_YOUTUBE_HANDOFF_REASONS
+                    or auto_youtube_execution_policy
+                    not in AUTO_YOUTUBE_EXECUTION_POLICIES
                 ):
                     raise ValueError("Invalid Auto YouTube handoff state.")
             previous = {
@@ -2434,6 +2445,7 @@ class JobManager:
                     "item_auto_youtube_handoffs",
                     "item_auto_youtube_handoff_reasons",
                     "item_auto_youtube_playlist_ids",
+                    "item_auto_youtube_execution_policies",
                 )
             }
             job["completed_media_path"] = str(completed_media_path)
@@ -2448,6 +2460,9 @@ class JobManager:
                 ]
                 job["item_auto_youtube_playlist_ids"] = [
                     str(auto_youtube_playlist_id or "")
+                ]
+                job["item_auto_youtube_execution_policies"] = [
+                    auto_youtube_execution_policy
                 ]
             self._set_item_state_locked(job, index, "completed")
             if self._lane_active["download"] == (str(job_id), str(item_id)):
@@ -4035,6 +4050,7 @@ def run_download_job(
                                         "handoff": "handoff_blocked",
                                         "reason": "settings_unavailable",
                                         "playlist_id": "",
+                                        "execution_policy": "manual",
                                     }
                             decision_handoff = (
                                 getattr(decision, "handoff", None)
@@ -4051,10 +4067,18 @@ def run_download_job(
                                 if decision is not None
                                 else ""
                             )
+                            decision_execution_policy = (
+                                getattr(decision, "execution_policy", "manual")
+                                if decision is not None
+                                else "manual"
+                            )
                             if isinstance(decision, dict):
                                 decision_handoff = decision.get("handoff")
                                 decision_reason = decision.get("reason", "")
                                 decision_playlist_id = decision.get("playlist_id", "")
+                                decision_execution_policy = decision.get(
+                                    "execution_policy", "manual"
+                                )
                             persisted = manager.finish_auto_vod_download_with_result(
                                 job_id,
                                 item_id,
@@ -4073,6 +4097,9 @@ def run_download_job(
                                 ),
                                 auto_youtube_playlist_id=str(
                                     decision_playlist_id or ""
+                                ),
+                                auto_youtube_execution_policy=str(
+                                    decision_execution_policy or "manual"
                                 ),
                             )
                             if not persisted:

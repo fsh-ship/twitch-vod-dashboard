@@ -17,6 +17,7 @@ class AutoYouTubeAdmission:
     handoff: str
     reason: str
     playlist_id: str
+    execution_policy: str
 
 
 def completion_admission(
@@ -25,14 +26,15 @@ def completion_admission(
     """Freeze the strict opt-in decision from settings at completion time."""
     canonical_streamer = canonical_streamer_login(streamer)
     if settings.get("auto_youtube_enabled") is not True:
-        return AutoYouTubeAdmission("not_eligible", "global_disabled", "")
+        return AutoYouTubeAdmission("not_eligible", "global_disabled", "", "manual")
     profile = normalize_streamer_profiles(settings.get("streamer_profiles")).get(
         canonical_streamer, {}
     )
     if profile.get("auto_youtube_upload") is not True:
-        return AutoYouTubeAdmission("not_eligible", "streamer_disabled", "")
+        return AutoYouTubeAdmission("not_eligible", "streamer_disabled", "", "manual")
     return AutoYouTubeAdmission(
-        "intent_pending", "", str(profile.get("youtube_playlist_id") or "").strip()
+        "intent_pending", "", str(profile.get("youtube_playlist_id") or "").strip(),
+        "automatic",
     )
 
 
@@ -101,6 +103,15 @@ class AutoYouTubeHandoffService:
         values = job.get("item_auto_youtube_playlist_ids") or []
         return str(values[0] or "") if isinstance(values, list) and len(values) == 1 else ""
 
+    @staticmethod
+    def _execution_policy(job: Mapping[str, Any]) -> str:
+        values = job.get("item_auto_youtube_execution_policies") or []
+        return (
+            str(values[0])
+            if isinstance(values, list) and len(values) == 1
+            else "manual"
+        )
+
     def _block(self, job_id: str, item_id: str, reason: str) -> str:
         try:
             self._job_manager.set_auto_youtube_handoff(
@@ -131,6 +142,7 @@ class AutoYouTubeHandoffService:
                 **source,
                 playlist_id=self._playlist_id(job) or None,
                 plan_inputs=plan_inputs,
+                execution_policy=self._execution_policy(job),
             )
         except YouTubeUploadStateLoadError:
             return self._block(job_id, item_id, "upload_state_unhealthy")

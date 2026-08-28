@@ -1304,7 +1304,13 @@ class V11UiContractTests(unittest.TestCase):
     def test_auto_youtube_settings_are_visible_but_not_an_active_workflow(self) -> None:
         self.assertIn('id="autoYoutubeEnabled"', TEMPLATE)
         self.assertNotIn('id="autoYoutubeEnabled" checked', TEMPLATE)
-        self.assertIn("Auto YouTube settings can be saved now. Automation is not active yet.", TEMPLATE)
+        self.assertIn(
+            "New eligible Auto VODs can be prepared and uploaded automatically.",
+            TEMPLATE,
+        )
+        self.assertIn(
+            "Existing deferred uploads still require manual start.", TEMPLATE
+        )
         self.assertIn(
             "$('autoYoutubeEnabled').checked = state.settings.auto_youtube_enabled === true",
             JAVASCRIPT,

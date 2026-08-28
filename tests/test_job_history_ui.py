@@ -241,6 +241,7 @@ def _upload_job(
     deferred: bool = True,
     states: list[str] | None = None,
     failure_kinds: list[str] | None = None,
+    execution_policy: str = "manual",
 ) -> dict:
     states = states or ["queued"]
     failure_kinds = failure_kinds or ["" for _ in states]
@@ -250,6 +251,7 @@ def _upload_job(
         "type": "youtube_upload",
         "origin": origin,
         "execution_deferred": deferred,
+        "auto_youtube_execution_policy": execution_policy,
         "state": (
             "running"
             if "running" in states
@@ -417,8 +419,10 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertNotIn("C:/private", str(friendly))
 
     def test_deferred_auto_youtube_has_clear_bundle_level_start_action(self):
+        historical = _upload_job("79")
+        historical.pop("auto_youtube_execution_policy")
         result = _evaluate_history_ui([
-            _upload_job("79"),
+            historical,
             _upload_job("80", states=["queued", "queued", "queued"]),
         ])
         cards_79 = [
@@ -468,6 +472,19 @@ class JobHistoryUiTests(unittest.TestCase):
         )
         self.assertIn("86", result["completedOrder"])
         self.assertNotIn("86", result["activeOrder"])
+
+    def test_automatic_policy_never_shows_manual_start_and_explains_queue_state(self):
+        result = _evaluate_history_ui([
+            _upload_job("87", execution_policy="automatic"),
+            _upload_job("88", deferred=False, execution_policy="automatic"),
+        ])
+        cards = {item["jobId"]: item["html"] for item in result["rendered"]}
+        self.assertIn("Preparing automatic upload", cards["87"])
+        self.assertIn("Automatic release is pending.", cards["87"])
+        self.assertIn("Upload queued automatically", cards["88"])
+        self.assertIn("Waiting for the upload queue.", cards["88"])
+        self.assertNotIn('data-queue-action="start-auto-youtube"', cards["87"])
+        self.assertNotIn('data-queue-action="start-auto-youtube"', cards["88"])
 
     def test_completed_auto_youtube_playlist_action_is_eligible_and_bundle_level(self):
         eligible = _upload_job(

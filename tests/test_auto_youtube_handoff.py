@@ -62,6 +62,7 @@ class AutoYouTubeHandoffTests(unittest.TestCase):
             auto_youtube_handoff=decision.handoff,
             auto_youtube_handoff_reason=decision.reason,
             auto_youtube_playlist_id=decision.playlist_id,
+            auto_youtube_execution_policy=decision.execution_policy,
         )
         return decision
 
@@ -116,6 +117,7 @@ class AutoYouTubeHandoffTests(unittest.TestCase):
         self.assertEqual(record["media_path"], "bearlychen/final.mkv")
         self.assertEqual(record["size_bytes"], 123)
         self.assertEqual(record["playlist_id"], "PLAYLIST_A")
+        self.assertEqual(record["execution_policy"], "automatic")
         self.assertEqual(record["playlist_id"], "PLAYLIST_A")
         self.assertIsNone(record["upload_job_id"])
         self.assertEqual(record["parts"], [])
@@ -296,6 +298,7 @@ class AutoYouTubeHandoffTests(unittest.TestCase):
                     auto_youtube_handoff=decision.handoff,
                     auto_youtube_handoff_reason=decision.reason,
                     auto_youtube_playlist_id=decision.playlist_id,
+                    auto_youtube_execution_policy=decision.execution_policy,
                 )
         self.assertFalse(self.store.path.exists())
         self.assertEqual(manager.get_job(job_id)["item_states"], ["failed"])
