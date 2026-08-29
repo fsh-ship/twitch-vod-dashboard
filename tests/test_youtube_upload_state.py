@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import tempfile
@@ -27,7 +27,7 @@ class YouTubeUploadStateStoreTests(unittest.TestCase):
         return self.store.create_intent_if_absent(**values)
 
     def record(self, **changes):
-        value = {"streamer": "bearlychen", "twitch_vod_id": "2855270041", "source_download_job_id": "38", "source_download_item_id": "38-item-1", "media_path": "bearlychen/video.mp4", "size_bytes": 12, "source_duration_seconds": None, "state": "intent_pending", "upload_job_id": None, "playlist_id": None, "plan_inputs": None, "upload_plan": None, "part_plan_version": None, "split": None, "parts": [], "reason": None, "created_at": "2026-08-26T12:00:00Z", "updated_at": "2026-08-26T12:00:00Z", "execution_policy": "manual"}
+        value = {"streamer": "bearlychen", "twitch_vod_id": "2855270041", "source_download_job_id": "38", "source_download_item_id": "38-item-1", "media_path": "bearlychen/video.mp4", "size_bytes": 12, "source_duration_seconds": None, "state": "intent_pending", "upload_job_id": None, "playlist_id": None, "plan_inputs": None, "upload_plan": None, "part_plan_version": None, "split": None, "parts": [], "reason": None, "created_at": "2026-08-26T12:00:00Z", "updated_at": "2026-08-26T12:00:00Z", "execution_policy": "manual", "local_cleanup": {"policy": "manual", "delay_hours": None, "keep_local": False, "cleanup_due_at": None, "cleaned_at": None}}
         value.update(changes)
         return value
 
@@ -41,7 +41,7 @@ class YouTubeUploadStateStoreTests(unittest.TestCase):
         self.assertEqual(self.store.health(), {"healthy": True, "reason": None})
 
     def test_prior_schemas_require_explicit_offline_migration(self):
-        for version in (1, 2):
+        for version in (1, 2, 3):
             with self.subTest(version=version):
                 self.path.write_text(json.dumps({"version": version, "uploads": {}}), encoding="utf-8")
                 with self.assertRaisesRegex(state.YouTubeUploadStateLoadError, "migration_required"):
@@ -49,17 +49,18 @@ class YouTubeUploadStateStoreTests(unittest.TestCase):
                 self.assertEqual(self.store.health(), {"healthy": False, "reason": "migration_required"})
 
     def test_corrupt_and_unsupported_fail_closed(self):
-        for raw, reason in ((b"{bad", "invalid_json"), (json.dumps({"version": 4, "uploads": {}}).encode(), "unsupported_version")):
+        for raw, reason in ((b"{bad", "invalid_json"), (json.dumps({"version": 5, "uploads": {}}).encode(), "unsupported_version")):
             with self.subTest(reason=reason):
                 self.path.write_bytes(raw)
                 self.assertEqual(self.store.health(), {"healthy": False, "reason": reason})
 
-    def test_create_uses_v3_record_with_explicit_execution_policy(self):
+    def test_create_uses_v4_record_with_explicit_execution_and_cleanup_policy(self):
         record, created = self.create(execution_policy="automatic")
         self.assertTrue(created); self.assertEqual(record["parts"], [])
         self.assertIsNone(record["source_duration_seconds"])
         self.assertEqual(record["execution_policy"], "automatic")
-        self.assertEqual(self.store.load()["version"], 3)
+        self.assertEqual(record["local_cleanup"]["policy"], "manual")
+        self.assertEqual(self.store.load()["version"], 4)
         self.assertNotIn(str(self.root), self.path.read_text(encoding="utf-8"))
 
     def test_execution_policy_is_strict_and_immutable(self):
@@ -72,6 +73,90 @@ class YouTubeUploadStateStoreTests(unittest.TestCase):
         self.assertFalse(created)
         self.assertEqual(duplicate["execution_policy"], "automatic")
         self.assertEqual(record, duplicate)
+
+    def _queued_original(self, *, playlist_id=None, cleanup_delay_hours=0):
+        self.create(
+            playlist_id=playlist_id,
+            cleanup_delay_hours=cleanup_delay_hours,
+            plan_inputs={"title_template": "{title}", "description_template": "", "description_fallback": "", "privacy_status": "private", "category_id": "20", "tags": []},
+        )
+        self.store.set_upload_plan("bearlychen", "2855270041", {"title": "title", "description": "", "privacy_status": "private", "category_id": "20", "tags": []})
+        self.store.set_preparation(
+            "bearlychen", "2855270041", source_duration_seconds=2.0,
+            state="parts_ready", split=None,
+            parts=[{"index": 1, "media_path": "bearlychen/video.mp4", "size_bytes": 12, "duration_seconds": 2.0, "source_kind": "original", "upload_item_id": None, "upload_state": "ready", "attempts": 0, "youtube_video_id": None, "playlist_state": "pending" if playlist_id else "not_requested", "reason": None}],
+        )
+        self.store.attach_materialized_upload(
+            "bearlychen", "2855270041", upload_job_id="99",
+            upload_item_ids=["99-item-1"],
+        )
+        self.store.begin_part_transfer(
+            "bearlychen", "2855270041", upload_job_id="99",
+            upload_item_id="99-item-1", part_index=1,
+        )
+
+    def test_cleanup_policy_is_frozen_and_not_changed_by_duplicate_admission(self):
+        first, _ = self.create(cleanup_delay_hours=6)
+        duplicate, created = self.create(cleanup_delay_hours=48)
+        self.assertFalse(created)
+        self.assertEqual(first["local_cleanup"], duplicate["local_cleanup"])
+        self.assertEqual(first["local_cleanup"]["delay_hours"], 6)
+
+    def test_playlistless_final_success_schedules_cleanup_deterministically(self):
+        self._queued_original(cleanup_delay_hours=6)
+        completed = self.store.confirm_part_video(
+            "bearlychen", "2855270041", upload_job_id="99",
+            upload_item_id="99-item-1", part_index=1,
+            youtube_video_id="video_1",
+        )
+        self.assertEqual(completed["state"], "completed")
+        self.assertEqual(completed["local_cleanup"]["cleanup_due_at"], "2026-08-26T18:00:00Z")
+        restarted = state.YouTubeUploadStateStore(self.path, clock=lambda: NOW + timedelta(days=1))
+        self.assertEqual(restarted.get("bearlychen", "2855270041")["local_cleanup"]["cleanup_due_at"], "2026-08-26T18:00:00Z")
+
+    def test_playlist_pending_never_schedules_until_final_membership_confirmation(self):
+        self._queued_original(playlist_id="PL1", cleanup_delay_hours=3)
+        pending = self.store.confirm_part_video(
+            "bearlychen", "2855270041", upload_job_id="99",
+            upload_item_id="99-item-1", part_index=1,
+            youtube_video_id="video_1",
+        )
+        self.assertEqual(pending["state"], "playlist_pending")
+        self.assertIsNone(pending["local_cleanup"]["cleanup_due_at"])
+        self.store.begin_part_playlist_insertion(
+            "bearlychen", "2855270041", upload_job_id="99",
+            upload_item_id="99-item-1", part_index=1,
+        )
+        completed = self.store.confirm_part_playlist_membership(
+            "bearlychen", "2855270041", upload_job_id="99",
+            upload_item_id="99-item-1", part_index=1,
+        )
+        self.assertEqual(completed["state"], "completed")
+        self.assertEqual(completed["local_cleanup"]["cleanup_due_at"], "2026-08-26T15:00:00Z")
+
+    def test_uncertain_nonfinal_bundle_never_gets_a_cleanup_deadline(self):
+        self._queued_original(cleanup_delay_hours=6)
+        attention = self.store.mark_part_attention(
+            "bearlychen", "2855270041", upload_job_id="99",
+            upload_item_id="99-item-1", part_index=1,
+            reason="upload_outcome_uncertain", uncertain=True,
+        )
+        self.assertEqual(attention["state"], "needs_attention")
+        self.assertIsNone(attention["local_cleanup"]["cleanup_due_at"])
+
+    def test_keep_local_persists_and_reversal_gets_a_fresh_full_delay(self):
+        clock = [NOW]
+        store = state.YouTubeUploadStateStore(self.path, clock=lambda: clock[0])
+        self.store = store
+        self._queued_original(cleanup_delay_hours=6)
+        store.confirm_part_video("bearlychen", "2855270041", upload_job_id="99", upload_item_id="99-item-1", part_index=1, youtube_video_id="video_1")
+        kept = store.set_keep_local("bearlychen", "2855270041", keep_local=True)
+        self.assertTrue(kept["local_cleanup"]["keep_local"])
+        self.assertIsNone(kept["local_cleanup"]["cleanup_due_at"])
+        self.assertTrue(state.YouTubeUploadStateStore(self.path).get("bearlychen", "2855270041")["local_cleanup"]["keep_local"])
+        clock[0] = NOW + timedelta(days=2)
+        resumed = store.set_keep_local("bearlychen", "2855270041", keep_local=False)
+        self.assertEqual(resumed["local_cleanup"]["cleanup_due_at"], "2026-08-28T18:00:00Z")
 
     def test_current_parts_are_strictly_ordered_and_safe(self):
         good = {"index": 1, "media_path": "bearlychen/part-1.mp4", "size_bytes": 5, "duration_seconds": 2.5, "source_kind": "generated", "upload_item_id": None, "upload_state": "ready", "attempts": 0, "youtube_video_id": None, "playlist_state": "not_requested", "reason": None}

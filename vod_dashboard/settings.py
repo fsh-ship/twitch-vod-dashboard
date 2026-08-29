@@ -21,6 +21,7 @@ YTDLP_DEFAULT_OUTPUT_TEMPLATE = (
     "%(uploader)s/%(upload_date)s - %(uploader)s - %(title)s [%(id)s].%(ext)s"
 )
 MANUAL_UPLOAD_DEFAULT_FILENAME_TEMPLATE = "{date_de} - {streamer} - {title}"
+AUTO_YOUTUBE_CLEANUP_DELAY_HOURS = frozenset({1, 3, 6, 12, 24, 48})
 
 
 def _default_settings(runtime_paths: RuntimePaths) -> Dict[str, Any]:
@@ -49,6 +50,7 @@ def _default_settings(runtime_paths: RuntimePaths) -> Dict[str, Any]:
         "auto_recorder_enabled": False,
         "auto_vod_enabled": False,
         "auto_youtube_enabled": False,
+        "auto_youtube_cleanup_delay_hours": 0,
         "auto_vod_poll_minutes": 60,
         "streamer_profiles": {},
         "youtube_client_secret_file": str(
@@ -290,6 +292,13 @@ def normalize_settings(
     # per-streamer opt-in below; normalization never starts an upload.
     settings["auto_youtube_enabled"] = (
         settings.get("auto_youtube_enabled") is True
+    )
+    cleanup_delay = settings.get("auto_youtube_cleanup_delay_hours")
+    settings["auto_youtube_cleanup_delay_hours"] = (
+        cleanup_delay
+        if type(cleanup_delay) is int
+        and cleanup_delay in AUTO_YOUTUBE_CLEANUP_DELAY_HOURS
+        else 0
     )
     poll_minutes = settings.get("auto_vod_poll_minutes")
     settings["auto_vod_poll_minutes"] = (

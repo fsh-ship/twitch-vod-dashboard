@@ -119,6 +119,7 @@ async function startSingleVodDownload() {
       auto_recorder_enabled: val('autoRecorderEnabled', false),
       auto_vod_enabled: val('autoVodEnabled', false),
       auto_youtube_enabled: val('autoYoutubeEnabled', false),
+      auto_youtube_cleanup_delay_hours: Number(val('autoYoutubeCleanupDelayHours', '0')),
       auto_vod_poll_minutes: val('autoVodPollMinutes', '60'),
       youtube_enabled: val('youtubeEnabled', false),
       youtube_auto_upload: val('youtubeAutoUpload', false),
@@ -376,6 +377,7 @@ function renderState() {
   $('autoRecorderEnabled').checked = state.settings.auto_recorder_enabled === true;
   $('autoVodEnabled').checked = state.settings.auto_vod_enabled === true;
   $('autoYoutubeEnabled').checked = state.settings.auto_youtube_enabled === true;
+  $('autoYoutubeCleanupDelayHours').value = String(state.settings.auto_youtube_cleanup_delay_hours || 0);
   $('autoVodPollMinutes').value = String(state.settings.auto_vod_poll_minutes || 60);
   $('autoVodPollMinutes').disabled = !$('autoVodEnabled').checked;
   updateAutoVodSettingCopy();
@@ -1481,6 +1483,7 @@ function gatherSettingsFromForm() {
     auto_recorder_enabled:$('autoRecorderEnabled').checked,
     auto_vod_enabled:$('autoVodEnabled').checked,
     auto_youtube_enabled:$('autoYoutubeEnabled').checked,
+    auto_youtube_cleanup_delay_hours:Number($('autoYoutubeCleanupDelayHours').value || 0),
     auto_vod_poll_minutes:$('autoVodPollMinutes').value,
     youtube_enabled:$('youtubeEnabled').checked,
     youtube_auto_upload:$('youtubeAutoUpload').checked,
@@ -2571,6 +2574,21 @@ function localVideoByPath(path) {
   return localVideoCache.get(path) || null;
 }
 
+function localCleanupLabel(video) {
+  const cleanup = video.auto_youtube_cleanup;
+  if (!cleanup) return '';
+  if (cleanup.state === 'disabled') return 'Local cleanup off';
+  if (cleanup.state === 'waiting_for_upload') return 'Local cleanup waits for upload';
+  if (cleanup.state === 'keep_local') return 'Local copy kept';
+  if (cleanup.state === 'due') return 'Ready for local cleanup';
+  if (cleanup.state === 'local_copy_missing') return 'Local copy unavailable';
+  if (cleanup.state === 'scheduled' && cleanup.cleanup_due_at) {
+    const seconds = Math.max(0, (Date.parse(cleanup.cleanup_due_at) - Date.now()) / 1000);
+    return `Local cleanup in ${formatRemainingDuration(seconds).replace(' remaining', '')}`;
+  }
+  return '';
+}
+
 function renderLocalVideoCard(v) {
   const uploaded = !!v.already_uploaded;
   const hasLocalFile = v.local_file_exists !== false;
@@ -2582,15 +2600,22 @@ function renderLocalVideoCard(v) {
     : uploaded
     ? 'Uploaded to YouTube'
     : (v.prepared ? 'Metadata ready' : 'Metadata needed');
+  const cleanup = v.auto_youtube_cleanup || {};
+  const cleanupLabel = localCleanupLabel(v);
+  const cleanupAction = cleanup.can_keep_local
+    ? `<button type="button" class="video-action" data-action="keep-local" data-path="${escapeHtml(v.path)}">Keep local</button>`
+    : cleanup.can_resume_cleanup
+    ? `<button type="button" class="video-action" data-action="resume-cleanup" data-path="${escapeHtml(v.path)}">Allow automatic cleanup</button>`
+    : '';
   return `<article class="video-workspace-card ${uploaded ? 'is-uploaded' : ''} ${hasLocalFile ? '' : 'is-local-removed'}" data-video-path="${escapeHtml(v.path)}">
     ${uploadable ? `<label class="video-select"><input class="localvideocheck" type="checkbox" data-path="${escapeHtml(v.path)}" checked><span>Select</span></label>` : `<span class="video-select muted">${autoYouTubeManaged ? 'Automatic' : 'History'}</span>`}
     <div class="video-person"><strong>${escapeHtml(v.streamer || 'Unknown streamer')}</strong><span>${escapeHtml(v.date_de || 'Unknown date')}</span></div>
     <strong class="video-display-title">${escapeHtml(v.title || v.youtube_title || v.name)}</strong>
     <span class="video-size">${hasLocalFile ? `${escapeHtml(v.size_gb)} GB` : 'Size unavailable'}</span>
-    <span class="metadata-status ${uploaded || v.prepared ? 'good' : 'muted'}">${secondaryStatus}</span>
+    <span class="metadata-status ${uploaded || v.prepared ? 'good' : 'muted'}">${secondaryStatus}${cleanupLabel ? `<small class="auto-youtube-cleanup-status">${escapeHtml(cleanupLabel)}</small>` : ''}</span>
     <span class="pill ${statusClassName}">${escapeHtml(workspaceStatusLabel(v))}</span>
     <div class="video-primary-actions">${uploadable ? `<button type="button" class="primary video-action" data-action="upload" data-path="${escapeHtml(v.path)}">Upload</button>` : ''}</div>
-    ${hasLocalFile ? `<details class="technical-details secondary-actions"><summary>Actions</summary><div class="video-copy-actions"><button type="button" class="video-action" data-action="copy-title" data-path="${escapeHtml(v.path)}">Copy Title</button><button type="button" class="video-action" data-action="copy-description" data-path="${escapeHtml(v.path)}">Copy Description</button>${uploadable && !v.prepared ? `<button type="button" class="video-action" data-action="prepare" data-path="${escapeHtml(v.path)}">Prepare metadata</button>` : ''}${uploadable ? `<button type="button" class="video-action" data-action="mark" data-path="${escapeHtml(v.path)}">Mark as Uploaded</button>` : ''}</div><div class="danger-zone"><strong>Delete the local VOD file and its sidecars</strong><button type="button" class="danger-outline video-action" data-action="delete" data-path="${escapeHtml(v.path)}">Delete Permanently</button></div></details>` : '<span class="muted">Upload history retained; local actions are unavailable.</span>'}
+    ${hasLocalFile ? `<details class="technical-details secondary-actions"><summary>Actions</summary><div class="video-copy-actions"><button type="button" class="video-action" data-action="copy-title" data-path="${escapeHtml(v.path)}">Copy Title</button><button type="button" class="video-action" data-action="copy-description" data-path="${escapeHtml(v.path)}">Copy Description</button>${cleanupAction}${uploadable && !v.prepared ? `<button type="button" class="video-action" data-action="prepare" data-path="${escapeHtml(v.path)}">Prepare metadata</button>` : ''}${uploadable ? `<button type="button" class="video-action" data-action="mark" data-path="${escapeHtml(v.path)}">Mark as Uploaded</button>` : ''}</div><div class="danger-zone"><strong>Delete the local VOD file and its sidecars</strong><button type="button" class="danger-outline video-action" data-action="delete" data-path="${escapeHtml(v.path)}">Delete Permanently</button></div></details>` : '<span class="muted">Upload history retained; local actions are unavailable.</span>'}
   </article>`;
 }
 
@@ -2685,6 +2710,22 @@ ${video.name}
 The VOD will be marked as manually uploaded.`)) return;
     await api('/api/local-video/mark-uploaded', { method:'POST', body: JSON.stringify({ path }) });
     showToast('Marked as manually uploaded.');
+    await loadLocalVideos();
+    return;
+  }
+
+  if (action === 'keep-local' || action === 'resume-cleanup') {
+    const keepLocal = action === 'keep-local';
+    await api('/api/auto-youtube/cleanup/keep-local', {
+      method:'POST',
+      body: JSON.stringify({
+        streamer: video.auto_youtube_streamer,
+        twitch_vod_id: video.auto_youtube_twitch_vod_id,
+        media_path: path,
+        keep_local: keepLocal
+      })
+    });
+    showToast(keepLocal ? 'Local copy will be kept.' : 'Automatic cleanup rescheduled with a fresh delay.');
     await loadLocalVideos();
     return;
   }

@@ -147,11 +147,16 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
         auto_youtube_playlist = self.client.post(
             "/api/jobs/auto-youtube/playlist", json={"job_id": "79"}
         )
+        auto_youtube_cleanup = self.client.post(
+            "/api/auto-youtube/cleanup/keep-local",
+            json={"streamer": "nika_livetv", "twitch_vod_id": "2855270041", "media_path": "nika/source.mp4", "keep_local": True},
+        )
         self.assertEqual(recording_start.status_code, 401)
         self.assertEqual(recording_stop.status_code, 401)
         self.assertEqual(clear_history.status_code, 401)
         self.assertEqual(auto_youtube_release.status_code, 401)
         self.assertEqual(auto_youtube_playlist.status_code, 401)
+        self.assertEqual(auto_youtube_cleanup.status_code, 401)
 
     def test_successful_login_rotates_session_state_and_sets_secure_cookie_flags(self):
         response, pre_login_token = self.login()
@@ -254,11 +259,17 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
             json={"job_id": "79"},
             headers={"Origin": self.ORIGIN},
         )
+        auto_youtube_cleanup = self.client.post(
+            "/api/auto-youtube/cleanup/keep-local",
+            json={"streamer": "nika_livetv", "twitch_vod_id": "2855270041", "media_path": "nika/source.mp4", "keep_local": True},
+            headers={"Origin": self.ORIGIN},
+        )
         self.assertEqual(recording_start.status_code, 403)
         self.assertEqual(recording_stop.status_code, 403)
         self.assertEqual(clear_history.status_code, 403)
         self.assertEqual(auto_youtube_release.status_code, 403)
         self.assertEqual(auto_youtube_playlist.status_code, 403)
+        self.assertEqual(auto_youtube_cleanup.status_code, 403)
 
     def test_invalid_csrf_token_is_rejected(self):
         self.assertEqual(self.login()[0].status_code, 302)
@@ -280,10 +291,17 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
             json={"job_id": "79"},
             headers={"Origin": self.ORIGIN, "X-CSRF-Token": "invalid"},
         )
+        auto_youtube_cleanup = self.client.post(
+            "/api/auto-youtube/cleanup/keep-local",
+            json={"streamer": "nika_livetv", "twitch_vod_id": "2855270041", "media_path": "nika/source.mp4", "keep_local": True},
+            headers={"Origin": self.ORIGIN, "X-CSRF-Token": "invalid"},
+        )
         self.assertEqual(auto_youtube_release.status_code, 403)
         self.assertIn("CSRF", auto_youtube_release.get_json()["error"])
         self.assertEqual(auto_youtube_playlist.status_code, 403)
         self.assertIn("CSRF", auto_youtube_playlist.get_json()["error"])
+        self.assertEqual(auto_youtube_cleanup.status_code, 403)
+        self.assertIn("CSRF", auto_youtube_cleanup.get_json()["error"])
 
     def test_invalid_origin_is_rejected(self):
         self.assertEqual(self.login()[0].status_code, 302)
@@ -323,10 +341,20 @@ class AuthenticationAndCsrfTests(unittest.TestCase):
                 "X-CSRF-Token": csrf_token,
             },
         )
+        auto_youtube_cleanup = self.client.post(
+            "/api/auto-youtube/cleanup/keep-local",
+            json={"streamer": "nika_livetv", "twitch_vod_id": "2855270041", "media_path": "nika/source.mp4", "keep_local": True},
+            headers={
+                "Origin": "https://attacker.invalid",
+                "X-CSRF-Token": csrf_token,
+            },
+        )
         self.assertEqual(auto_youtube_release.status_code, 403)
         self.assertIn("origin", auto_youtube_release.get_json()["error"])
         self.assertEqual(auto_youtube_playlist.status_code, 403)
         self.assertIn("origin", auto_youtube_playlist.get_json()["error"])
+        self.assertEqual(auto_youtube_cleanup.status_code, 403)
+        self.assertIn("origin", auto_youtube_cleanup.get_json()["error"])
 
     def test_login_requires_pre_authentication_csrf_token(self):
         response = self.client.post(

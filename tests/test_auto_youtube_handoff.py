@@ -40,7 +40,7 @@ class AutoYouTubeHandoffTests(unittest.TestCase):
         return manager, job_id, item_id
 
     @staticmethod
-    def _settings(*, global_enabled=False, streamer_enabled=False, playlist=""):
+    def _settings(*, global_enabled=False, streamer_enabled=False, playlist="", cleanup_delay=0):
         profile = {}
         if streamer_enabled:
             profile["auto_youtube_upload"] = True
@@ -49,6 +49,7 @@ class AutoYouTubeHandoffTests(unittest.TestCase):
         return {
             "auto_youtube_enabled": global_enabled,
             "streamer_profiles": {"bearlychen": profile},
+            "auto_youtube_cleanup_delay_hours": cleanup_delay,
         }
 
     def _finish(self, manager, job_id, item_id, settings):
@@ -63,6 +64,7 @@ class AutoYouTubeHandoffTests(unittest.TestCase):
             auto_youtube_handoff_reason=decision.reason,
             auto_youtube_playlist_id=decision.playlist_id,
             auto_youtube_execution_policy=decision.execution_policy,
+            auto_youtube_cleanup_delay_hours=decision.cleanup_delay_hours,
         )
         return decision
 
@@ -136,6 +138,26 @@ class AutoYouTubeHandoffTests(unittest.TestCase):
         self._service(manager).admit_pending(job_id, item_id)
         record = self.store.get("bearlychen", VOD_ID)
         self.assertIsNone(record["playlist_id"])
+
+    def test_cleanup_delay_is_frozen_through_durable_handoff(self):
+        manager, job_id, item_id = self._completed_job()
+        decision = self._finish(
+            manager, job_id, item_id,
+            self._settings(global_enabled=True, streamer_enabled=True, cleanup_delay=6),
+        )
+        self.assertEqual(decision.cleanup_delay_hours, 6)
+        self.assertEqual(manager.get_job(job_id)["item_auto_youtube_cleanup_delay_hours"], [6])
+        changed_settings = self._settings(
+            global_enabled=True, streamer_enabled=True, cleanup_delay=0
+        )
+        self.assertEqual(
+            handoff.completion_admission(changed_settings, "bearlychen").cleanup_delay_hours,
+            0,
+        )
+        self._service(manager).admit_pending(job_id, item_id)
+        record = self.store.get("bearlychen", VOD_ID)
+        self.assertEqual(record["local_cleanup"]["policy"], "automatic")
+        self.assertEqual(record["local_cleanup"]["delay_hours"], 6)
         self.assertIsNone(record["playlist_id"])
 
     def test_historical_or_not_eligible_jobs_are_never_backfilled(self):

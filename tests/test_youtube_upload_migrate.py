@@ -8,6 +8,7 @@ import unittest
 
 from vod_dashboard.youtube_upload_migrate import (
     YouTubeUploadMigrationError, convert_v1_state, convert_v2_state,
+    convert_v3_state,
     run_migration,
 )
 from vod_dashboard.youtube_upload_state import (
@@ -56,7 +57,7 @@ class YouTubeUploadMigrationTests(unittest.TestCase):
         self.path.write_bytes(b"{bad"); before = self.path.read_bytes()
         with self.assertRaises(YouTubeUploadMigrationError): run_migration(self.root, apply=True)
         self.assertEqual(self.path.read_bytes(), before)
-        self.path.write_text(json.dumps({"version": 3, "uploads": {}}), encoding="utf-8")
+        self.path.write_text(json.dumps({"version": 4, "uploads": {}}), encoding="utf-8")
         self.assertEqual(run_migration(self.root, apply=True).action, "already_migrated")
 
     def test_v2_migration_makes_every_historical_owner_manual(self):
@@ -74,7 +75,7 @@ class YouTubeUploadMigrationTests(unittest.TestCase):
                 key: {
                     field: value
                     for field, value in record.items()
-                    if field != "execution_policy"
+                    if field not in {"execution_policy", "local_cleanup"}
                 }
                 for key, record in converted_v3["uploads"].items()
             },
@@ -98,3 +99,34 @@ class YouTubeUploadMigrationTests(unittest.TestCase):
             ],
             "confirmed",
         )
+
+    def test_v3_migration_preserves_upload_state_and_makes_cleanup_manual(self):
+        converted_v4, _ = convert_v1_state({
+            "version": 1,
+            "uploads": {"bearlychen:2855270041": self.record(
+                state="completed",
+                youtube_video_id="YT_EXISTING",
+                playlist_state="confirmed",
+            )},
+        })
+        v3 = {
+            "version": 3,
+            "uploads": {
+                key: {field: value for field, value in record.items() if field != "local_cleanup"}
+                for key, record in converted_v4["uploads"].items()
+            },
+        }
+        converted, report = convert_v3_state(v3)
+        record = converted["uploads"]["bearlychen:2855270041"]
+        self.assertEqual(report.source_schema, 3)
+        self.assertEqual(record["execution_policy"], "manual")
+        self.assertEqual(record["parts"][0]["youtube_video_id"], "YT_EXISTING")
+        self.assertEqual(record["parts"][0]["playlist_state"], "confirmed")
+        self.assertEqual(
+            {field: value for field, value in record.items() if field != "local_cleanup"},
+            v3["uploads"]["bearlychen:2855270041"],
+        )
+        self.assertEqual(record["local_cleanup"], {
+            "policy": "manual", "delay_hours": None, "keep_local": False,
+            "cleanup_due_at": None, "cleaned_at": None,
+        })

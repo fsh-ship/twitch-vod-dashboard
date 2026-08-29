@@ -24,6 +24,7 @@ from vod_dashboard import auto_recording as dashboard_auto_recording
 from vod_dashboard import auto_recording_runtime as dashboard_auto_runtime
 from vod_dashboard import auto_vod as dashboard_auto_vod
 from vod_dashboard import auto_youtube_handoff as dashboard_auto_youtube_handoff
+from vod_dashboard import auto_youtube_cleanup as dashboard_auto_youtube_cleanup
 from vod_dashboard import auto_youtube_ownership as dashboard_auto_youtube_ownership
 from vod_dashboard import auto_youtube_generate as dashboard_auto_youtube_generate
 from vod_dashboard import auto_youtube_execute as dashboard_auto_youtube_execute
@@ -1394,6 +1395,15 @@ def _auto_youtube_handoff_service(
     )
 
 
+def _auto_youtube_cleanup_service() -> dashboard_auto_youtube_cleanup.AutoYouTubeCleanupService:
+    return dashboard_auto_youtube_cleanup.AutoYouTubeCleanupService(
+        state_store=dashboard_youtube_upload_state.YouTubeUploadStateStore.from_dashboard_dir(
+            DEFAULT_DASHBOARD_DIR
+        ),
+        media_policy=dashboard_media.MediaPathPolicy(MEDIA_ROOT),
+    )
+
+
 def _auto_youtube_plan_service() -> dashboard_auto_youtube_plan.AutoYouTubePlanService:
     return dashboard_auto_youtube_plan.AutoYouTubePlanService(
         state_store=dashboard_youtube_upload_state.YouTubeUploadStateStore.from_dashboard_dir(
@@ -1895,11 +1905,25 @@ def enumerate_local_vods(
             records=ownership_records,
             media_policy=media_policy,
         )
-        return {
+        result = {
             "auto_youtube_managed": ownership.managed,
             "auto_youtube_video_confirmed": ownership.video_confirmed,
             "auto_youtube_status": ownership.status,
         }
+        record = dashboard_auto_youtube_ownership.record_for_local_media(
+            path,
+            streamer=payload.get("streamer"),
+            twitch_vod_id=payload.get("vod_id"),
+            records=ownership_records,
+            media_policy=media_policy,
+        )
+        if record is not None:
+            result["auto_youtube_cleanup"] = dashboard_auto_youtube_cleanup.cleanup_status(
+                record, media_policy=media_policy
+            )
+            result["auto_youtube_streamer"] = record["streamer"]
+            result["auto_youtube_twitch_vod_id"] = record["twitch_vod_id"]
+        return result
 
     return dashboard_local_vods.enumerate_local_vods(
         settings,
@@ -1941,6 +1965,38 @@ def api_local_videos():
     settings = load_settings()
     include_uploaded = to_bool(request.args.get("include_uploaded"), False)
     return jsonify(enumerate_local_vods(settings, include_uploaded))
+
+
+@app.post("/api/auto-youtube/cleanup/keep-local")
+def api_auto_youtube_keep_local():
+    data = request.get_json(silent=True)
+    required = {"streamer", "twitch_vod_id", "media_path", "keep_local"}
+    if not isinstance(data, dict) or set(data) != required or not isinstance(data.get("keep_local"), bool):
+        return jsonify({"error": "Exact Auto YouTube ownership details are required.", "reason": "invalid_request"}), 400
+    try:
+        record = _auto_youtube_cleanup_service().set_keep_local(
+            data.get("streamer"),
+            data.get("twitch_vod_id"),
+            media_path=data.get("media_path"),
+            keep_local=data["keep_local"],
+        )
+        status = dashboard_auto_youtube_cleanup.cleanup_status(
+            record, media_policy=dashboard_media.MediaPathPolicy(MEDIA_ROOT)
+        )
+    except dashboard_auto_youtube_cleanup.AutoYouTubeCleanupError as exc:
+        statuses = {
+            "ownership_not_found": 404,
+            "ownership_mismatch": 409,
+            "local_media_invalid": 409,
+            "keep_local_not_allowed": 409,
+            "upload_not_found": 404,
+            "cleanup_persistence_failed": 503,
+        }
+        return jsonify({
+            "error": "The local cleanup preference could not be saved safely.",
+            "reason": exc.code,
+        }), statuses.get(exc.code, 409)
+    return jsonify({"ok": True, "cleanup": status})
 
 
 def is_windows_platform() -> bool:

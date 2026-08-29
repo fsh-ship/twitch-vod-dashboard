@@ -80,6 +80,39 @@ def ownership_for_local_media(
     media_policy: MediaPathPolicy,
 ) -> AutoYouTubeOwnership:
     """Match canonical VOD ownership plus the exact ledger media path."""
+    record = record_for_local_media(
+        path,
+        streamer=streamer,
+        twitch_vod_id=twitch_vod_id,
+        records=records,
+        media_policy=media_policy,
+    )
+    if record is None:
+        return AutoYouTubeOwnership(False, False)
+    parts = record.get("parts")
+    part_confirmed = isinstance(parts, list) and any(
+        isinstance(part, Mapping)
+        and bool(str(part.get("youtube_video_id") or "").strip())
+        and str(part.get("upload_state") or "")
+        in {"video_confirmed", "completed"}
+        for part in parts
+    )
+    confirmed = (
+        str(record.get("state") or "") in CONFIRMED_BUNDLE_STATES
+        or part_confirmed
+    )
+    return AutoYouTubeOwnership(True, confirmed)
+
+
+def record_for_local_media(
+    path: Path,
+    *,
+    streamer: Any,
+    twitch_vod_id: Any,
+    records: Iterable[Mapping[str, Any]],
+    media_policy: MediaPathPolicy,
+) -> Mapping[str, Any] | None:
+    """Return the validated owner for one exact canonical local source."""
     vod_id = normalize_auto_vod_id(twitch_vod_id)
     canonical_streamer = canonical_streamer_login(streamer)
     try:
@@ -88,7 +121,7 @@ def ownership_for_local_media(
         )
         local_size = local_path.stat().st_size
     except Exception:
-        return AutoYouTubeOwnership(False, False)
+        return None
 
     for record in records:
         if str(record.get("state") or "") not in OWNED_BUNDLE_STATES:
@@ -110,20 +143,8 @@ def ownership_for_local_media(
         record_streamer = canonical_streamer_login(record.get("streamer"))
         if vod_id and canonical_streamer and record_streamer != canonical_streamer:
             continue
-        parts = record.get("parts")
-        part_confirmed = isinstance(parts, list) and any(
-            isinstance(part, Mapping)
-            and bool(str(part.get("youtube_video_id") or "").strip())
-            and str(part.get("upload_state") or "")
-            in {"video_confirmed", "completed"}
-            for part in parts
-        )
-        confirmed = (
-            str(record.get("state") or "") in CONFIRMED_BUNDLE_STATES
-            or part_confirmed
-        )
-        return AutoYouTubeOwnership(True, confirmed)
-    return AutoYouTubeOwnership(False, False)
+        return record
+    return None
 
 
 def require_manual_upload_eligible(

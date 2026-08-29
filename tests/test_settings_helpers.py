@@ -17,6 +17,7 @@ DEFAULT_SETTINGS_KEYS = {
     "auto_recorder_enabled",
     "auto_vod_enabled",
     "auto_youtube_enabled",
+    "auto_youtube_cleanup_delay_hours",
     "auto_vod_poll_minutes",
     "batch_postprocess_mode",
     "cookie_browser",
@@ -125,6 +126,7 @@ class SettingsRepositoryTests(unittest.TestCase):
             "auto_recorder_enabled": False,
             "auto_vod_enabled": False,
             "auto_youtube_enabled": False,
+            "auto_youtube_cleanup_delay_hours": 0,
             "auto_vod_poll_minutes": 60,
             "streamer_profiles": {},
             "youtube_client_secret_file": str(
@@ -149,7 +151,7 @@ class SettingsRepositoryTests(unittest.TestCase):
             "manual_upload_write_metadata_json": True,
         }
         self.assertEqual(set(settings.DEFAULT_SETTINGS), DEFAULT_SETTINGS_KEYS)
-        self.assertEqual(len(settings.DEFAULT_SETTINGS), 44)
+        self.assertEqual(len(settings.DEFAULT_SETTINGS), 45)
         self.assertEqual(settings.DEFAULT_SETTINGS, expected)
 
     def test_legacy_settings_without_automation_fields_use_defaults(self):
@@ -240,6 +242,19 @@ class SettingsRepositoryTests(unittest.TestCase):
         self.assertIs(saved["auto_youtube_enabled"], True)
         self.assertIs(loaded["auto_youtube_enabled"], True)
         self.assertIs(saved["youtube_auto_upload"], False)
+
+    def test_auto_youtube_cleanup_delay_is_strict_and_defaults_off(self):
+        self.assertEqual(settings.DEFAULT_SETTINGS["auto_youtube_cleanup_delay_hours"], 0)
+        for value, expected in (
+            (0, 0), (1, 1), (3, 3), (6, 6), (12, 12), (24, 24),
+            (48, 48), (2, 0), ("6", 0), (True, 0), (None, 0),
+        ):
+            with self.subTest(value=value):
+                normalized = self.repository.normalize({
+                    **self.defaults,
+                    "auto_youtube_cleanup_delay_hours": value,
+                })
+                self.assertEqual(normalized["auto_youtube_cleanup_delay_hours"], expected)
 
     def test_streamer_profiles_round_trip_without_touching_streamer_file(self):
         streamer_file = self.runtime_dir / "streamer.txt"

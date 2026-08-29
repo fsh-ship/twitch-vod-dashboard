@@ -353,6 +353,7 @@ const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const UPLOADED_HISTORY_PAGE_SIZE = 20;
 const localVideoCache = new Map();
 function escapeHtml(value) { return String(value || ''); }
+function formatRemainingDuration(value) { return `${Math.ceil(Number(value) / 3600)} hr remaining`; }
 eval(source.slice(start, end));
 const visible = visibleLocalVideoRows(input.videos || [], true, 20);
 process.stdout.write(JSON.stringify({
@@ -1178,6 +1179,32 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn(">Mark as Uploaded<", html)
         self.assertIn('data-action="delete"', html)
 
+    def test_completed_auto_youtube_cleanup_status_and_keep_action_are_scoped(self) -> None:
+        owned = {
+            "path": "C:/media/cptmary/owned.mp4", "name": "owned.mp4",
+            "streamer": "cptmary", "date_de": "29.08.2026", "title": "Canary",
+            "size_gb": 12.35, "prepared": False, "already_uploaded": False,
+            "local_file_exists": True, "auto_youtube_managed": True,
+            "auto_youtube_video_confirmed": True,
+            "auto_youtube_status": "Uploaded by Auto YouTube",
+            "auto_youtube_streamer": "cptmary",
+            "auto_youtube_twitch_vod_id": "2855270041",
+            "auto_youtube_cleanup": {
+                "state": "scheduled", "cleanup_due_at": "2099-08-29T18:00:00Z",
+                "can_keep_local": True, "can_resume_cleanup": False,
+            },
+        }
+        html = _evaluate_local_history_ui(owned, [owned])["card"]
+        self.assertIn("Uploaded by Auto YouTube", html)
+        self.assertIn("Local cleanup in", html)
+        self.assertIn('data-action="keep-local"', html)
+        self.assertNotIn('data-action="upload"', html)
+
+        manual = dict(owned, auto_youtube_managed=False, auto_youtube_cleanup=None)
+        manual_html = _evaluate_local_history_ui(manual, [manual])["card"]
+        self.assertNotIn("Keep local", manual_html)
+        self.assertNotIn("Local cleanup", manual_html)
+
     def test_uploaded_history_initially_limits_rendering_without_deleting_data(self) -> None:
         pending = [
             {"path": f"pending-{index}", "already_uploaded": False}
@@ -1319,6 +1346,11 @@ class V11UiContractTests(unittest.TestCase):
             "auto_youtube_enabled:$('autoYoutubeEnabled').checked",
             JAVASCRIPT,
         )
+        self.assertIn('id="autoYoutubeCleanupDelayHours"', TEMPLATE)
+        self.assertIn('<option value="0">Off</option>', TEMPLATE)
+        self.assertIn('After 6 hours (recommended)', TEMPLATE)
+        self.assertIn('This release schedules cleanup but does not delete media automatically.', TEMPLATE)
+        self.assertIn("auto_youtube_cleanup_delay_hours:Number($('autoYoutubeCleanupDelayHours').value || 0)", JAVASCRIPT)
         self.assertIn('class="streamer-auto-youtube-toggle"', JAVASCRIPT)
         self.assertIn(
             'aria-label="Enable automatic YouTube uploads for ${escapeHtml(name)}"',

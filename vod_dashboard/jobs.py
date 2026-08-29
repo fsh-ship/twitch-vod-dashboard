@@ -2402,6 +2402,7 @@ class JobManager:
         auto_youtube_handoff_reason: str = "",
         auto_youtube_playlist_id: str = "",
         auto_youtube_execution_policy: str = "manual",
+        auto_youtube_cleanup_delay_hours: int = 0,
     ) -> bool:
         """Persist exact Auto VOD media output before exposing completion."""
         with self._condition:
@@ -2429,6 +2430,8 @@ class JobManager:
                     not in AUTO_YOUTUBE_HANDOFF_REASONS
                     or auto_youtube_execution_policy
                     not in AUTO_YOUTUBE_EXECUTION_POLICIES
+                    or type(auto_youtube_cleanup_delay_hours) is not int
+                    or auto_youtube_cleanup_delay_hours not in {0, 1, 3, 6, 12, 24, 48}
                 ):
                     raise ValueError("Invalid Auto YouTube handoff state.")
             previous = {
@@ -2446,6 +2449,7 @@ class JobManager:
                     "item_auto_youtube_handoff_reasons",
                     "item_auto_youtube_playlist_ids",
                     "item_auto_youtube_execution_policies",
+                    "item_auto_youtube_cleanup_delay_hours",
                 )
             }
             job["completed_media_path"] = str(completed_media_path)
@@ -2463,6 +2467,9 @@ class JobManager:
                 ]
                 job["item_auto_youtube_execution_policies"] = [
                     auto_youtube_execution_policy
+                ]
+                job["item_auto_youtube_cleanup_delay_hours"] = [
+                    auto_youtube_cleanup_delay_hours
                 ]
             self._set_item_state_locked(job, index, "completed")
             if self._lane_active["download"] == (str(job_id), str(item_id)):
@@ -4072,12 +4079,20 @@ def run_download_job(
                                 if decision is not None
                                 else "manual"
                             )
+                            decision_cleanup_delay_hours = (
+                                getattr(decision, "cleanup_delay_hours", 0)
+                                if decision is not None
+                                else 0
+                            )
                             if isinstance(decision, dict):
                                 decision_handoff = decision.get("handoff")
                                 decision_reason = decision.get("reason", "")
                                 decision_playlist_id = decision.get("playlist_id", "")
                                 decision_execution_policy = decision.get(
                                     "execution_policy", "manual"
+                                )
+                                decision_cleanup_delay_hours = decision.get(
+                                    "cleanup_delay_hours", 0
                                 )
                             persisted = manager.finish_auto_vod_download_with_result(
                                 job_id,
@@ -4100,6 +4115,9 @@ def run_download_job(
                                 ),
                                 auto_youtube_execution_policy=str(
                                     decision_execution_policy or "manual"
+                                ),
+                                auto_youtube_cleanup_delay_hours=(
+                                    decision_cleanup_delay_hours
                                 ),
                             )
                             if not persisted:

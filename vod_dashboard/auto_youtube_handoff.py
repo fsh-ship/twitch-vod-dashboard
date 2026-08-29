@@ -18,6 +18,7 @@ class AutoYouTubeAdmission:
     reason: str
     playlist_id: str
     execution_policy: str
+    cleanup_delay_hours: int
 
 
 def completion_admission(
@@ -26,15 +27,19 @@ def completion_admission(
     """Freeze the strict opt-in decision from settings at completion time."""
     canonical_streamer = canonical_streamer_login(streamer)
     if settings.get("auto_youtube_enabled") is not True:
-        return AutoYouTubeAdmission("not_eligible", "global_disabled", "", "manual")
+        return AutoYouTubeAdmission("not_eligible", "global_disabled", "", "manual", 0)
     profile = normalize_streamer_profiles(settings.get("streamer_profiles")).get(
         canonical_streamer, {}
     )
     if profile.get("auto_youtube_upload") is not True:
-        return AutoYouTubeAdmission("not_eligible", "streamer_disabled", "", "manual")
+        return AutoYouTubeAdmission("not_eligible", "streamer_disabled", "", "manual", 0)
+    cleanup_delay = settings.get("auto_youtube_cleanup_delay_hours")
+    if type(cleanup_delay) is not int or cleanup_delay not in {1, 3, 6, 12, 24, 48}:
+        cleanup_delay = 0
     return AutoYouTubeAdmission(
         "intent_pending", "", str(profile.get("youtube_playlist_id") or "").strip(),
         "automatic",
+        cleanup_delay,
     )
 
 
@@ -112,6 +117,11 @@ class AutoYouTubeHandoffService:
             else "manual"
         )
 
+    @staticmethod
+    def _cleanup_delay_hours(job: Mapping[str, Any]) -> int:
+        values = job.get("item_auto_youtube_cleanup_delay_hours") or []
+        return values[0] if isinstance(values, list) and len(values) == 1 else 0
+
     def _block(self, job_id: str, item_id: str, reason: str) -> str:
         try:
             self._job_manager.set_auto_youtube_handoff(
@@ -143,6 +153,7 @@ class AutoYouTubeHandoffService:
                 playlist_id=self._playlist_id(job) or None,
                 plan_inputs=plan_inputs,
                 execution_policy=self._execution_policy(job),
+                cleanup_delay_hours=self._cleanup_delay_hours(job),
             )
         except YouTubeUploadStateLoadError:
             return self._block(job_id, item_id, "upload_state_unhealthy")

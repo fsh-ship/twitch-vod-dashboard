@@ -1,8 +1,8 @@
-"""Durable Auto YouTube ownership ledger (schema v3)."""
+"""Durable Auto YouTube ownership ledger (schema v4)."""
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import math
 from pathlib import Path, PurePosixPath
@@ -14,8 +14,9 @@ from vod_dashboard.runtime_files import atomic_write_text
 from vod_dashboard.settings import canonical_streamer_login
 
 YOUTUBE_UPLOAD_STATE_FILE_NAME = "youtube-upload-state.json"
-YOUTUBE_UPLOAD_STATE_VERSION = 3
-PREVIOUS_YOUTUBE_UPLOAD_STATE_VERSION = 2
+YOUTUBE_UPLOAD_STATE_VERSION = 4
+PREVIOUS_YOUTUBE_UPLOAD_STATE_VERSION = 3
+V2_YOUTUBE_UPLOAD_STATE_VERSION = 2
 LEGACY_YOUTUBE_UPLOAD_STATE_VERSION = 1
 MAX_UPLOAD_RECORDS = 100_000
 MAX_VOD_ID_LENGTH = 32
@@ -38,6 +39,8 @@ PART_UPLOAD_STATES = frozenset({"ready", "queued", "transfer_started", "video_co
 PLAYLIST_STATES = frozenset({"not_requested", "pending", "inserting", "confirmed", "failed", "uncertain"})
 SOURCE_KINDS = frozenset({"original", "generated"})
 EXECUTION_POLICIES = frozenset({"manual", "automatic"})
+CLEANUP_POLICIES = frozenset({"manual", "automatic"})
+CLEANUP_DELAY_HOURS = frozenset({1, 3, 6, 12, 24, 48})
 SPLIT_MODES = frozenset({"stream_copy"})
 PART_PLAN_VERSION = 1
 REASON_CODES = frozenset({"youtube_not_connected", "token_refresh_failed", "api_unavailable", "local_preparation_failed", "upload_outcome_uncertain", "playlist_failed", "playlist_uncertain", "plan_media_missing", "plan_source_invalid", "plan_preparation_failed", "plan_inputs_missing", "materialization_media_missing", "materialization_source_invalid", "materialization_consistency_error", "multipart_preparation_required", "parts_preparation_failed", "parts_manifest_invalid", "insufficient_storage", "storage_unavailable", "ffmpeg_unavailable", "ffmpeg_failed", "multipart_storage_insufficient", "multipart_storage_unavailable", "multipart_generation_incomplete", "multipart_validation_failed", "multipart_replan_required", "multipart_replan_exhausted", "multipart_replan_source_invalid", "multipart_replan_unsafe", "multipart_replan_failed"})
@@ -155,6 +158,7 @@ def _part(v: Any, index: int) -> Dict[str, Any]:
 
 V2_FIELDS = {"streamer", "twitch_vod_id", "source_download_job_id", "source_download_item_id", "media_path", "size_bytes", "source_duration_seconds", "state", "upload_job_id", "playlist_id", "plan_inputs", "upload_plan", "part_plan_version", "split", "parts", "reason", "created_at", "updated_at"}
 V3_FIELDS = V2_FIELDS | {"execution_policy"}
+V4_FIELDS = V3_FIELDS | {"local_cleanup"}
 V1_FIELDS = {"streamer", "twitch_vod_id", "source_download_job_id", "source_download_item_id", "media_path", "size_bytes", "state", "upload_job_id", "attempts", "youtube_video_id", "playlist_id", "playlist_state", "reason", "created_at", "updated_at"}
 def _record_v2(v: Any, key: str) -> UploadRecord:
     if not isinstance(v, Mapping) or set(v) != V2_FIELDS: raise YouTubeUploadStateLoadError("invalid_record")
@@ -180,6 +184,39 @@ def _record_v3(v: Any, key: str) -> UploadRecord:
     if policy not in EXECUTION_POLICIES: raise YouTubeUploadStateLoadError("invalid_record")
     base = _record_v2({field: v[field] for field in V2_FIELDS}, key)
     return {**base, "execution_policy": policy}
+def _local_cleanup(v: Any, *, bundle_state: str) -> Dict[str, Any]:
+    fields = {"policy", "delay_hours", "keep_local", "cleanup_due_at", "cleaned_at"}
+    if not isinstance(v, Mapping) or set(v) != fields:
+        raise YouTubeUploadStateLoadError("invalid_record")
+    policy = v.get("policy")
+    delay = v.get("delay_hours")
+    keep_local = v.get("keep_local")
+    due = v.get("cleanup_due_at")
+    cleaned = v.get("cleaned_at")
+    if policy not in CLEANUP_POLICIES or not isinstance(keep_local, bool):
+        raise YouTubeUploadStateLoadError("invalid_record")
+    if policy == "manual":
+        if delay is not None or keep_local or due is not None or cleaned is not None:
+            raise YouTubeUploadStateLoadError("invalid_record")
+    else:
+        if type(delay) is not int or delay not in CLEANUP_DELAY_HOURS:
+            raise YouTubeUploadStateLoadError("invalid_record")
+        if due is not None:
+            due = _timestamp(due)
+        if cleaned is not None:
+            cleaned = _timestamp(cleaned)
+        if bundle_state != "completed" and (keep_local or due is not None or cleaned is not None):
+            raise YouTubeUploadStateLoadError("invalid_record")
+        if keep_local and due is not None:
+            raise YouTubeUploadStateLoadError("invalid_record")
+        if bundle_state == "completed" and not keep_local and cleaned is None and due is None:
+            raise YouTubeUploadStateLoadError("invalid_record")
+    return {"policy": policy, "delay_hours": delay, "keep_local": keep_local, "cleanup_due_at": due, "cleaned_at": cleaned}
+def _record_v4(v: Any, key: str) -> UploadRecord:
+    if not isinstance(v, Mapping) or set(v) != V4_FIELDS:
+        raise YouTubeUploadStateLoadError("invalid_record")
+    base = _record_v3({field: v[field] for field in V3_FIELDS}, key)
+    return {**base, "local_cleanup": _local_cleanup(v.get("local_cleanup"), bundle_state=base["state"])}
 def _record_v1(v: Any, key: str) -> UploadRecord:
     if not isinstance(v, Mapping) or not (set(v) == V1_FIELDS or set(v) == V1_FIELDS | {"plan_inputs"} or set(v) == V1_FIELDS | {"plan_inputs", "upload_plan"}): raise YouTubeUploadStateLoadError("invalid_record")
     try:
@@ -195,18 +232,30 @@ def normalize_legacy_youtube_upload_state(v: Any) -> State:
     if not isinstance(v, Mapping) or set(v) != {"version", "uploads"} or isinstance(v.get("version"), bool) or v.get("version") != 1 or not isinstance(v.get("uploads"), Mapping) or len(v["uploads"]) > MAX_UPLOAD_RECORDS: raise YouTubeUploadStateLoadError("invalid_structure")
     return {"version": 1, "uploads": {key: _record_v1(record, key) if isinstance(key, str) else (_ for _ in ()).throw(YouTubeUploadStateLoadError("invalid_record")) for key, record in v["uploads"].items()}}
 def normalize_v2_youtube_upload_state(v: Any) -> State:
+    if not isinstance(v, Mapping) or set(v) != {"version", "uploads"} or isinstance(v.get("version"), bool) or v.get("version") != V2_YOUTUBE_UPLOAD_STATE_VERSION or not isinstance(v.get("uploads"), Mapping) or len(v["uploads"]) > MAX_UPLOAD_RECORDS: raise YouTubeUploadStateLoadError("invalid_structure")
+    return {"version": V2_YOUTUBE_UPLOAD_STATE_VERSION, "uploads": {key: _record_v2(record, key) if isinstance(key, str) else (_ for _ in ()).throw(YouTubeUploadStateLoadError("invalid_record")) for key, record in v["uploads"].items()}}
+def normalize_v3_youtube_upload_state(v: Any) -> State:
     if not isinstance(v, Mapping) or set(v) != {"version", "uploads"} or isinstance(v.get("version"), bool) or v.get("version") != PREVIOUS_YOUTUBE_UPLOAD_STATE_VERSION or not isinstance(v.get("uploads"), Mapping) or len(v["uploads"]) > MAX_UPLOAD_RECORDS: raise YouTubeUploadStateLoadError("invalid_structure")
-    return {"version": PREVIOUS_YOUTUBE_UPLOAD_STATE_VERSION, "uploads": {key: _record_v2(record, key) if isinstance(key, str) else (_ for _ in ()).throw(YouTubeUploadStateLoadError("invalid_record")) for key, record in v["uploads"].items()}}
+    return {"version": PREVIOUS_YOUTUBE_UPLOAD_STATE_VERSION, "uploads": {key: _record_v3(record, key) if isinstance(key, str) else (_ for _ in ()).throw(YouTubeUploadStateLoadError("invalid_record")) for key, record in v["uploads"].items()}}
 def normalize_youtube_upload_state(v: Any) -> State:
     if not isinstance(v, Mapping) or set(v) != {"version", "uploads"}: raise YouTubeUploadStateLoadError("invalid_structure")
-    if v.get("version") in {LEGACY_YOUTUBE_UPLOAD_STATE_VERSION, PREVIOUS_YOUTUBE_UPLOAD_STATE_VERSION}: raise YouTubeUploadStateLoadError("migration_required")
+    if v.get("version") in {LEGACY_YOUTUBE_UPLOAD_STATE_VERSION, V2_YOUTUBE_UPLOAD_STATE_VERSION, PREVIOUS_YOUTUBE_UPLOAD_STATE_VERSION}: raise YouTubeUploadStateLoadError("migration_required")
     if isinstance(v.get("version"), bool) or v.get("version") != YOUTUBE_UPLOAD_STATE_VERSION: raise YouTubeUploadStateLoadError("unsupported_version")
     if not isinstance(v.get("uploads"), Mapping) or len(v["uploads"]) > MAX_UPLOAD_RECORDS: raise YouTubeUploadStateLoadError("invalid_structure")
-    return {"version": YOUTUBE_UPLOAD_STATE_VERSION, "uploads": {key: _record_v3(record, key) if isinstance(key, str) else (_ for _ in ()).throw(YouTubeUploadStateLoadError("invalid_record")) for key, record in v["uploads"].items()}}
+    return {"version": YOUTUBE_UPLOAD_STATE_VERSION, "uploads": {key: _record_v4(record, key) if isinstance(key, str) else (_ for _ in ()).throw(YouTubeUploadStateLoadError("invalid_record")) for key, record in v["uploads"].items()}}
 def _now(clock: Clock) -> str:
     value = clock()
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None: raise YouTubeUploadStateValidationError("invalid_clock")
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+def _cleanup_due(now: str, delay_hours: int) -> str:
+    parsed = datetime.fromisoformat(now.replace("Z", "+00:00"))
+    return (parsed + timedelta(hours=delay_hours)).astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+def _schedule_completed_cleanup(record: UploadRecord, now: str) -> UploadRecord:
+    cleanup = deepcopy(record["local_cleanup"])
+    if record["state"] == "completed" and cleanup["policy"] == "automatic" and not cleanup["keep_local"] and cleanup["cleaned_at"] is None and cleanup["cleanup_due_at"] is None:
+        cleanup["cleanup_due_at"] = _cleanup_due(now, cleanup["delay_hours"])
+        record["local_cleanup"] = cleanup
+    return record
 
 class YouTubeUploadStateStore:
     def __init__(self, path: Path, *, clock: Optional[Clock] = None) -> None: self.path = Path(path); self._clock = clock or (lambda: datetime.now(timezone.utc)); self._lock = threading.RLock()
@@ -238,14 +287,15 @@ class YouTubeUploadStateStore:
         except Exception as exc: raise YouTubeUploadStatePersistenceError("Could not persist Auto YouTube ownership state.") from exc
     def replace_state(self, state: Any) -> State:
         with self._lock: self._write_locked(state); return self.load()
-    def create_intent_if_absent(self, streamer: Any, twitch_vod_id: Any, *, source_download_job_id: Any, source_download_item_id: Any, media_path: Any, size_bytes: Any, playlist_id: Any = None, plan_inputs: Any = None, execution_policy: str = "manual") -> Tuple[UploadRecord, bool]:
+    def create_intent_if_absent(self, streamer: Any, twitch_vod_id: Any, *, source_download_job_id: Any, source_download_item_id: Any, media_path: Any, size_bytes: Any, playlist_id: Any = None, plan_inputs: Any = None, execution_policy: str = "manual", cleanup_delay_hours: int = 0) -> Tuple[UploadRecord, bool]:
         streamer = _streamer(streamer); vod_id = _vod(twitch_vod_id); key = f"{streamer}:{vod_id}"
         if execution_policy not in EXECUTION_POLICIES: raise YouTubeUploadStateValidationError("invalid_execution_policy")
+        if type(cleanup_delay_hours) is not int or cleanup_delay_hours not in ({0} | CLEANUP_DELAY_HOURS): raise YouTubeUploadStateValidationError("invalid_cleanup_policy")
         with self._lock:
             doc = self._load_locked()
             if key in doc["uploads"]: return deepcopy(doc["uploads"][key]), False
             if len(doc["uploads"]) >= MAX_UPLOAD_RECORDS: raise YouTubeUploadStateValidationError("too_many_uploads")
-            now = _now(self._clock); record = {"streamer": streamer, "twitch_vod_id": vod_id, "source_download_job_id": _identifier(source_download_job_id, "invalid_source_download_job_id"), "source_download_item_id": _identifier(source_download_item_id, "invalid_source_download_item_id"), "media_path": _path(media_path), "size_bytes": _size(size_bytes), "source_duration_seconds": None, "state": "intent_pending", "upload_job_id": None, "playlist_id": _youtube_id(playlist_id, "invalid_playlist_id"), "plan_inputs": _plan_inputs(plan_inputs), "upload_plan": None, "part_plan_version": None, "split": None, "parts": [], "reason": None, "created_at": now, "updated_at": now, "execution_policy": execution_policy}
+            now = _now(self._clock); record = {"streamer": streamer, "twitch_vod_id": vod_id, "source_download_job_id": _identifier(source_download_job_id, "invalid_source_download_job_id"), "source_download_item_id": _identifier(source_download_item_id, "invalid_source_download_item_id"), "media_path": _path(media_path), "size_bytes": _size(size_bytes), "source_duration_seconds": None, "state": "intent_pending", "upload_job_id": None, "playlist_id": _youtube_id(playlist_id, "invalid_playlist_id"), "plan_inputs": _plan_inputs(plan_inputs), "upload_plan": None, "part_plan_version": None, "split": None, "parts": [], "reason": None, "created_at": now, "updated_at": now, "execution_policy": execution_policy, "local_cleanup": {"policy": "automatic" if cleanup_delay_hours else "manual", "delay_hours": cleanup_delay_hours or None, "keep_local": False, "cleanup_due_at": None, "cleaned_at": None}}
             doc["uploads"][key] = record; self._write_locked(doc); return deepcopy(record), True
     def update_record(self, streamer: Any, twitch_vod_id: Any, *, state: Optional[str] = None, upload_job_id: Any = ..., reason: Any = ...) -> UploadRecord:
         key = canonical_upload_key(streamer, twitch_vod_id)
@@ -258,7 +308,7 @@ class YouTubeUploadStateStore:
                 new["state"] = state
             if upload_job_id is not ...: new["upload_job_id"] = None if upload_job_id is None else _identifier(upload_job_id, "invalid_upload_job_id")
             if reason is not ...: new["reason"] = _reason(reason)
-            new["updated_at"] = _now(self._clock); doc["uploads"][key] = _record_v3(new, key); self._write_locked(doc); return deepcopy(doc["uploads"][key])
+            new["updated_at"] = _now(self._clock); doc["uploads"][key] = _record_v4(new, key); self._write_locked(doc); return deepcopy(doc["uploads"][key])
     def set_upload_plan(self, streamer: Any, twitch_vod_id: Any, plan: Any) -> UploadRecord:
         key = canonical_upload_key(streamer, twitch_vod_id); plan = validate_upload_plan(plan)
         with self._lock:
@@ -266,7 +316,7 @@ class YouTubeUploadStateStore:
             if old is None: raise YouTubeUploadStateValidationError("upload_not_found")
             if old["upload_plan"] is not None: return deepcopy(old)
             if old["state"] != "intent_pending": raise YouTubeUploadStateValidationError("invalid_plan_transition")
-            new = deepcopy(old); new.update({"upload_plan": plan, "state": "plan_ready", "reason": None, "updated_at": _now(self._clock)}); doc["uploads"][key] = _record_v3(new, key); self._write_locked(doc); return deepcopy(doc["uploads"][key])
+            new = deepcopy(old); new.update({"upload_plan": plan, "state": "plan_ready", "reason": None, "updated_at": _now(self._clock)}); doc["uploads"][key] = _record_v4(new, key); self._write_locked(doc); return deepcopy(doc["uploads"][key])
     def set_preparation(self, streamer: Any, twitch_vod_id: Any, *, source_duration_seconds: Any, state: str, split: Any, parts: Any, reason: Any = None) -> UploadRecord:
         """Atomically persist one finalized original or pending split plan."""
         key = canonical_upload_key(streamer, twitch_vod_id)
@@ -276,7 +326,7 @@ class YouTubeUploadStateStore:
             if old is None: raise YouTubeUploadStateValidationError("upload_not_found")
             if old["state"] not in {"plan_ready", "parts_preparing", "parts_ready", "needs_attention"}: raise YouTubeUploadStateValidationError("invalid_preparation_transition")
             new = deepcopy(old); new.update({"source_duration_seconds": source_duration_seconds, "state": state, "part_plan_version": PART_PLAN_VERSION, "split": split, "parts": parts, "reason": reason, "updated_at": _now(self._clock)})
-            normalized = _record_v3(new, key)
+            normalized = _record_v4(new, key)
             if old["state"] in {"parts_preparing", "parts_ready", "needs_attention"} and any(normalized[name] != old[name] for name in ("source_duration_seconds", "part_plan_version", "split", "parts")):
                 raise YouTubeUploadStateValidationError("preparation_immutable")
             doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
@@ -288,7 +338,7 @@ class YouTubeUploadStateStore:
             if old is None: raise YouTubeUploadStateValidationError("upload_not_found")
             if old["state"] not in {"parts_preparing", "needs_attention"} or old["split"] is None or old["parts"]: raise YouTubeUploadStateValidationError("invalid_generation_finalization")
             new = deepcopy(old); new.update({"state": "parts_ready", "parts": parts, "reason": None, "updated_at": _now(self._clock)})
-            normalized = _record_v3(new, key)
+            normalized = _record_v4(new, key)
             if not normalized["parts"] or any(part["source_kind"] != "generated" or part["upload_state"] != "ready" for part in normalized["parts"]): raise YouTubeUploadStateValidationError("invalid_generation_finalization")
             doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
     def attach_materialized_upload(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_ids: Any) -> UploadRecord:
@@ -307,7 +357,7 @@ class YouTubeUploadStateStore:
             if any(part["upload_state"] != "ready" or part["upload_item_id"] is not None or part["attempts"] != 0 or part["youtube_video_id"] is not None for part in old["parts"]): raise YouTubeUploadStateValidationError("invalid_materialization_link")
             parts = [dict(part, upload_item_id=item_id, upload_state="queued") for part, item_id in zip(old["parts"], item_ids)]
             new = deepcopy(old); new.update({"state": "upload_queued", "upload_job_id": job_id, "parts": parts, "reason": None, "updated_at": _now(self._clock)})
-            normalized = _record_v3(new, key)
+            normalized = _record_v4(new, key)
             doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
     def begin_part_transfer(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_id: Any, part_index: Any) -> UploadRecord:
         """Persist the uncertainty boundary before the first resumable send."""
@@ -326,7 +376,7 @@ class YouTubeUploadStateStore:
             if any(part["upload_state"] != "queued" or part["youtube_video_id"] is not None for part in parts[part_index:]): raise YouTubeUploadStateValidationError("invalid_transfer_order")
             current.update({"upload_state": "transfer_started", "attempts": current["attempts"] + 1, "reason": None})
             new = deepcopy(old); new.update({"parts": parts, "reason": None, "updated_at": _now(self._clock)})
-            normalized = _record_v3(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+            normalized = _record_v4(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
     def confirm_part_video(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_id: Any, part_index: Any, youtube_video_id: Any) -> UploadRecord:
         """Persist the confirmed remote ID before JobStore completion."""
         key = canonical_upload_key(streamer, twitch_vod_id)
@@ -346,8 +396,10 @@ class YouTubeUploadStateStore:
             bundle_state = old["state"]
             if all_confirmed:
                 bundle_state = "playlist_pending" if old.get("playlist_id") else "completed"
-            new = deepcopy(old); new.update({"state": bundle_state, "parts": parts, "reason": None, "updated_at": _now(self._clock)})
-            normalized = _record_v3(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+            now = _now(self._clock)
+            new = deepcopy(old); new.update({"state": bundle_state, "parts": parts, "reason": None, "updated_at": now})
+            new = _schedule_completed_cleanup(new, now)
+            normalized = _record_v4(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
 
     def begin_part_playlist_insertion(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_id: Any, part_index: Any) -> UploadRecord:
         """Persist the playlist-insert uncertainty boundary before mutation."""
@@ -366,7 +418,7 @@ class YouTubeUploadStateStore:
             if any(part["playlist_state"] != "pending" for part in parts[part_index:]): raise YouTubeUploadStateValidationError("invalid_playlist_order")
             current.update({"playlist_state": "inserting", "reason": None})
             new = deepcopy(old); new.update({"parts": parts, "reason": None, "updated_at": _now(self._clock)})
-            normalized = _record_v3(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+            normalized = _record_v4(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
 
     def confirm_part_playlist_membership(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_id: Any, part_index: Any) -> UploadRecord:
         """Durably record exact playlist membership without changing video state."""
@@ -388,8 +440,29 @@ class YouTubeUploadStateStore:
                 and part["playlist_state"] == "confirmed"
                 for part in parts
             )
-            new = deepcopy(old); new.update({"state": "completed" if all_confirmed else "playlist_pending", "parts": parts, "reason": None, "updated_at": _now(self._clock)})
-            normalized = _record_v3(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+            now = _now(self._clock)
+            new = deepcopy(old); new.update({"state": "completed" if all_confirmed else "playlist_pending", "parts": parts, "reason": None, "updated_at": now})
+            new = _schedule_completed_cleanup(new, now)
+            normalized = _record_v4(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+
+    def set_keep_local(self, streamer: Any, twitch_vod_id: Any, *, keep_local: bool) -> UploadRecord:
+        """Durably opt one completed owner out of cleanup, or grant a fresh delay."""
+        if not isinstance(keep_local, bool):
+            raise YouTubeUploadStateValidationError("invalid_keep_local")
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        with self._lock:
+            doc = self._load_locked(); old = doc["uploads"].get(key)
+            if old is None: raise YouTubeUploadStateValidationError("upload_not_found")
+            cleanup = deepcopy(old["local_cleanup"])
+            if old["state"] != "completed" or cleanup["policy"] != "automatic" or cleanup["cleaned_at"] is not None:
+                raise YouTubeUploadStateValidationError("keep_local_not_allowed")
+            if cleanup["keep_local"] == keep_local:
+                return deepcopy(old)
+            now = _now(self._clock)
+            cleanup["keep_local"] = keep_local
+            cleanup["cleanup_due_at"] = None if keep_local else _cleanup_due(now, cleanup["delay_hours"])
+            new = deepcopy(old); new.update({"local_cleanup": cleanup, "updated_at": now})
+            normalized = _record_v4(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
 
     def mark_part_playlist_attention(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_id: Any, part_index: Any, reason: Any) -> UploadRecord:
         """Fail closed after an ambiguous playlist insertion outcome."""
@@ -407,7 +480,7 @@ class YouTubeUploadStateStore:
             if current["upload_item_id"] != item_id or current["playlist_state"] != "inserting": raise YouTubeUploadStateValidationError("invalid_playlist_attention")
             current.update({"playlist_state": "uncertain", "reason": safe_reason})
             new = deepcopy(old); new.update({"state": "needs_attention", "parts": parts, "reason": safe_reason, "updated_at": _now(self._clock)})
-            normalized = _record_v3(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+            normalized = _record_v4(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
 
     def mark_part_attention(self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any, upload_item_id: Any, part_index: Any, reason: Any, uncertain: bool) -> UploadRecord:
         """Atomically block a bundle after a known or uncertain part failure."""
@@ -426,7 +499,7 @@ class YouTubeUploadStateStore:
             if current["upload_item_id"] != item_id or current["upload_state"] != expected_state or current["youtube_video_id"] is not None: raise YouTubeUploadStateValidationError("invalid_part_attention")
             current.update({"upload_state": "uncertain" if uncertain else "failed_known", "reason": safe_reason})
             new = deepcopy(old); new.update({"state": "needs_attention", "parts": parts, "reason": safe_reason, "updated_at": _now(self._clock)})
-            normalized = _record_v3(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+            normalized = _record_v4(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
     def replace_split_for_replan(self, streamer: Any, twitch_vod_id: Any, *, expected_generation_id: Any, split: Any) -> UploadRecord:
         """Atomically replace exactly one proven-invalid multipart generation plan."""
         key = canonical_upload_key(streamer, twitch_vod_id)
@@ -440,5 +513,5 @@ class YouTubeUploadStateStore:
             if old["state"] != "needs_attention" or old["reason"] != "multipart_replan_required" or old["upload_job_id"] is not None or old["parts"] or not isinstance(current, Mapping) or current.get("generation_id") != expected: raise YouTubeUploadStateValidationError("invalid_replan_transition")
             if replacement["generation_id"] == current["generation_id"] or replacement["mode"] != current["mode"] or replacement["target_duration_seconds"] != current["target_duration_seconds"] or replacement["target_size_bytes"] != current["target_size_bytes"] or replacement["replan_count"] != current["replan_count"] + 1 or len(replacement["split_points_seconds"]) != len(current["split_points_seconds"]) + 1: raise YouTubeUploadStateValidationError("invalid_replan_transition")
             new = deepcopy(old); new.update({"state": "parts_preparing", "split": replacement, "parts": [], "reason": None, "updated_at": _now(self._clock)})
-            normalized = _record_v3(new, key)
+            normalized = _record_v4(new, key)
             doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)

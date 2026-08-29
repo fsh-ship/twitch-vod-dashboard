@@ -912,6 +912,7 @@ main { width:100%; max-width:1320px; }
 .video-select { min-width:0; }
 .video-person { display:grid; gap:3px; min-width:0; }
 .video-person span, .video-size, .metadata-status { color:var(--muted); font-size:12px; }
+.auto-youtube-cleanup-status { display:block; margin-top:3px; color:var(--muted); font-size:11px; line-height:1.25; }
 .video-display-title { min-width:0; line-height:1.35; overflow-wrap:anywhere; }
 .video-primary-actions { margin:0; flex-wrap:nowrap; }
 .video-primary-actions .primary { flex:0 1 auto; }

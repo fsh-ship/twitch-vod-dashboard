@@ -62,6 +62,7 @@ DEFAULT_SETTINGS_KEYS = {
     "auto_recorder_enabled",
     "auto_vod_enabled",
     "auto_youtube_enabled",
+    "auto_youtube_cleanup_delay_hours",
     "auto_vod_poll_minutes",
     "batch_postprocess_mode",
     "cookie_browser",
@@ -275,6 +276,11 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
                 "/api/jobs/auto-youtube/playlist",
                 "POST",
                 "api_add_auto_youtube_playlist",
+            ),
+            (
+                "/api/auto-youtube/cleanup/keep-local",
+                "POST",
+                "api_auto_youtube_keep_local",
             ),
             (
                 "/api/jobs/clear-completed",
@@ -1230,6 +1236,7 @@ class SettingsContractTests(IsolatedDashboardTestCase):
         self.assertFalse(defaults["auto_recorder_enabled"])
         self.assertFalse(defaults["auto_vod_enabled"])
         self.assertFalse(defaults["auto_youtube_enabled"])
+        self.assertEqual(defaults["auto_youtube_cleanup_delay_hours"], 0)
         self.assertEqual(defaults["auto_vod_poll_minutes"], 60)
         self.assertTrue(defaults["move_uploaded_vods"])
         self.assertEqual(defaults["youtube_privacy_status"], "private")
