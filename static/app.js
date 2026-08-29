@@ -2168,6 +2168,9 @@ function queueTechnicalDetailsHtml(item, itemId, detailId, detailOpen, error) {
     if (item.job.origin) values.push(['Origin', item.job.origin]);
     if (item.job.attempt) values.push(['Attempt', item.job.attempt]);
   }
+  if (item.index === 0 && item.job?.auto_youtube_cleanup?.reason) {
+    values.push(['Local cleanup reason', item.job.auto_youtube_cleanup.reason]);
+  }
   const historicalProgress = Number(item.historicalProgress);
   if (item.historicalProgress !== null && item.historicalProgress !== '' && Number.isFinite(historicalProgress)) {
     values.push(['Last recorded progress', `${Math.max(0, Math.min(100, historicalProgress)).toFixed(1).replace(/\.0$/, '')}%`]);
@@ -2208,6 +2211,19 @@ function renderQueueVodItem(item, compact=false) {
     && bundleStates.every(state => state === 'queued')
     && !bundleFailureKinds.some(kind => kind === 'uncertain');
   const playlistStatus = item.job?.auto_youtube_playlist || {};
+  const cleanupStatus = item.job?.auto_youtube_cleanup || {};
+  const cleanupLabels = {
+    scheduled: 'Local cleanup scheduled',
+    due: 'Local cleanup due',
+    keep_local: 'Local copy kept',
+    cleaning: 'Removing local copy',
+    removed: 'Local copy removed',
+    needs_attention: 'Local cleanup needs attention',
+    local_copy_missing: 'Local copy unavailable',
+  };
+  const cleanupNote = item.index === 0 && cleanupLabels[cleanupStatus.state]
+    ? `<div class="queue-item-note auto-youtube-cleanup-status">${escapeHtml(cleanupLabels[cleanupStatus.state])}</div>`
+    : '';
   const canAddAutoYoutubePlaylist = item.index === 0
     && item.job?.type === 'youtube_upload'
     && item.job?.origin === 'auto_youtube'
@@ -2235,12 +2251,12 @@ function renderQueueVodItem(item, compact=false) {
       <div class="queue-row-title">${escapeHtml(item.title || item.job.label)}</div>
       ${item.distinguishingLabel ? `<div class="queue-row-disambiguator muted">${escapeHtml(item.distinguishingLabel)}</div>` : ''}
       <span class="pill ${pillClass}">${escapeHtml(status)}</span>
-      ${support}${reviewRequired}${retryRelationship}${actions}${details}
+      ${support}${cleanupNote}${reviewRequired}${retryRelationship}${actions}${details}
     </article>`;
   }
   return `<article class="queue-vod-item ${attention} ${presentation.reviewRequired ? 'is-uncertain' : ''}">
     <div class="queue-vod-main"><div class="queue-vod-copy">${identity ? `<div class="queue-vod-identity">${escapeHtml(identity)}</div>` : ''}<strong>${escapeHtml(item.title || item.job.label)}</strong></div><span class="pill ${pillClass}">${escapeHtml(status)}</span></div>
-    ${support}${error}${reviewRequired}${retryRelationship}${progress}${progressDetails}${actions}${details}
+    ${support}${error}${cleanupNote}${reviewRequired}${retryRelationship}${progress}${progressDetails}${actions}${details}
   </article>`;
 }
 
@@ -2581,6 +2597,9 @@ function localCleanupLabel(video) {
   if (cleanup.state === 'waiting_for_upload') return 'Local cleanup waits for upload';
   if (cleanup.state === 'keep_local') return 'Local copy kept';
   if (cleanup.state === 'due') return 'Ready for local cleanup';
+  if (cleanup.state === 'cleaning') return 'Removing local copy';
+  if (cleanup.state === 'removed') return 'Local copy removed';
+  if (cleanup.state === 'needs_attention') return 'Local cleanup needs attention';
   if (cleanup.state === 'local_copy_missing') return 'Local copy unavailable';
   if (cleanup.state === 'scheduled' && cleanup.cleanup_due_at) {
     const seconds = Math.max(0, (Date.parse(cleanup.cleanup_due_at) - Date.now()) / 1000);

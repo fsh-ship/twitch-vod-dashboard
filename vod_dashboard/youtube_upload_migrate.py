@@ -1,4 +1,4 @@
-"""Offline-only migration of Auto YouTube ownership state v1/v2/v3 to v4."""
+"""Offline-only migration of Auto YouTube ownership state v1-v4 to v5."""
 from __future__ import annotations
 
 import argparse
@@ -14,6 +14,7 @@ from vod_dashboard.runtime_files import atomic_write_text
 from vod_dashboard.youtube_upload_state import (
     LEGACY_YOUTUBE_UPLOAD_STATE_VERSION,
     PREVIOUS_YOUTUBE_UPLOAD_STATE_VERSION,
+    V3_YOUTUBE_UPLOAD_STATE_VERSION,
     V2_YOUTUBE_UPLOAD_STATE_VERSION,
     PART_PLAN_VERSION,
     YOUTUBE_UPLOAD_STATE_FILE_NAME,
@@ -22,6 +23,7 @@ from vod_dashboard.youtube_upload_state import (
     normalize_legacy_youtube_upload_state,
     normalize_v2_youtube_upload_state,
     normalize_v3_youtube_upload_state,
+    normalize_v4_youtube_upload_state,
     normalize_youtube_upload_state,
 )
 
@@ -193,6 +195,13 @@ def _manual_cleanup() -> Dict[str, Any]:
         "keep_local": False,
         "cleanup_due_at": None,
         "cleaned_at": None,
+        "state": "pending",
+        "started_at": None,
+        "canonical_files": [],
+        "generated_files": [],
+        "canonical_status": "pending",
+        "artifacts_status": "pending",
+        "reason": None,
     }
 
 
@@ -213,7 +222,7 @@ def convert_v3_state(value: Mapping[str, Any]) -> tuple[Dict[str, Any], Migratio
         raise YouTubeUploadMigrationError("conversion_invalid") from exc
     return converted, MigrationReport(
         action="ready",
-        source_schema=PREVIOUS_YOUTUBE_UPLOAD_STATE_VERSION,
+        source_schema=V3_YOUTUBE_UPLOAD_STATE_VERSION,
         records_scanned=len(uploads),
         records_migrated=len(uploads),
         confirmed_video_ids_preserved=sum(
@@ -223,6 +232,40 @@ def convert_v3_state(value: Mapping[str, Any]) -> tuple[Dict[str, Any], Migratio
         upload_jobs_preserved=sum(
             1 for record in uploads.values() if record["upload_job_id"] is not None
         ),
+    )
+
+
+def convert_v4_state(value: Mapping[str, Any]) -> tuple[Dict[str, Any], MigrationReport]:
+    """Add crash-safe execution fields without changing P8j1 policy or schedule."""
+    try:
+        previous = normalize_v4_youtube_upload_state(value)
+    except YouTubeUploadStateLoadError as exc:
+        raise YouTubeUploadMigrationError("state_invalid") from exc
+    uploads: Dict[str, Any] = {}
+    for key, record in previous["uploads"].items():
+        old = record["local_cleanup"]
+        already_cleaned = old["cleaned_at"] is not None
+        execution = {
+            **old,
+            "state": "completed" if already_cleaned else "pending",
+            "started_at": old["cleaned_at"] if already_cleaned else None,
+            "canonical_files": [],
+            "generated_files": [],
+            "canonical_status": "accounted" if already_cleaned else "pending",
+            "artifacts_status": "not_applicable" if already_cleaned else "pending",
+            "reason": None,
+        }
+        uploads[key] = {**record, "local_cleanup": execution}
+    converted = {"version": YOUTUBE_UPLOAD_STATE_VERSION, "uploads": uploads}
+    try:
+        converted = normalize_youtube_upload_state(converted)
+    except YouTubeUploadStateLoadError as exc:
+        raise YouTubeUploadMigrationError("conversion_invalid") from exc
+    return converted, MigrationReport(
+        action="ready", source_schema=PREVIOUS_YOUTUBE_UPLOAD_STATE_VERSION,
+        records_scanned=len(uploads), records_migrated=len(uploads),
+        confirmed_video_ids_preserved=sum(1 for record in uploads.values() if any(part.get("youtube_video_id") for part in record["parts"])),
+        upload_jobs_preserved=sum(1 for record in uploads.values() if record["upload_job_id"] is not None),
     )
 
 
@@ -243,6 +286,9 @@ def plan_migration(dashboard_dir: Path) -> MigrationPlan:
             records_scanned=len(state["uploads"]), records_migrated=0,
         ))
     if version == PREVIOUS_YOUTUBE_UPLOAD_STATE_VERSION:
+        converted, report = convert_v4_state(value)
+        return MigrationPlan(root, path, source, converted, report)
+    if version == V3_YOUTUBE_UPLOAD_STATE_VERSION:
         converted, report = convert_v3_state(value)
         return MigrationPlan(root, path, source, converted, report)
     if version == V2_YOUTUBE_UPLOAD_STATE_VERSION:

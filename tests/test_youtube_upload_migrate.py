@@ -8,7 +8,7 @@ import unittest
 
 from vod_dashboard.youtube_upload_migrate import (
     YouTubeUploadMigrationError, convert_v1_state, convert_v2_state,
-    convert_v3_state,
+    convert_v3_state, convert_v4_state,
     run_migration,
 )
 from vod_dashboard.youtube_upload_state import (
@@ -57,7 +57,7 @@ class YouTubeUploadMigrationTests(unittest.TestCase):
         self.path.write_bytes(b"{bad"); before = self.path.read_bytes()
         with self.assertRaises(YouTubeUploadMigrationError): run_migration(self.root, apply=True)
         self.assertEqual(self.path.read_bytes(), before)
-        self.path.write_text(json.dumps({"version": 4, "uploads": {}}), encoding="utf-8")
+        self.path.write_text(json.dumps({"version": 5, "uploads": {}}), encoding="utf-8")
         self.assertEqual(run_migration(self.root, apply=True).action, "already_migrated")
 
     def test_v2_migration_makes_every_historical_owner_manual(self):
@@ -126,7 +126,33 @@ class YouTubeUploadMigrationTests(unittest.TestCase):
             {field: value for field, value in record.items() if field != "local_cleanup"},
             v3["uploads"]["bearlychen:2855270041"],
         )
-        self.assertEqual(record["local_cleanup"], {
-            "policy": "manual", "delay_hours": None, "keep_local": False,
-            "cleanup_due_at": None, "cleaned_at": None,
+        self.assertEqual(record["local_cleanup"]["policy"], "manual")
+        self.assertEqual(record["local_cleanup"]["state"], "pending")
+        self.assertEqual(record["local_cleanup"]["canonical_files"], [])
+
+    def test_v4_migration_preserves_automatic_cleanup_schedule_exactly(self):
+        current, _ = convert_v1_state({
+            "version": 1, "uploads": {"bearlychen:2855270041": self.record(
+                state="completed", youtube_video_id="YT_EXISTING",
+                playlist_state="confirmed",
+            )},
         })
+        record = current["uploads"]["bearlychen:2855270041"]
+        old_cleanup = {
+            "policy": "automatic", "delay_hours": 6, "keep_local": False,
+            "cleanup_due_at": "2026-08-27T12:00:00Z", "cleaned_at": None,
+        }
+        v4 = {"version": 4, "uploads": {
+            "bearlychen:2855270041": {**record, "local_cleanup": old_cleanup}
+        }}
+        converted, report = convert_v4_state(v4)
+        cleanup = converted["uploads"]["bearlychen:2855270041"]["local_cleanup"]
+        self.assertEqual(report.source_schema, 4)
+        self.assertEqual(
+            converted["uploads"]["bearlychen:2855270041"]["execution_policy"],
+            record["execution_policy"],
+        )
+        self.assertEqual(
+            {key: cleanup[key] for key in old_cleanup}, old_cleanup
+        )
+        self.assertEqual(cleanup["state"], "pending")

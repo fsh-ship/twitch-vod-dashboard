@@ -1205,6 +1205,41 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn("Keep local", manual_html)
         self.assertNotIn("Local cleanup", manual_html)
 
+    def test_auto_youtube_queue_cleanup_states_remain_visible_after_media_removal(self) -> None:
+        expected = {
+            "scheduled": "Local cleanup scheduled",
+            "cleaning": "Removing local copy",
+            "removed": "Local copy removed",
+            "needs_attention": "Local cleanup needs attention",
+        }
+        for state, label in expected.items():
+            with self.subTest(state=state):
+                item = {
+                    "index": 0, "itemId": "upload-1-item-1",
+                    "state": "completed", "streamer": "cptmary",
+                    "date": "29.08.2026", "title": "Uploaded VOD",
+                    "operation": "YouTube upload", "capabilities": {},
+                    "resolved": False, "error": "", "progress": 100,
+                    "extra": "", "completionReason": "completed",
+                    "recoveryReason": "", "failureKind": "",
+                    "job": {
+                        "id": "upload-1", "type": "youtube_upload",
+                        "origin": "auto_youtube", "label": "Auto YouTube",
+                        "state": "completed", "item_states": ["completed"],
+                        "auto_youtube_cleanup": {
+                            "state": state,
+                            "reason": "filesystem_error" if state == "needs_attention" else None,
+                        },
+                    },
+                }
+                html = _render_queue_item_with_saved_open_state(item)
+                self.assertIn(label, html)
+                self.assertNotIn("Keep local", html)
+                self.assertNotIn("Start upload", html)
+                if state == "needs_attention":
+                    self.assertIn("Local cleanup reason", html)
+                    self.assertIn("filesystem_error", html)
+
     def test_uploaded_history_initially_limits_rendering_without_deleting_data(self) -> None:
         pending = [
             {"path": f"pending-{index}", "already_uploaded": False}

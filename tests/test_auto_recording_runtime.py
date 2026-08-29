@@ -388,7 +388,7 @@ class LiveStatusLimiterTests(unittest.TestCase):
         )
         auto_vod_monitor = dashboard.create_auto_vod_monitor()
         self.assertIs(
-            auto_vod_monitor._coordinator._live_status_checker,
+            auto_vod_monitor._coordinator._primary._live_status_checker,
             dashboard.run_ytdlp_live_status,
         )
 

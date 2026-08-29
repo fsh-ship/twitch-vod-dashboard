@@ -14,7 +14,7 @@ import webbrowser
 from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 
@@ -866,6 +866,12 @@ def create_auto_vod_monitor() -> dashboard_auto_vod_runtime.AutoVodMonitor:
         ),
         live_status_checker=run_ytdlp_live_status,
     )
+    coordinator = dashboard_auto_youtube_cleanup.AutoYouTubeCleanupPeriodicCoordinator(
+        coordinator,
+        _auto_youtube_cleanup_service(
+            JOB_MANAGER, should_stop=stop_event.is_set
+        ),
+    )
     return dashboard_auto_vod_runtime.AutoVodMonitor(
         coordinator, settings_provider=load_settings, stop_event=stop_event, log=log_line
     )
@@ -954,6 +960,10 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             "released": 0, "recovered": 0, "already_started": 0,
             "pending": 0, "ignored": 0,
         }
+        auto_youtube_cleanup = {
+            "cleaned": 0, "resumed": 0, "attention": 0,
+            "pending": 0, "ignored": 0, "errors": 0,
+        }
         try:
             auto_youtube_handoff = _auto_youtube_handoff_service(
                 manager
@@ -1012,6 +1022,14 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             app.logger.error(
                 "Auto YouTube automatic release failed (automatic_release_reconciliation_failed)."
             )
+        try:
+            auto_youtube_cleanup = _auto_youtube_cleanup_service(
+                manager
+            ).reconcile()
+        except Exception:
+            app.logger.error(
+                "Auto YouTube local cleanup failed (cleanup_reconciliation_failed)."
+            )
 
         monitor_started = False
         auto_vod_monitor_started = False
@@ -1069,6 +1087,7 @@ def initialize_worker_runtime(*, worker_count: int = 1) -> Dict[str, Any]:
             "auto_youtube_materialization": auto_youtube_materialization,
             "auto_youtube_execution": auto_youtube_execution,
             "auto_youtube_automatic_release": auto_youtube_automatic_release,
+            "auto_youtube_cleanup": auto_youtube_cleanup,
         }
         app.logger.info(
             "Worker runtime initialized: loaded=%d discarded=%d "
@@ -1395,12 +1414,35 @@ def _auto_youtube_handoff_service(
     )
 
 
-def _auto_youtube_cleanup_service() -> dashboard_auto_youtube_cleanup.AutoYouTubeCleanupService:
+def _active_auto_youtube_cleanup_paths(
+    manager: dashboard_jobs.JobManager,
+) -> set[str]:
+    """Return exact paths currently consumed by known local-media workers."""
+    paths = set(manager.unfinished_upload_paths())
+    for job in manager.snapshot_jobs():
+        if job.get("state") not in {"running", "cancelling"}:
+            continue
+        output_path = job.get("output_path")
+        if isinstance(output_path, str) and output_path.strip():
+            paths.add(output_path)
+    return paths
+
+
+def _auto_youtube_cleanup_service(
+    manager: Optional[dashboard_jobs.JobManager] = None,
+    *,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> dashboard_auto_youtube_cleanup.AutoYouTubeCleanupService:
+    current_manager = manager or _job_manager_for_compatibility()
     return dashboard_auto_youtube_cleanup.AutoYouTubeCleanupService(
         state_store=dashboard_youtube_upload_state.YouTubeUploadStateStore.from_dashboard_dir(
             DEFAULT_DASHBOARD_DIR
         ),
         media_policy=dashboard_media.MediaPathPolicy(MEDIA_ROOT),
+        active_paths_provider=lambda: _active_auto_youtube_cleanup_paths(
+            current_manager
+        ),
+        should_stop=should_stop,
     )
 
 
@@ -2684,6 +2726,16 @@ def api_jobs():
                     job["auto_youtube_playlist"] = status
         except Exception:
             app.logger.warning("Auto YouTube playlist status was unavailable.")
+        try:
+            cleanup_statuses = _auto_youtube_cleanup_service(
+                manager
+            ).status_for_jobs(jobs_snapshot)
+            for job in jobs_snapshot:
+                status = cleanup_statuses.get(str(job.get("id") or ""))
+                if status is not None:
+                    job["auto_youtube_cleanup"] = status
+        except Exception:
+            app.logger.warning("Auto YouTube local cleanup status was unavailable.")
     persistence = manager.persistence_status()
     return jsonify({
         "jobs": jobs_snapshot,

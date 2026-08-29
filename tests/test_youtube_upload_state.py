@@ -27,7 +27,7 @@ class YouTubeUploadStateStoreTests(unittest.TestCase):
         return self.store.create_intent_if_absent(**values)
 
     def record(self, **changes):
-        value = {"streamer": "bearlychen", "twitch_vod_id": "2855270041", "source_download_job_id": "38", "source_download_item_id": "38-item-1", "media_path": "bearlychen/video.mp4", "size_bytes": 12, "source_duration_seconds": None, "state": "intent_pending", "upload_job_id": None, "playlist_id": None, "plan_inputs": None, "upload_plan": None, "part_plan_version": None, "split": None, "parts": [], "reason": None, "created_at": "2026-08-26T12:00:00Z", "updated_at": "2026-08-26T12:00:00Z", "execution_policy": "manual", "local_cleanup": {"policy": "manual", "delay_hours": None, "keep_local": False, "cleanup_due_at": None, "cleaned_at": None}}
+        value = {"streamer": "bearlychen", "twitch_vod_id": "2855270041", "source_download_job_id": "38", "source_download_item_id": "38-item-1", "media_path": "bearlychen/video.mp4", "size_bytes": 12, "source_duration_seconds": None, "state": "intent_pending", "upload_job_id": None, "playlist_id": None, "plan_inputs": None, "upload_plan": None, "part_plan_version": None, "split": None, "parts": [], "reason": None, "created_at": "2026-08-26T12:00:00Z", "updated_at": "2026-08-26T12:00:00Z", "execution_policy": "manual", "local_cleanup": {"policy": "manual", "delay_hours": None, "keep_local": False, "cleanup_due_at": None, "cleaned_at": None, "state": "pending", "started_at": None, "canonical_files": [], "generated_files": [], "canonical_status": "pending", "artifacts_status": "pending", "reason": None}}
         value.update(changes)
         return value
 
@@ -41,7 +41,7 @@ class YouTubeUploadStateStoreTests(unittest.TestCase):
         self.assertEqual(self.store.health(), {"healthy": True, "reason": None})
 
     def test_prior_schemas_require_explicit_offline_migration(self):
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4):
             with self.subTest(version=version):
                 self.path.write_text(json.dumps({"version": version, "uploads": {}}), encoding="utf-8")
                 with self.assertRaisesRegex(state.YouTubeUploadStateLoadError, "migration_required"):
@@ -49,18 +49,18 @@ class YouTubeUploadStateStoreTests(unittest.TestCase):
                 self.assertEqual(self.store.health(), {"healthy": False, "reason": "migration_required"})
 
     def test_corrupt_and_unsupported_fail_closed(self):
-        for raw, reason in ((b"{bad", "invalid_json"), (json.dumps({"version": 5, "uploads": {}}).encode(), "unsupported_version")):
+        for raw, reason in ((b"{bad", "invalid_json"), (json.dumps({"version": 6, "uploads": {}}).encode(), "unsupported_version")):
             with self.subTest(reason=reason):
                 self.path.write_bytes(raw)
                 self.assertEqual(self.store.health(), {"healthy": False, "reason": reason})
 
-    def test_create_uses_v4_record_with_explicit_execution_and_cleanup_policy(self):
+    def test_create_uses_v5_record_with_explicit_execution_and_cleanup_policy(self):
         record, created = self.create(execution_policy="automatic")
         self.assertTrue(created); self.assertEqual(record["parts"], [])
         self.assertIsNone(record["source_duration_seconds"])
         self.assertEqual(record["execution_policy"], "automatic")
         self.assertEqual(record["local_cleanup"]["policy"], "manual")
-        self.assertEqual(self.store.load()["version"], 4)
+        self.assertEqual(self.store.load()["version"], 5)
         self.assertNotIn(str(self.root), self.path.read_text(encoding="utf-8"))
 
     def test_execution_policy_is_strict_and_immutable(self):
