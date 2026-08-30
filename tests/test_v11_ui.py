@@ -43,63 +43,10 @@ const profiles = {
   orphan_streamer: {youtube_playlist_id:'ORPHAN'}
 };
 const clonedProfiles = cloneStreamerProfiles(profiles);
-const setOverride = withStreamerPlaylistSelection(
-  profiles, 'DigitalGirlUli', 'PLAYLIST_B'
-);
-const removedOverride = withStreamerPlaylistSelection(
-  profiles, '@DigitalGirlUli', ''
-);
-const autoEnabled = withStreamerAutoRecordSelection(
-  withStreamerPlaylistSelection({}, 'DigitalGirlUli', 'PLAYLIST_A'),
-  'DigitalGirlUli', true
-);
-const playlistChangedAfterAuto = withStreamerPlaylistSelection(
-  autoEnabled, 'DigitalGirlUli', 'PLAYLIST_B'
-);
-const autoRemovedAfterPlaylist = withStreamerAutoRecordSelection(
-  playlistChangedAfterAuto, 'DigitalGirlUli', false
-);
-const autoEnabledAfterVod = withStreamerAutoRecordSelection(
-  {digitalgirluli:{youtube_playlist_id:'PLAYLIST_A', auto_vod_download:true}},
-  'DigitalGirlUli', true
-);
-const autoRemovedAfterVod = withStreamerAutoRecordSelection(
-  autoEnabledAfterVod, 'DigitalGirlUli', false
-);
-const emptyProfileRemoved = withStreamerAutoRecordSelection(
-  {auto_only:{auto_record:true}}, 'auto_only', false
-);
-const autoYoutubeEnabled = withStreamerAutoYoutubeSelection(
-  {digitalgirluli:{youtube_playlist_id:'PLAYLIST_A', auto_vod_download:true}},
-  'DigitalGirlUli', true
-);
-const autoYoutubeRemoved = withStreamerAutoYoutubeSelection(
-  autoYoutubeEnabled, 'DigitalGirlUli', false
-);
-const emptyAutoYoutubeProfileRemoved = withStreamerAutoYoutubeSelection(
-  {auto_youtube_only:{auto_youtube_upload:true}}, 'auto_youtube_only', false
-);
 process.stdout.write(JSON.stringify({
   clonedProfiles,
-  configured: streamerProfilePlaylistId(profiles, 'DigitalGirlUli'),
-  inherited: streamerProfilePlaylistId(profiles, 'NoOverride'),
-  autoConfigured: streamerProfileAutoRecordEnabled(profiles, 'DigitalGirlUli'),
-  autoMissing: streamerProfileAutoRecordEnabled(profiles, 'NoOverride'),
-  autoYoutubeConfigured: streamerProfileAutoYoutubeEnabled(profiles, 'DigitalGirlUli'),
-  autoYoutubeMissing: streamerProfileAutoYoutubeEnabled(profiles, 'NoOverride'),
-  configuredOptions: playlistOptionsHtml('PLAYLIST_A', 'Global Default'),
-  inheritedOptions: playlistOptionsHtml('', 'Global Default'),
-  setOverride,
-  removedOverride,
-  autoEnabled,
-  playlistChangedAfterAuto,
-  autoRemovedAfterPlaylist,
-  autoEnabledAfterVod,
-  autoRemovedAfterVod,
-  emptyProfileRemoved,
-  autoYoutubeEnabled,
-  autoYoutubeRemoved,
-  emptyAutoYoutubeProfileRemoved,
+  configuredOptions: playlistOptionsHtml('PLAYLIST_A', 'No playlist'),
+  emptyOptions: playlistOptionsHtml('', 'No playlist'),
   defaultSingle: buildYoutubeUploadRequest(['one.mp4'], 'streamer-default'),
   defaultMultiple: buildYoutubeUploadRequest(
     ['one.mp4', 'two.mp4'], 'streamer-default'
@@ -114,6 +61,50 @@ process.stdout.write(JSON.stringify({
   explicitMultiple: buildYoutubeUploadRequest(
     ['one.mp4', 'two.mp4'], 'playlist', 'PLAYLIST_A'
   )
+}));
+"""
+    completed = subprocess.run(
+        [NODE, "-e", runner],
+        cwd=ROOT,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
+def _evaluate_streamer_workspace_filters() -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for streamer filter tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function canonicalStreamerLoginClient');
+const end = source.indexOf('function setStreamerEditorNames', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Streamer filter helpers not found');
+eval(source.slice(start, end));
+const names = ['Manual', 'AutoDownload', 'AutoYoutube', 'LiveBravo', 'ReviewCase'];
+const product = {streamer_policies:{
+  manual:{vod_handling:'manual', live_recording:'manual', validation:{state:'valid'}},
+  autodownload:{vod_handling:'auto_download', live_recording:'manual', validation:{state:'valid'}},
+  autoyoutube:{vod_handling:'download_and_youtube', live_recording:'manual', validation:{state:'valid'}},
+  livebravo:{vod_handling:'manual', live_recording:'automatic', validation:{state:'valid'}},
+  reviewcase:{vod_handling:'needs_review', live_recording:'manual', validation:{state:'needs_review'}}
+}};
+const before = JSON.stringify({names, product});
+const listed = (query, filter) => streamerWorkspaceEntries(names, product, query, filter).map(entry => entry.name);
+process.stdout.write(JSON.stringify({
+  all:listed('', 'all'),
+  automated:listed('', 'automated'),
+  live:listed('', 'live-recording'),
+  review:listed('', 'needs-review'),
+  caseInsensitive:listed('aUtO', 'all'),
+  combined:listed('youtube', 'automated'),
+  none:listed('missing', 'all'),
+  after:JSON.stringify({names, product}),
+  before
 }));
 """
     completed = subprocess.run(
@@ -1202,11 +1193,124 @@ class V11UiContractTests(unittest.TestCase):
     def test_settings_sections_replace_old_primary_pages(self) -> None:
         self.assertEqual(
             re.findall(r'data-settings-tab="([^"]+)"', TEMPLATE),
-            ["general", "streamers", "youtube", "advanced"],
+            ["general", "automation", "streamers", "youtube", "advanced"],
         )
         self.assertNotIn('id="page-youtube"', TEMPLATE)
         self.assertNotIn('id="page-localuploads"', TEMPLATE)
         self.assertNotIn('id="page-streamers"', TEMPLATE)
+
+    def test_settings_tabs_have_complete_accessible_panel_relationships(self) -> None:
+        for name in ("General", "Automation", "Streamers", "Youtube", "Advanced"):
+            self.assertRegex(
+                TEMPLATE,
+                rf'id="settingsTab{name}"[^>]*role="tab"[^>]*aria-controls="settingsPanel{name}"',
+            )
+            self.assertRegex(
+                TEMPLATE,
+                rf'id="settingsPanel{name}"[^>]*role="tabpanel"[^>]*aria-labelledby="settingsTab{name}"',
+            )
+        tab_switcher = JAVASCRIPT.split("function showSettingsTab", 1)[1].split("function updateAutoRecorderSettingCopy", 1)[0]
+        self.assertIn("panel.hidden = !active", tab_switcher)
+        self.assertIn("tab.setAttribute('aria-selected'", tab_switcher)
+        self.assertIn("tab.setAttribute('tabindex', active ? '0' : '-1')", tab_switcher)
+        self.assertIn("['ArrowLeft', 'ArrowRight', 'Home', 'End']", JAVASCRIPT)
+        self.assertIn(".settings-panel[hidden] { display:none !important; }", STYLESHEET)
+
+    def test_automation_workspace_maps_only_global_controls_to_legacy_fields(self) -> None:
+        automation = TEMPLATE.split('data-settings-panel="automation"', 1)[1].split('data-settings-panel="streamers"', 1)[0]
+        for heading in (
+            "VOD Monitoring",
+            "Automatic YouTube Processing",
+            "Automatic Live Recording",
+            "Automated Upload Retention",
+        ):
+            self.assertIn(heading, automation)
+        for control in (
+            "autoVodEnabled",
+            "autoVodPollMinutes",
+            "autoYoutubeEnabled",
+            "autoRecorderEnabled",
+            "autoYoutubeCleanupDelayHours",
+        ):
+            self.assertIn(f'id="{control}"', automation)
+        saver = JAVASCRIPT.split("async function saveAutomationSettings", 1)[1].split("function parseProgress", 1)[0]
+        for field in (
+            "auto_vod_enabled",
+            "auto_vod_poll_minutes",
+            "auto_youtube_enabled",
+            "auto_recorder_enabled",
+            "auto_youtube_cleanup_delay_hours",
+        ):
+            self.assertIn(field, saver)
+        self.assertNotIn("streamer_profiles", saver)
+        self.assertIn("Streamer policies were not changed.", saver)
+
+    def test_streamer_workspace_is_canonical_compact_and_mobile_safe(self) -> None:
+        renderer = JAVASCRIPT.split("function renderStreamerEditor", 1)[1].split("async function saveStreamerPolicy", 1)[0]
+        self.assertIn("streamerWorkspaceEntries(", renderer)
+        self.assertIn("streamer-policy-summary", renderer)
+        self.assertIn("validationLabel", renderer)
+        self.assertIn("expandedStreamerLogin === login", renderer)
+        self.assertIn("streamerPolicyEditorDirty", renderer)
+        self.assertIn("data-streamer-action=\"up\"", renderer)
+        self.assertIn("data-streamer-action=\"down\"", renderer)
+        self.assertIn("data-streamer-action=\"remove\"", renderer)
+        self.assertIn("aria-expanded", renderer)
+        self.assertIn("@media (max-width:430px)", STYLESHEET)
+        self.assertIn(".streamer-policy-editor select { min-height:44px; }", STYLESHEET)
+        self.assertIn(".streamer-policy-summary { grid-column:1 / -1; grid-template-columns:repeat(3,minmax(0,1fr));", STYLESHEET)
+
+    def test_streamer_discovery_search_and_canonical_policy_filters(self) -> None:
+        result = _evaluate_streamer_workspace_filters()
+
+        self.assertEqual(
+            result["all"],
+            ["Manual", "AutoDownload", "AutoYoutube", "LiveBravo", "ReviewCase"],
+        )
+        self.assertEqual(result["automated"], ["AutoDownload", "AutoYoutube"])
+        self.assertEqual(result["live"], ["LiveBravo"])
+        self.assertEqual(result["review"], ["ReviewCase"])
+        self.assertEqual(result["caseInsensitive"], ["AutoDownload", "AutoYoutube"])
+        self.assertEqual(result["combined"], ["AutoYoutube"])
+        self.assertEqual(result["none"], [])
+        self.assertEqual(result["before"], result["after"])
+
+    def test_streamer_discovery_controls_preserve_order_and_editor_state(self) -> None:
+        self.assertIn('id="streamerListSearch"', TEMPLATE)
+        self.assertIn('aria-label="Filter streamers"', TEMPLATE)
+        for filter_name in ("all", "automated", "live-recording", "needs-review"):
+            self.assertIn(f'data-streamer-filter="{filter_name}"', TEMPLATE)
+        renderer = JAVASCRIPT.split("function renderStreamerEditor", 1)[1].split("async function saveStreamerPolicy", 1)[0]
+        self.assertIn("streamerWorkspaceEntries(", renderer)
+        self.assertIn("No streamers match these filters.", renderer)
+        self.assertIn("data-streamer-index=\"${index}\"", renderer)
+        self.assertIn("const current = streamerEditorNames();", renderer)
+        self.assertIn("captureExpandedStreamerPolicyDraft();", JAVASCRIPT)
+        self.assertIn("streamerPolicyEditorDraft", JAVASCRIPT)
+        self.assertIn("streamerPolicyEditorDraft.delete(login)", JAVASCRIPT)
+        self.assertIn("streamerListSearchQuery", JAVASCRIPT)
+        self.assertIn("streamerListFilter", JAVASCRIPT)
+
+    def test_streamer_discovery_has_compact_mobile_hooks(self) -> None:
+        self.assertIn(".streamer-discovery-controls", STYLESHEET)
+        self.assertIn(".streamer-filter-chips", STYLESHEET)
+        self.assertIn("overflow-x:auto", STYLESHEET)
+        self.assertIn(".streamer-discovery-controls { grid-template-columns:1fr;", STYLESHEET)
+        self.assertIn("event.key !== 'Escape'", JAVASCRIPT)
+
+    def test_manual_download_workflow_keeps_both_legacy_gates_separate(self) -> None:
+        general = TEMPLATE.split('data-settings-panel="general"', 1)[1].split('data-settings-panel="automation"', 1)[0]
+        self.assertIn("Manual Download Workflow", general)
+        self.assertIn("After a manually started download", general)
+        self.assertIn('id="youtubeEnabled"', general)
+        self.assertIn('id="youtubeAutoUpload"', general)
+        self.assertNotIn("Enable YouTube Uploads", TEMPLATE)
+        synchronizer = JAVASCRIPT.split("function syncManualDownloadWorkflowMode", 1)[1].split("function applyManualDownloadWorkflowChoice", 1)[0]
+        self.assertIn("manual_download_workflow", synchronizer)
+        self.assertIn("blocked_by_legacy_youtube_gate", synchronizer)
+        updater = JAVASCRIPT.split("function applyManualDownloadWorkflowChoice", 1)[1].split("function updateStreamerListSaveState", 1)[0]
+        self.assertIn("youtubeEnabled", updater)
+        self.assertIn("youtubeAutoUpload", updater)
 
     def test_normal_ui_has_no_desktop_file_manager_actions(self) -> None:
         for label in (
@@ -1846,10 +1950,11 @@ process.stdout.write(JSON.stringify({empty, ready}));
 
     def test_prepare_metadata_is_secondary_under_actions(self) -> None:
         self.assertNotIn('id="prepareSelectedLocalVideos"', TEMPLATE)
-        self.assertNotIn("More actions", JAVASCRIPT)
-        self.assertIn("<summary>Actions</summary>", JAVASCRIPT)
-        self.assertIn(">Prepare metadata</button>", JAVASCRIPT)
-        self.assertNotIn(">Prepare</button>", JAVASCRIPT)
+        local_card = JAVASCRIPT.split("function renderLocalVideoCard", 1)[1].split("function visibleLocalVideoRows", 1)[0]
+        self.assertNotIn("More actions", local_card)
+        self.assertIn("<summary>Actions</summary>", local_card)
+        self.assertIn(">Prepare metadata</button>", local_card)
+        self.assertNotIn(">Prepare</button>", local_card)
 
     def test_missing_local_archive_rows_have_no_local_actions(self) -> None:
         self.assertIn("Upload history retained; local actions are unavailable.", JAVASCRIPT)
@@ -2016,14 +2121,8 @@ process.stdout.write(JSON.stringify({empty, ready}));
     def test_streamer_playlist_ui_represents_sets_and_removes_overrides(self) -> None:
         result = _evaluate_playlist_ui()
 
-        self.assertEqual(result["configured"], "PLAYLIST_A")
-        self.assertEqual(result["inherited"], "")
-        self.assertTrue(result["autoConfigured"])
-        self.assertFalse(result["autoMissing"])
-        self.assertTrue(result["autoYoutubeConfigured"])
-        self.assertFalse(result["autoYoutubeMissing"])
         self.assertIn('value="PLAYLIST_A" selected', result["configuredOptions"])
-        self.assertIn(">Global Default</option>", result["inheritedOptions"])
+        self.assertIn(">No playlist</option>", result["emptyOptions"])
         self.assertEqual(
             result["clonedProfiles"]["digitalgirluli"],
             {
@@ -2047,37 +2146,16 @@ process.stdout.write(JSON.stringify({empty, ready}));
             result["clonedProfiles"]["auto_youtube_only"],
             {"auto_youtube_upload": True},
         )
-        self.assertEqual(
-            result["setOverride"]["digitalgirluli"],
-            {
-                "youtube_playlist_id": "PLAYLIST_B",
-                "auto_record": True,
-                "auto_vod_download": True,
-                "auto_youtube_upload": True,
-            },
-        )
-        self.assertEqual(
-            result["setOverride"]["orphan_streamer"],
-            {"youtube_playlist_id": "ORPHAN"},
-        )
-        self.assertEqual(
-            result["removedOverride"]["digitalgirluli"],
-            {
-                "auto_record": True,
-                "auto_vod_download": True,
-                "auto_youtube_upload": True,
-            },
-        )
-        self.assertEqual(
-            result["removedOverride"]["orphan_streamer"],
-            {"youtube_playlist_id": "ORPHAN"},
-        )
+        self.assertIn("streamerWorkspaceEntries(", JAVASCRIPT)
+        self.assertIn("'/api/streamers/policy'", JAVASCRIPT)
+        self.assertNotIn("withStreamerAutoVodSelection", JAVASCRIPT)
+        self.assertNotIn("withStreamerAutoYoutubeSelection", JAVASCRIPT)
 
     def test_auto_recorder_controls_are_visible_compact_and_accessible(self) -> None:
         self.assertIn('id="autoRecorderEnabled"', TEMPLATE)
         self.assertNotIn('id="autoRecorderEnabled" checked', TEMPLATE)
         self.assertIn('role="switch"', TEMPLATE)
-        self.assertIn('aria-label="Enable Auto Recorder"', TEMPLATE)
+        self.assertIn('aria-label="Run Automatic Live Recording"', TEMPLATE)
         self.assertIn(
             "$('autoRecorderEnabled').checked = state.settings.auto_recorder_enabled === true",
             JAVASCRIPT,
@@ -2086,25 +2164,18 @@ process.stdout.write(JSON.stringify({empty, ready}));
             "auto_recorder_enabled:$('autoRecorderEnabled').checked",
             JAVASCRIPT,
         )
-        self.assertIn("Paused · streamer selections are preserved.", TEMPLATE)
-        self.assertIn('class="streamer-auto-record-toggle"', JAVASCRIPT)
-        self.assertIn(
-            'aria-label="Enable automatic recording for ${escapeHtml(name)}"',
-            JAVASCRIPT,
-        )
+        self.assertIn("Paused · streamer policies are preserved.", TEMPLATE)
+        self.assertIn('class="streamer-live-recording-select"', JAVASCRIPT)
+        self.assertIn('<option value="manual" ${editorValues.live_recording', JAVASCRIPT)
+        self.assertIn('<option value="automatic" ${editorValues.live_recording', JAVASCRIPT)
         self.assertIn("min-height:44px", STYLESHEET)
         self.assertIn("input:focus-visible + .switch-track", STYLESHEET)
 
     def test_auto_youtube_settings_are_visible_but_not_an_active_workflow(self) -> None:
         self.assertIn('id="autoYoutubeEnabled"', TEMPLATE)
         self.assertNotIn('id="autoYoutubeEnabled" checked', TEMPLATE)
-        self.assertIn(
-            "New eligible Auto VODs can be prepared and uploaded automatically.",
-            TEMPLATE,
-        )
-        self.assertIn(
-            "Existing deferred uploads still require manual start.", TEMPLATE
-        )
+        self.assertIn("Automatic YouTube Processing", TEMPLATE)
+        self.assertIn("Paused · Download + YouTube streamer policies are preserved.", JAVASCRIPT)
         self.assertIn(
             "$('autoYoutubeEnabled').checked = state.settings.auto_youtube_enabled === true",
             JAVASCRIPT,
@@ -2114,62 +2185,33 @@ process.stdout.write(JSON.stringify({empty, ready}));
             JAVASCRIPT,
         )
         self.assertIn('id="autoYoutubeCleanupDelayHours"', TEMPLATE)
-        self.assertIn('<option value="0">Off</option>', TEMPLATE)
-        self.assertIn('After 6 hours (recommended)', TEMPLATE)
-        self.assertIn('This release schedules cleanup but does not delete media automatically.', TEMPLATE)
+        self.assertIn('<option value="0">Keep local copies</option>', TEMPLATE)
+        self.assertIn('Remove after 6 hours', TEMPLATE)
+        self.assertIn('Global default for new VODs entering the automatic YouTube lifecycle.', TEMPLATE)
         self.assertIn("auto_youtube_cleanup_delay_hours:Number($('autoYoutubeCleanupDelayHours').value || 0)", JAVASCRIPT)
-        self.assertIn('class="streamer-auto-youtube-toggle"', JAVASCRIPT)
-        self.assertIn(
-            'aria-label="Enable automatic YouTube uploads for ${escapeHtml(name)}"',
-            JAVASCRIPT,
-        )
+        self.assertIn('class="streamer-vod-handling-select"', JAVASCRIPT)
+        self.assertIn('<option value="download_and_youtube" ${editorMode', JAVASCRIPT)
         self.assertNotIn('data-page="auto-youtube"', TEMPLATE)
         self.assertIn(".streamer-editor-row", STYLESHEET)
-        self.assertIn("grid-template-columns:34px minmax(0,1fr)", STYLESHEET)
+        self.assertIn(".streamer-policy-fields", STYLESHEET)
 
     def test_streamer_auto_record_and_playlist_round_trip_independently(self) -> None:
-        result = _evaluate_playlist_ui()
-        self.assertEqual(
-            result["autoEnabled"]["digitalgirluli"],
-            {"youtube_playlist_id": "PLAYLIST_A", "auto_record": True},
-        )
-        self.assertEqual(
-            result["playlistChangedAfterAuto"]["digitalgirluli"],
-            {"youtube_playlist_id": "PLAYLIST_B", "auto_record": True},
-        )
-        self.assertEqual(
-            result["autoRemovedAfterPlaylist"]["digitalgirluli"],
-            {"youtube_playlist_id": "PLAYLIST_B"},
-        )
-        self.assertEqual(result["emptyProfileRemoved"], {})
-        self.assertEqual(
-            result["autoEnabledAfterVod"]["digitalgirluli"],
-            {
-                "youtube_playlist_id": "PLAYLIST_A",
-                "auto_record": True,
-                "auto_vod_download": True,
-            },
-        )
-        self.assertEqual(
-            result["autoRemovedAfterVod"]["digitalgirluli"],
-            {"youtube_playlist_id": "PLAYLIST_A", "auto_vod_download": True},
-        )
+        saver = JAVASCRIPT.split("async function saveStreamerPolicy", 1)[1].split("function updateStreamerEditorButtons", 1)[0]
+        self.assertIn("live_recording", saver)
+        self.assertIn("youtube_playlist_id", saver)
+        self.assertIn("vod_handling", saver)
+        self.assertIn("No playlist", JAVASCRIPT)
+        self.assertIn("Optional. Blank means no playlist for automatic uploads.", JAVASCRIPT)
 
     def test_streamer_auto_youtube_and_playlist_round_trip_independently(self) -> None:
-        result = _evaluate_playlist_ui()
-        self.assertEqual(
-            result["autoYoutubeEnabled"]["digitalgirluli"],
-            {
-                "youtube_playlist_id": "PLAYLIST_A",
-                "auto_vod_download": True,
-                "auto_youtube_upload": True,
-            },
-        )
-        self.assertEqual(
-            result["autoYoutubeRemoved"]["digitalgirluli"],
-            {"youtube_playlist_id": "PLAYLIST_A", "auto_vod_download": True},
-        )
-        self.assertEqual(result["emptyAutoYoutubeProfileRemoved"], {})
+        renderer = JAVASCRIPT.split("function renderStreamerEditor", 1)[1].split("async function saveStreamerPolicy", 1)[0]
+        self.assertIn("vod_handling", renderer)
+        self.assertIn("manual", renderer)
+        self.assertIn("auto_download", renderer)
+        self.assertIn("download_and_youtube", renderer)
+        self.assertIn("Needs Review", renderer)
+        self.assertNotIn("auto_vod_download", renderer)
+        self.assertNotIn("auto_youtube_upload", renderer)
 
     def test_playlist_refresh_failure_preserves_streamer_profile_draft(self) -> None:
         loader = JAVASCRIPT.split(
@@ -2188,13 +2230,13 @@ process.stdout.write(JSON.stringify({empty, ready}));
         self.assertNotIn("streamer-playlist-select", connection_status)
 
     def test_settings_finishing_labels_and_youtube_disconnected_copy(self) -> None:
-        general = TEMPLATE.split('data-settings-panel="general"', 1)[1].split('data-settings-panel="streamers"', 1)[0]
+        general = TEMPLATE.split('data-settings-panel="general"', 1)[1].split('data-settings-panel="automation"', 1)[0]
         advanced = TEMPLATE.split('data-settings-panel="advanced"', 1)[1]
         self.assertNotIn("Concurrent Fragments", general)
         self.assertIn("Concurrent Fragments", advanced)
         self.assertNotIn("After a Batch", TEMPLATE)
         self.assertIn("When to Prepare or Upload", TEMPLATE)
-        self.assertIn("Archive Local VOD After Successful Upload", TEMPLATE)
+        self.assertIn("Archive the local VOD bundle after a successful dashboard upload", TEMPLATE)
         self.assertIn("YouTube is not connected. Connect your account to enable uploads.", JAVASCRIPT)
         self.assertNotIn("YouTubeNotConnectedError", TEMPLATE + JAVASCRIPT)
         self.assertIn("refreshButton.disabled = !data.connected", JAVASCRIPT)

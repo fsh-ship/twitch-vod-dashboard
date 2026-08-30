@@ -12,8 +12,9 @@ Important compatibility facts encoded here:
 * An Auto YouTube playlist is optional.  A configured but unavailable playlist
   can be reported as an unavailable dependency when a caller has verified that
   condition.
-* Automatic cleanup delay ``0`` means no automatic cleanup; it is distinct
-  from the legacy ``move_uploaded_vods`` archive behavior.
+* Automatic cleanup delay ``0`` means no global automatic-cleanup default. Its
+  product label describes the desired outcome but is distinct from both a
+  durable item's ``keep_local`` override and legacy ``move_uploaded_vods``.
 * ``youtube_auto_upload`` belongs to the manual-download workflow and is not a
   VOD Handling mode.
 """
@@ -83,10 +84,15 @@ class StreamerAutomationPolicy:
 
 @dataclass(frozen=True)
 class RetentionPolicy:
-    """Default Auto YouTube retention, separate from legacy archiving."""
+    """Desired default outcome for new automatic-upload intents.
+
+    ``automatic_cleanup_configured`` describes the global admission default;
+    it is deliberately not the durable per-item ``keep_local`` override.
+    """
 
     mode: str
     delay_hours: Optional[int]
+    automatic_cleanup_configured: bool
     validation: PolicyValidation
 
 
@@ -225,7 +231,10 @@ def derive_retention(delay_hours: Any) -> RetentionPolicy:
     """Translate the global default automatic-cleanup delay exactly."""
     if type(delay_hours) is int and delay_hours == 0:
         return RetentionPolicy(
-            RETENTION_KEEP_LOCAL, None, PolicyValidation(VALID)
+            RETENTION_KEEP_LOCAL,
+            None,
+            False,
+            PolicyValidation(VALID),
         )
     if (
         type(delay_hours) is int
@@ -234,11 +243,13 @@ def derive_retention(delay_hours: Any) -> RetentionPolicy:
         return RetentionPolicy(
             RETENTION_CLEANUP_AFTER_DELAY,
             delay_hours,
+            True,
             PolicyValidation(VALID),
         )
     return RetentionPolicy(
         NEEDS_REVIEW,
         None,
+        False,
         PolicyValidation(NEEDS_REVIEW, ("unsupported_retention_delay",)),
     )
 
@@ -300,3 +311,68 @@ def summarize_vod_handling(
         mode = vod_handling_from_profile(profiles.get(streamer)).mode
         counts[mode] += 1
     return counts
+
+
+def streamer_automation_payload(
+    profile: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Return a JSON-safe canonical view for one streamer settings row."""
+    policy = validate_streamer_automation(profile)
+    return {
+        "vod_handling": policy.vod_handling.mode,
+        "live_recording": policy.live_recording,
+        "youtube_playlist_id": policy.playlist_id,
+        "validation": {
+            "state": policy.validation.state,
+            "issues": list(policy.validation.issues),
+        },
+    }
+
+
+def automation_product_payload(
+    settings: Mapping[str, Any], configured_streamers: Iterable[Any]
+) -> Dict[str, Any]:
+    """Build the additive product view without changing persisted settings."""
+    configured = list(configured_streamers)
+    profiles = normalize_streamer_profiles(settings.get("streamer_profiles"))
+    streamer_policies: Dict[str, Dict[str, Any]] = {}
+    seen = set()
+    for raw_streamer in configured:
+        streamer = canonical_streamer_login(raw_streamer)
+        if not streamer or streamer in seen:
+            continue
+        seen.add(streamer)
+        streamer_policies[streamer] = streamer_automation_payload(
+            profiles.get(streamer)
+        )
+
+    retention = derive_retention(
+        settings.get("auto_youtube_cleanup_delay_hours")
+    )
+    manual_workflow = derive_manual_download_workflow(
+        settings.get("youtube_enabled"),
+        settings.get("youtube_auto_upload"),
+    )
+    return {
+        "streamer_policies": streamer_policies,
+        "summary": summarize_vod_handling(configured, profiles),
+        "automated_upload_retention": {
+            "mode": retention.mode,
+            "delay_hours": retention.delay_hours,
+            "automatic_cleanup_configured": (
+                retention.automatic_cleanup_configured
+            ),
+            "validation": {
+                "state": retention.validation.state,
+                "issues": list(retention.validation.issues),
+            },
+        },
+        "manual_download_workflow": {
+            "requested": manual_workflow.requested,
+            "legacy_youtube_gate_enabled": (
+                manual_workflow.legacy_youtube_gate_enabled
+            ),
+            "enabled": manual_workflow.enabled,
+            "status": manual_workflow.status,
+        },
+    }

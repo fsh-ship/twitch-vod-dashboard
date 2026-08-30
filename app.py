@@ -22,6 +22,7 @@ from vod_dashboard import dashboard_state
 from vod_dashboard import auto_recorder as dashboard_auto_recorder
 from vod_dashboard import auto_recording as dashboard_auto_recording
 from vod_dashboard import auto_recording_runtime as dashboard_auto_runtime
+from vod_dashboard import automation_policy as dashboard_automation_policy
 from vod_dashboard import auto_vod as dashboard_auto_vod
 from vod_dashboard import auto_youtube_handoff as dashboard_auto_youtube_handoff
 from vod_dashboard import auto_youtube_cleanup as dashboard_auto_youtube_cleanup
@@ -2270,12 +2271,13 @@ def state():
     settings = load_settings()
     ids = archive_ids(settings)
     resolved_streamer_file = streamer_file(settings)
-    return jsonify(dashboard_state.application_state_payload(
+    configured_streamers = read_streamers_from_path(resolved_streamer_file)
+    payload = dashboard_state.application_state_payload(
         settings,
         str(SETTINGS_FILE),
         str(LOCAL_SETTINGS_FILE),
         SETTINGS_FILE.exists(),
-        read_streamers_from_path(resolved_streamer_file),
+        configured_streamers,
         len(ids),
         download_path_exists=download_path(settings).exists(),
         streamer_file_exists=resolved_streamer_file.exists(),
@@ -2284,7 +2286,13 @@ def state():
         archive_file_exists=archive_file(settings).exists(),
         archive_file_resolved=str(archive_file(settings)),
         archive_file_forced=FIXED_ARCHIVE_FILE,
-    ))
+    )
+    payload["automation_product"] = (
+        dashboard_automation_policy.automation_product_payload(
+            settings, configured_streamers
+        )
+    )
+    return jsonify(payload)
 
 
 @app.get("/api/settings/status")
@@ -2465,6 +2473,87 @@ def api_streamers():
             "streamer_profiles", {}
         )
     return jsonify(payload)
+
+
+@app.post("/api/streamers/policy")
+def api_streamer_policy():
+    """Apply one explicit product-policy decision to existing profile fields."""
+    data = request.json or {}
+    if not isinstance(data, Mapping):
+        return jsonify({"error": "Invalid streamer policy payload."}), 400
+
+    login = dashboard_settings.canonical_streamer_login(data.get("streamer"))
+    settings = load_settings()
+    configured_streamers = read_streamers(settings)
+    configured_logins = {
+        dashboard_settings.canonical_streamer_login(streamer)
+        for streamer in configured_streamers
+    }
+    if not login or login not in configured_logins:
+        return jsonify({"error": "Configured streamer was not found."}), 404
+
+    vod_handling = str(data.get("vod_handling") or "")
+    live_recording = str(data.get("live_recording") or "")
+    playlist_value = data.get("youtube_playlist_id")
+    if playlist_value is not None and not isinstance(playlist_value, str):
+        return jsonify({"error": "YouTube playlist must be text."}), 400
+
+    profiles = dashboard_settings.normalize_streamer_profiles(
+        settings.get("streamer_profiles")
+    )
+    profile = dict(profiles.get(login) or {})
+    try:
+        profile = dashboard_automation_policy.apply_vod_handling(
+            profile, vod_handling
+        )
+        profile = dashboard_automation_policy.apply_live_recording(
+            profile, live_recording
+        )
+    except ValueError:
+        return jsonify({"error": "Choose a valid streamer policy."}), 400
+
+    playlist_id = str(playlist_value or "").strip()
+    if playlist_id:
+        profile["youtube_playlist_id"] = playlist_id
+    else:
+        profile.pop("youtube_playlist_id", None)
+
+    before_watched = _configured_auto_record_streamers(
+        settings, configured_streamers
+    )
+    before_auto_vod = _configured_auto_vod_streamers(
+        settings, configured_streamers
+    )
+    if profile:
+        profiles[login] = profile
+    else:
+        profiles.pop(login, None)
+    saved = save_settings({"streamer_profiles": profiles})
+    after_watched = _configured_auto_record_streamers(
+        saved, configured_streamers
+    )
+    after_auto_vod = _configured_auto_vod_streamers(
+        saved, configured_streamers
+    )
+    if before_watched != after_watched:
+        _wake_auto_recorder_after_save("streamer policy save")
+    if before_auto_vod != after_auto_vod:
+        _wake_auto_vod_after_save("streamer policy save")
+
+    product = dashboard_automation_policy.automation_product_payload(
+        saved, configured_streamers
+    )
+    return jsonify(
+        {
+            "streamer": login,
+            "streamer_profile": saved.get("streamer_profiles", {}).get(
+                login, {}
+            ),
+            "streamer_profiles": saved.get("streamer_profiles", {}),
+            "policy": product["streamer_policies"][login],
+            "automation_product": product,
+        }
+    )
 
 
 

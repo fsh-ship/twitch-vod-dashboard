@@ -240,6 +240,7 @@ class AutomationPolicyCompatibilityTests(unittest.TestCase):
         keep = automation_policy.derive_retention(0)
         self.assertEqual(keep.mode, automation_policy.RETENTION_KEEP_LOCAL)
         self.assertIsNone(keep.delay_hours)
+        self.assertFalse(keep.automatic_cleanup_configured)
         self.assertEqual(keep.validation.state, automation_policy.VALID)
 
         for delay in sorted(settings.AUTO_YOUTUBE_CLEANUP_DELAY_HOURS):
@@ -250,6 +251,7 @@ class AutomationPolicyCompatibilityTests(unittest.TestCase):
                     automation_policy.RETENTION_CLEANUP_AFTER_DELAY,
                 )
                 self.assertEqual(policy.delay_hours, delay)
+                self.assertTrue(policy.automatic_cleanup_configured)
                 self.assertEqual(
                     automation_policy.retention_delay_for_mode(
                         policy.mode, policy.delay_hours
@@ -338,6 +340,69 @@ class AutomationPolicyCompatibilityTests(unittest.TestCase):
             },
         )
         self.assertNotIn("vod_handling", applied)
+
+    def test_additive_product_payload_is_json_safe_and_globally_independent(self):
+        configured = ["Manual", "Download", "YouTube", "Legacy"]
+        current = {
+            "auto_vod_enabled": False,
+            "auto_youtube_enabled": False,
+            "auto_recorder_enabled": False,
+            "auto_youtube_cleanup_delay_hours": 6,
+            "youtube_enabled": False,
+            "youtube_auto_upload": True,
+            "streamer_profiles": {
+                "download": {"auto_vod_download": True},
+                "youtube": {
+                    "auto_vod_download": True,
+                    "auto_youtube_upload": True,
+                    "auto_record": True,
+                },
+                "legacy": {"auto_youtube_upload": True},
+            },
+        }
+
+        payload = automation_policy.automation_product_payload(
+            current, configured
+        )
+
+        self.assertEqual(
+            payload["streamer_policies"]["youtube"],
+            {
+                "vod_handling": "download_and_youtube",
+                "live_recording": "automatic",
+                "youtube_playlist_id": "",
+                "validation": {"state": "valid", "issues": []},
+            },
+        )
+        self.assertEqual(
+            payload["streamer_policies"]["legacy"]["validation"],
+            {
+                "state": "needs_review",
+                "issues": ["auto_youtube_requires_auto_vod"],
+            },
+        )
+        self.assertEqual(
+            payload["summary"],
+            {
+                "manual": 1,
+                "auto_download": 1,
+                "download_and_youtube": 1,
+                "needs_review": 1,
+            },
+        )
+        self.assertEqual(
+            payload["automated_upload_retention"],
+            {
+                "mode": "cleanup_after_delay",
+                "delay_hours": 6,
+                "automatic_cleanup_configured": True,
+                "validation": {"state": "valid", "issues": []},
+            },
+        )
+        self.assertEqual(
+            payload["manual_download_workflow"]["status"],
+            "blocked_by_legacy_youtube_gate",
+        )
 
 
 if __name__ == "__main__":

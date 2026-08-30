@@ -256,6 +256,7 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
                 "api_streamers_force_fixed_path",
             ),
             ("/api/streamers", "POST", "api_streamers"),
+            ("/api/streamers/policy", "POST", "api_streamer_policy"),
             ("/api/search", "POST", "api_search"),
             ("/api/live/status", "GET", "api_live_status"),
             ("/api/live/record", "POST", "api_start_live_recording"),
@@ -918,6 +919,7 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
                 "archive_file_exists": bool,
                 "archive_file_resolved": str,
                 "archive_file_forced": str,
+                "automation_product": dict,
             },
         )
 
@@ -1245,6 +1247,168 @@ class SettingsContractTests(IsolatedDashboardTestCase):
         self.assertIn("{date_de}", defaults["youtube_title_template"])
         self.assertIn("{date_de}", defaults["youtube_description_template"])
         self.assertIn("{date_de}", defaults["manual_upload_filename_template"])
+
+    def test_state_adds_canonical_streamer_policy_without_repairing_legacy_flags(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "Manual\nLegacy\n", encoding="utf-8"
+        )
+        dashboard.save_settings(
+            {
+                "auto_vod_enabled": False,
+                "auto_youtube_enabled": False,
+                "streamer_profiles": {
+                    "legacy": {"auto_youtube_upload": True}
+                },
+            }
+        )
+
+        payload = self.client.get("/api/state").get_json()
+
+        self.assertEqual(
+            payload["automation_product"]["streamer_policies"]["manual"][
+                "vod_handling"
+            ],
+            "manual",
+        )
+        self.assertEqual(
+            payload["automation_product"]["streamer_policies"]["legacy"],
+            {
+                "vod_handling": "needs_review",
+                "live_recording": "manual",
+                "youtube_playlist_id": "",
+                "validation": {
+                    "state": "needs_review",
+                    "issues": ["auto_youtube_requires_auto_vod"],
+                },
+            },
+        )
+        self.assertEqual(
+            dashboard.load_settings()["streamer_profiles"],
+            {"legacy": {"auto_youtube_upload": True}},
+        )
+
+    def test_product_policy_endpoint_maps_valid_modes_to_existing_fields(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "Example\n", encoding="utf-8"
+        )
+        cases = (
+            ("manual", {}),
+            ("auto_download", {"auto_vod_download": True}),
+            (
+                "download_and_youtube",
+                {
+                    "auto_vod_download": True,
+                    "auto_youtube_upload": True,
+                },
+            ),
+        )
+        for mode, expected_flags in cases:
+            with self.subTest(mode=mode), mock.patch.object(
+                dashboard, "create_upload_job"
+            ) as create_upload:
+                response = self.client.post(
+                    "/api/streamers/policy",
+                    json={
+                        "streamer": "Example",
+                        "vod_handling": mode,
+                        "live_recording": "manual",
+                        "youtube_playlist_id": "",
+                    },
+                    headers=self.csrf_headers,
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json()["streamer_profile"], expected_flags)
+            self.assertEqual(
+                response.get_json()["policy"]["vod_handling"], mode
+            )
+            create_upload.assert_not_called()
+
+    def test_product_policy_save_keeps_playlist_and_live_recording_independent(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "Example\n", encoding="utf-8"
+        )
+        with mock.patch.object(
+            dashboard, "_wake_auto_recorder_after_save"
+        ) as wake_recorder, mock.patch.object(
+            dashboard, "_wake_auto_vod_after_save"
+        ) as wake_vod:
+            response = self.client.post(
+                "/api/streamers/policy",
+                json={
+                    "streamer": "@EXAMPLE",
+                    "vod_handling": "download_and_youtube",
+                    "live_recording": "automatic",
+                    "youtube_playlist_id": " PLAYLIST_A ",
+                },
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["streamer_profile"],
+            {
+                "youtube_playlist_id": "PLAYLIST_A",
+                "auto_record": True,
+                "auto_vod_download": True,
+                "auto_youtube_upload": True,
+            },
+        )
+        wake_recorder.assert_called_once_with("streamer policy save")
+        wake_vod.assert_called_once_with("streamer policy save")
+
+        blank = self.client.post(
+            "/api/streamers/policy",
+            json={
+                "streamer": "Example",
+                "vod_handling": "download_and_youtube",
+                "live_recording": "automatic",
+                "youtube_playlist_id": "",
+            },
+            headers=self.csrf_headers,
+        )
+        self.assertEqual(blank.status_code, 200)
+        self.assertNotIn(
+            "youtube_playlist_id", blank.get_json()["streamer_profile"]
+        )
+        self.assertEqual(
+            blank.get_json()["policy"]["validation"]["state"], "valid"
+        )
+
+    def test_invalid_product_policy_does_not_resolve_or_start_legacy_configuration(self):
+        (self.runtime_dir / "streamer.txt").write_text(
+            "Legacy\n", encoding="utf-8"
+        )
+        dashboard.save_settings(
+            {
+                "streamer_profiles": {
+                    "legacy": {"auto_youtube_upload": True}
+                }
+            }
+        )
+        with mock.patch.object(
+            dashboard, "save_settings"
+        ) as save, mock.patch.object(
+            dashboard, "create_upload_job"
+        ) as create_upload:
+            response = self.client.post(
+                "/api/streamers/policy",
+                json={
+                    "streamer": "Legacy",
+                    "vod_handling": "needs_review",
+                    "live_recording": "manual",
+                    "youtube_playlist_id": "",
+                },
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 400)
+        save.assert_not_called()
+        create_upload.assert_not_called()
+        self.assertEqual(
+            dashboard.load_settings()["streamer_profiles"],
+            {"legacy": {"auto_youtube_upload": True}},
+        )
 
     def test_app_runtime_data_wrappers_honor_patched_paths(self):
         repository = dashboard._runtime_data_repository()

@@ -289,6 +289,13 @@ let autoYoutubePlaylistHistoryAutoOpened = false;
 let autoExpandJobDetails = localStorage.getItem('vodJobAutoExpand') === '1';
 let youtubePlaylistChoices = [];
 let streamerProfileDraft = {};
+let expandedStreamerLogin = '';
+let streamerPolicyEditorDirty = false;
+let streamerListDirty = false;
+let streamerPolicyFeedback = new Map();
+let streamerPolicyEditorDraft = new Map();
+let streamerListSearchQuery = '';
+let streamerListFilter = 'all';
 let liveStreamers = [];
 let liveStreamStatuses = new Map();
 let liveStatusRequests = new Map();
@@ -398,8 +405,10 @@ function renderState() {
   $('archiveCount').textContent = `Archive: ${state.archive_count} VODs`;
   if ($('settingsFilePath')) $('settingsFilePath').textContent = state.settings_file || state.settings._settings_file || 'unknown';
   streamerProfileDraft = cloneStreamerProfiles(state.settings.streamer_profiles);
+  streamerListDirty = false;
   $('streamersText').value = state.streamers.join('\n');
   renderStreamerEditor();
+  updateStreamerListSaveState();
   if ($('streamerFileInfo')) $('streamerFileInfo').textContent = state.streamer_file_resolved || state.settings.streamer_file || 'unknown';
   if ($('streamerFileStatus')) $('streamerFileStatus').textContent = `${state.streamers.length} streamers loaded`;
   $('limit').value = state.settings.playlist_end;
@@ -425,8 +434,10 @@ function renderState() {
   $('autoVodPollMinutes').disabled = !$('autoVodEnabled').checked;
   updateAutoVodSettingCopy();
   updateAutoRecorderSettingCopy();
+  updateAutoYoutubeSettingCopy();
   $('youtubeEnabled').checked = !!state.settings.youtube_enabled;
   $('youtubeAutoUpload').checked = !!state.settings.youtube_auto_upload;
+  syncManualDownloadWorkflowMode();
   $('moveUploadedVods').checked = state.settings.move_uploaded_vods !== false;
   $('uploadedVodsFolder').value = state.settings.uploaded_vods_folder || '';
   $('youtubePrivacyStatus').value = state.settings.youtube_privacy_status || 'private';
@@ -446,6 +457,7 @@ function renderState() {
   $('youtubeUploadMode').value = state.settings.youtube_upload_mode || 'stable';
   renderGlobalPlaylistSelect();
   renderLocalUploadPlaylistSelect();
+  renderAutomationPolicySummaries();
   renderSearchStreamerCheckboxes();
   updateVodFilterCount();
   syncLiveStreamers(state.streamers);
@@ -730,69 +742,9 @@ function cloneStreamerProfiles(profiles) {
   return normalized;
 }
 
-function streamerProfilePlaylistId(profiles, streamer) {
-  const login = canonicalStreamerLoginClient(streamer);
-  if (!login) return '';
-  return String(profiles?.[login]?.youtube_playlist_id || '').trim();
-}
-
 function streamerProfileAutoRecordEnabled(profiles, streamer) {
   const login = canonicalStreamerLoginClient(streamer);
   return !!login && profiles?.[login]?.auto_record === true;
-}
-
-function streamerProfileAutoVodEnabled(profiles, streamer) {
-  const login = canonicalStreamerLoginClient(streamer);
-  return !!login && profiles?.[login]?.auto_vod_download === true;
-}
-
-function streamerProfileAutoYoutubeEnabled(profiles, streamer) {
-  const login = canonicalStreamerLoginClient(streamer);
-  return !!login && profiles?.[login]?.auto_youtube_upload === true;
-}
-
-function withStreamerPlaylistSelection(profiles, streamer, playlistId) {
-  const updated = cloneStreamerProfiles(profiles);
-  const login = canonicalStreamerLoginClient(streamer);
-  if (!login) return updated;
-  const selected = String(playlistId || '').trim();
-  const profile = { ...(updated[login] || {}) };
-  if (selected) profile.youtube_playlist_id = selected;
-  else delete profile.youtube_playlist_id;
-  if (Object.keys(profile).length) updated[login] = profile;
-  else delete updated[login];
-  return updated;
-}
-
-function withStreamerAutoRecordSelection(profiles, streamer, enabled) {
-  const updated = cloneStreamerProfiles(profiles);
-  const login = canonicalStreamerLoginClient(streamer);
-  if (!login) return updated;
-  const profile = { ...(updated[login] || {}) };
-  if (enabled === true) profile.auto_record = true;
-  else delete profile.auto_record;
-  if (Object.keys(profile).length) updated[login] = profile;
-  else delete updated[login];
-  return updated;
-}
-
-function withStreamerAutoVodSelection(profiles, streamer, enabled) {
-  const updated = cloneStreamerProfiles(profiles); const login = canonicalStreamerLoginClient(streamer);
-  if (!login) return updated; const profile = { ...(updated[login] || {}) };
-  if (enabled === true) profile.auto_vod_download = true; else delete profile.auto_vod_download;
-  if (Object.keys(profile).length) updated[login] = profile; else delete updated[login]; return updated;
-}
-
-function withStreamerAutoYoutubeSelection(profiles, streamer, enabled) {
-  const updated = cloneStreamerProfiles(profiles);
-  const login = canonicalStreamerLoginClient(streamer);
-  if (!login) return updated;
-  const profile = { ...(updated[login] || {}) };
-  if (enabled === true) profile.auto_youtube_upload = true;
-  else delete profile.auto_youtube_upload;
-  if (Object.keys(profile).length) updated[login] = profile;
-  else delete updated[login];
-  return updated;
 }
 
 function buildYoutubeUploadRequest(paths, mode, playlistId='') {
@@ -819,6 +771,105 @@ function availablePlaylistChoices(currentId='') {
 function playlistOptionsHtml(currentId, emptyLabel) {
   const current = String(currentId || '').trim();
   return `<option value="" ${current ? '' : 'selected'}>${escapeHtml(emptyLabel)}</option>` + availablePlaylistChoices(current).map(playlist => `<option value="${escapeHtml(playlist.id)}" ${playlist.id === current ? 'selected' : ''}>${escapeHtml(playlist.title)}</option>`).join('');
+}
+
+const VOD_HANDLING_LABELS = {
+  manual:'Manual',
+  auto_download:'Auto Download',
+  download_and_youtube:'Download + YouTube',
+  needs_review:'Needs Review'
+};
+
+const LIVE_RECORDING_LABELS = {
+  manual:'Manual',
+  automatic:'Automatic'
+};
+
+function automationProductView() {
+  return state?.automation_product || {
+    streamer_policies:{},
+    summary:{manual:0, auto_download:0, download_and_youtube:0, needs_review:0}
+  };
+}
+
+function streamerPolicyView(streamer) {
+  const login = canonicalStreamerLoginClient(streamer);
+  return login ? automationProductView().streamer_policies?.[login] || null : null;
+}
+
+function vodHandlingLabel(mode) {
+  return VOD_HANDLING_LABELS[mode] || 'Unavailable';
+}
+
+function liveRecordingLabel(mode) {
+  return LIVE_RECORDING_LABELS[mode] || 'Manual';
+}
+
+function playlistDisplayName(playlistId) {
+  const id = String(playlistId || '').trim();
+  if (!id) return 'No playlist';
+  const match = availablePlaylistChoices(id).find(playlist => playlist.id === id);
+  return match?.title || `Saved playlist (${id})`;
+}
+
+function policySummaryText(summary=automationProductView().summary) {
+  const values = summary || {};
+  const parts = [
+    `${Number(values.manual) || 0} Manual`,
+    `${Number(values.auto_download) || 0} Auto Download`,
+    `${Number(values.download_and_youtube) || 0} Download + YouTube`
+  ];
+  const review = Number(values.needs_review) || 0;
+  if (review) parts.push(`${review} Needs Review`);
+  return parts.join(' · ');
+}
+
+function renderAutomationPolicySummaries() {
+  const text = policySummaryText();
+  if ($('automationPolicySummary')) $('automationPolicySummary').textContent = text;
+  if ($('streamerPolicySummary')) $('streamerPolicySummary').textContent = text;
+}
+
+function syncManualDownloadWorkflowMode() {
+  const select = $('manualDownloadWorkflowMode');
+  if (!select) return;
+  const workflow = automationProductView().manual_download_workflow || {};
+  select.value = workflow.status === 'enabled'
+    ? 'upload_after_download'
+    : workflow.status === 'blocked_by_legacy_youtube_gate'
+      ? 'needs_review'
+      : 'ready_for_review';
+  const help = $('manualDownloadWorkflowHelp');
+  if (help) {
+    help.textContent = select.value === 'needs_review'
+      ? 'Automatic upload was requested in the existing configuration, but its legacy YouTube gate is off. Choose a valid handling option to resolve it.'
+      : 'Automatic upload requires a connected YouTube account. Explicit uploads from Local VODs remain available independently.';
+    help.className = `field-message ${select.value === 'needs_review' ? 'warn' : 'muted'}`;
+  }
+}
+
+function applyManualDownloadWorkflowChoice() {
+  const mode = $('manualDownloadWorkflowMode')?.value;
+  if (!mode || mode === 'needs_review') return;
+  const upload = mode === 'upload_after_download';
+  $('youtubeEnabled').checked = upload;
+  $('youtubeAutoUpload').checked = upload;
+  const help = $('manualDownloadWorkflowHelp');
+  if (help) {
+    help.textContent = upload
+      ? 'After a manually started download, the legacy follow-up will attempt a YouTube upload when the account is connected.'
+      : 'Manually downloaded VODs will remain ready for review. You can still upload them explicitly from Local VODs.';
+    help.className = 'field-message muted';
+  }
+}
+
+function updateStreamerListSaveState() {
+  const button = $('saveStreamers');
+  const status = $('streamerListSaveStatus');
+  if (button) button.disabled = !streamerListDirty;
+  if (status) status.textContent = streamerListDirty
+    ? 'Streamer order or membership has unsaved changes.'
+    : 'Streamer order and membership are saved.';
 }
 
 function renderGlobalPlaylistSelect() {
@@ -861,13 +912,13 @@ function updateAutoRecorderSettingCopy() {
   const persisted = state?.settings?.auto_recorder_enabled === true;
   if (toggle.checked !== persisted) {
     copy.textContent = toggle.checked
-      ? 'Will enable when settings are saved.'
-      : 'Will pause when settings are saved. Active recordings will continue.';
+      ? 'Will run when Automation settings are saved.'
+      : 'Will pause when Automation settings are saved. Active recordings will continue.';
     return;
   }
   copy.textContent = persisted
-    ? 'Enabled · only selected streamers are monitored.'
-    : 'Paused · streamer selections are preserved.';
+    ? 'Running · only streamers configured for Automatic Live Recording are monitored.'
+    : 'Paused · streamer Live Recording policies are preserved.';
 }
 
 function formatAutoRecorderTimestamp(value) {
@@ -881,7 +932,32 @@ function updateAutoVodSettingCopy() {
   const toggle = $('autoVodEnabled'), interval = $('autoVodPollMinutes'), copy = $('autoVodSettingState');
   if (!toggle || !interval || !copy) return;
   interval.disabled = !toggle.checked;
-  copy.textContent = toggle.checked ? 'Enabled · only selected streamers are checked.' : 'Paused · streamer selections are preserved.';
+  const persisted = state?.settings?.auto_vod_enabled === true;
+  if (toggle.checked !== persisted) {
+    copy.textContent = toggle.checked
+      ? 'Will run when Automation settings are saved.'
+      : 'Will pause when Automation settings are saved.';
+    return;
+  }
+  copy.textContent = persisted
+    ? 'Running · streamer VOD Handling policies are unchanged.'
+    : 'Paused · streamer VOD Handling policies are preserved.';
+}
+
+function updateAutoYoutubeSettingCopy() {
+  const toggle = $('autoYoutubeEnabled');
+  const copy = $('autoYoutubeSettingState');
+  if (!toggle || !copy) return;
+  const persisted = state?.settings?.auto_youtube_enabled === true;
+  if (toggle.checked !== persisted) {
+    copy.textContent = toggle.checked
+      ? 'Will run when Automation settings are saved.'
+      : 'Will pause when Automation settings are saved.';
+    return;
+  }
+  copy.textContent = persisted
+    ? 'Running · eligible automatic downloads may continue to YouTube.'
+    : 'Paused · Download + YouTube streamer policies are preserved.';
 }
 
 function autoVodStatusPresentation(snapshot) {
@@ -1432,57 +1508,164 @@ function streamerEditorNames() {
   return String($('streamersText')?.value || '').split(/\r?\n/).map(name => name.trim()).filter(Boolean);
 }
 
-function setStreamerEditorNames(names) {
-  $('streamersText').value = (names || []).join('\n');
+const STREAMER_LIST_FILTERS = new Set([
+  'all', 'automated', 'live-recording', 'needs-review'
+]);
+
+function normalizeStreamerListSearch(value) {
+  return String(value || '').trim().toLocaleLowerCase();
+}
+
+function streamerWorkspaceEntries(names, product, searchQuery='', filter='all') {
+  const query = normalizeStreamerListSearch(searchQuery);
+  const selectedFilter = STREAMER_LIST_FILTERS.has(filter) ? filter : 'all';
+  const policies = product?.streamer_policies || {};
+  return (names || []).map((name, index) => {
+    const login = canonicalStreamerLoginClient(name);
+    return {name, index, login, policy: login ? policies[login] || null : null};
+  }).filter(entry => {
+    if (query && !String(entry.name || '').toLocaleLowerCase().includes(query)) return false;
+    const policy = entry.policy;
+    if (selectedFilter === 'automated') return ['auto_download', 'download_and_youtube'].includes(policy?.vod_handling);
+    if (selectedFilter === 'live-recording') return policy?.live_recording === 'automatic';
+    if (selectedFilter === 'needs-review') return policy?.validation?.state === 'needs_review';
+    return true;
+  });
+}
+
+function captureExpandedStreamerPolicyDraft() {
+  if (!expandedStreamerLogin) return;
+  const row = document.querySelector(`[data-streamer-login="${expandedStreamerLogin}"]`);
+  const vodHandling = row?.querySelector('.streamer-vod-handling-select')?.value;
+  const liveRecording = row?.querySelector('.streamer-live-recording-select')?.value;
+  const playlistId = row?.querySelector('.streamer-playlist-select')?.value;
+  if (vodHandling !== undefined && liveRecording !== undefined && playlistId !== undefined) {
+    streamerPolicyEditorDraft.set(expandedStreamerLogin, {
+      vod_handling: vodHandling,
+      live_recording: liveRecording,
+      youtube_playlist_id: playlistId
+    });
+  }
+}
+
+function setStreamerListDiscovery({searchQuery=streamerListSearchQuery, filter=streamerListFilter}={}) {
+  captureExpandedStreamerPolicyDraft();
+  streamerListSearchQuery = String(searchQuery || '');
+  streamerListFilter = STREAMER_LIST_FILTERS.has(filter) ? filter : 'all';
+  if ($('streamerListSearch')) $('streamerListSearch').value = streamerListSearchQuery;
+  document.querySelectorAll('[data-streamer-filter]').forEach(button => {
+    const active = button.dataset.streamerFilter === streamerListFilter;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
   renderStreamerEditor();
+}
+
+function streamerEditorValues(login, policy) {
+  const draft = streamerPolicyEditorDraft.get(login) || {};
+  return {
+    vod_handling: draft.vod_handling ?? (policy?.validation?.state === 'needs_review' ? '' : policy?.vod_handling || 'manual'),
+    live_recording: draft.live_recording ?? (policy?.live_recording || 'manual'),
+    youtube_playlist_id: draft.youtube_playlist_id ?? (policy?.youtube_playlist_id || '')
+  };
+}
+
+function setStreamerEditorNames(names, {dirty=true}={}) {
+  $('streamersText').value = (names || []).join('\n');
+  if (dirty) streamerListDirty = true;
+  renderStreamerEditor();
+  updateStreamerListSaveState();
 }
 
 function renderStreamerEditor() {
   const list = $('streamerEditorList');
   if (!list || !$('streamersText')) return;
   const names = streamerEditorNames();
+  if (expandedStreamerLogin && !names.some(name => canonicalStreamerLoginClient(name) === expandedStreamerLogin)) {
+    expandedStreamerLogin = '';
+    streamerPolicyEditorDirty = false;
+  }
   if (!names.length) {
-    list.innerHTML = '<div class="streamer-editor-empty muted">No streamers configured yet.</div>';
+    if ($('streamerFilterSummary')) $('streamerFilterSummary').textContent = '0 streamers';
+    list.innerHTML = '<div class="streamer-editor-empty muted">No streamers configured yet. Add one to begin with Manual handling.</div>';
     return;
   }
-  list.innerHTML = names.map((name, index) => {
-    const playlistId = streamerProfilePlaylistId(
-      streamerProfileDraft, name
-    );
-    const autoRecord = streamerProfileAutoRecordEnabled(
-      streamerProfileDraft, name
-    );
-    const autoVod = streamerProfileAutoVodEnabled(streamerProfileDraft, name);
-    const autoYoutube = streamerProfileAutoYoutubeEnabled(streamerProfileDraft, name);
-    return `<div class="streamer-editor-row" data-streamer-index="${index}"><span class="streamer-order">${index + 1}</span><strong>${escapeHtml(name)}</strong><label class="streamer-playlist-field"><span>Default Playlist</span><select class="streamer-playlist-select" data-streamer-login="${escapeHtml(name)}" aria-label="Default YouTube playlist for ${escapeHtml(name)}">${playlistOptionsHtml(playlistId, 'Global Default')}</select></label><label class="streamer-auto-record-field"><span>Auto VOD</span><span class="switch-control"><input type="checkbox" role="switch" class="streamer-auto-vod-toggle" data-streamer-login="${escapeHtml(name)}" aria-label="Enable automatic VOD downloads for ${escapeHtml(name)}" ${autoVod ? 'checked' : ''}><span class="switch-track" aria-hidden="true"></span><span class="switch-value">${autoVod ? 'On' : 'Off'}</span></span></label><label class="streamer-auto-record-field"><span>Auto YouTube</span><span class="switch-control"><input type="checkbox" role="switch" class="streamer-auto-youtube-toggle" data-streamer-login="${escapeHtml(name)}" aria-label="Enable automatic YouTube uploads for ${escapeHtml(name)}" ${autoYoutube ? 'checked' : ''}><span class="switch-track" aria-hidden="true"></span><span class="switch-value">${autoYoutube ? 'On' : 'Off'}</span></span></label><label class="streamer-auto-record-field"><span>Auto Recording</span><span class="switch-control"><input type="checkbox" role="switch" class="streamer-auto-record-toggle" data-streamer-login="${escapeHtml(name)}" aria-label="Enable automatic recording for ${escapeHtml(name)}" ${autoRecord ? 'checked' : ''}><span class="switch-track" aria-hidden="true"></span><span class="switch-value">${autoRecord ? 'On' : 'Off'}</span></span></label><div class="streamer-row-actions"><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></div>`;
+  const visibleEntries = streamerWorkspaceEntries(
+    names, automationProductView(), streamerListSearchQuery, streamerListFilter
+  );
+  const discoveryActive = !!normalizeStreamerListSearch(streamerListSearchQuery) || streamerListFilter !== 'all';
+  if ($('streamerFilterSummary')) {
+    $('streamerFilterSummary').textContent = discoveryActive
+      ? `${names.length} streamer${names.length === 1 ? '' : 's'} · ${visibleEntries.length} shown`
+      : `${names.length} streamer${names.length === 1 ? '' : 's'}`;
+  }
+  if (!visibleEntries.length) {
+    list.innerHTML = '<div class="streamer-editor-empty muted">No streamers match these filters.</div>';
+    return;
+  }
+  list.innerHTML = visibleEntries.map(({name, index, login, policy}) => {
+    const expanded = !!login && login === expandedStreamerLogin;
+    const mode = policy?.vod_handling || 'manual';
+    const needsReview = policy?.validation?.state === 'needs_review';
+    const editorValues = streamerEditorValues(login, policy);
+    const editorMode = editorValues.vod_handling;
+    const playlistId = policy?.youtube_playlist_id || '';
+    const validationLabel = policy ? (needsReview ? 'Needs Review' : 'Valid') : 'Not saved';
+    const feedback = streamerPolicyFeedback.get(login) || '';
+    const editorId = `streamerPolicyEditor-${login || index}`;
+    const reviewId = `streamerPolicyReview-${login || index}`;
+    const modeOptions = needsReview && !editorMode
+      ? '<option value="" selected disabled>Choose a valid VOD Handling mode</option>'
+      : '';
+    const editor = expanded && policy ? `<div class="streamer-policy-editor" id="${editorId}">
+      ${needsReview ? `<div class="streamer-policy-warning" id="${reviewId}" role="alert"><strong>Configuration needs review</strong><span>YouTube automation is enabled for this streamer, but automatic VOD download is not. Choose a valid VOD Handling mode to resolve this configuration.</span></div>` : ''}
+      <div class="streamer-policy-fields">
+        <label>VOD Handling<select class="streamer-vod-handling-select" aria-describedby="${needsReview ? reviewId : ''}">${modeOptions}<option value="manual" ${editorMode === 'manual' ? 'selected' : ''}>Manual</option><option value="auto_download" ${editorMode === 'auto_download' ? 'selected' : ''}>Auto Download</option><option value="download_and_youtube" ${editorMode === 'download_and_youtube' ? 'selected' : ''}>Download + YouTube</option></select></label>
+        <label>YouTube Playlist<select class="streamer-playlist-select">${playlistOptionsHtml(editorValues.youtube_playlist_id, 'No playlist')}</select><span class="field-help">Optional. Blank means no playlist for automatic uploads.</span></label>
+        <label>Live Recording<select class="streamer-live-recording-select"><option value="manual" ${editorValues.live_recording === 'manual' ? 'selected' : ''}>Manual</option><option value="automatic" ${editorValues.live_recording === 'automatic' ? 'selected' : ''}>Automatic</option></select></label>
+      </div>
+      ${editorMode === 'download_and_youtube' && state?.settings?.auto_youtube_enabled !== true ? '<p class="streamer-global-pause-note">Configured for Download + YouTube · Automatic YouTube Processing is currently paused globally.</p>' : ''}
+      <div class="streamer-policy-editor-footer"><p class="streamer-policy-feedback muted" role="status" aria-live="polite">${escapeHtml(feedback || 'No unsaved policy changes.')}</p><div class="button-row"><button type="button" class="quiet-button streamer-policy-cancel">Cancel</button><button type="button" class="primary streamer-policy-save">Save changes</button></div></div>
+    </div>` : '';
+    return `<article class="streamer-editor-row${expanded ? ' is-expanded' : ''}${needsReview ? ' needs-review' : ''}" data-streamer-index="${index}" data-streamer-login="${escapeHtml(login)}"><div class="streamer-row-summary"><span class="streamer-order" aria-label="Position ${index + 1}">${index + 1}</span><div class="streamer-row-identity"><strong>${escapeHtml(name)}</strong><span class="streamer-validation is-${needsReview ? 'review' : policy ? 'valid' : 'pending'}">${validationLabel}</span></div><dl class="streamer-policy-summary"><div><dt>VOD Handling</dt><dd>${escapeHtml(policy ? vodHandlingLabel(mode) : 'Manual after save')}</dd></div><div><dt>Playlist</dt><dd title="${escapeHtml(playlistId)}">${escapeHtml(policy ? playlistDisplayName(playlistId) : 'No playlist')}</dd></div><div><dt>Live Recording</dt><dd>${escapeHtml(policy ? liveRecordingLabel(policy.live_recording) : 'Manual after save')}</dd></div></dl><button type="button" class="quiet-button streamer-edit-button" aria-expanded="${expanded ? 'true' : 'false'}" aria-controls="${editorId}" ${policy ? '' : 'disabled'}>${expanded ? 'Close' : 'Edit'}</button><details class="streamer-secondary-actions"><summary aria-label="More actions for ${escapeHtml(name)}">More</summary><div><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Move up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Move down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></details></div>${editor}</article>`;
   }).join('');
-  list.querySelectorAll('.streamer-playlist-select').forEach(select => {
+  list.querySelectorAll('.streamer-edit-button').forEach(button => button.addEventListener('click', () => {
+    const login = button.closest('[data-streamer-login]')?.dataset.streamerLogin || '';
+    if (streamerPolicyEditorDirty && login !== expandedStreamerLogin) {
+      showToast('Save or cancel the current streamer changes first.', 'warn');
+      return;
+    }
+    const closing = expandedStreamerLogin === login;
+    if (closing) streamerPolicyEditorDraft.delete(login);
+    expandedStreamerLogin = closing ? '' : login;
+    streamerPolicyEditorDirty = false;
+    streamerPolicyFeedback.delete(login);
+    renderStreamerEditor();
+    if (expandedStreamerLogin) document.querySelector(`[data-streamer-login="${expandedStreamerLogin}"] .streamer-vod-handling-select`)?.focus();
+  }));
+  list.querySelectorAll('.streamer-policy-editor select').forEach(select => {
     select.addEventListener('change', () => {
-      streamerProfileDraft = withStreamerPlaylistSelection(
-        streamerProfileDraft,
-        select.dataset.streamerLogin,
-        select.value
-      );
+      streamerPolicyEditorDirty = true;
+      captureExpandedStreamerPolicyDraft();
+      const status = select.closest('.streamer-policy-editor')?.querySelector('.streamer-policy-feedback');
+      if (status) status.textContent = 'Unsaved policy changes.';
     });
   });
-  list.querySelectorAll('.streamer-auto-vod-toggle').forEach(toggle => toggle.addEventListener('change', () => {
-    streamerProfileDraft = withStreamerAutoVodSelection(streamerProfileDraft, toggle.dataset.streamerLogin, toggle.checked); renderStreamerEditor();
+  list.querySelectorAll('.streamer-policy-cancel').forEach(button => button.addEventListener('click', () => {
+    streamerPolicyEditorDirty = false;
+    streamerPolicyFeedback.delete(expandedStreamerLogin);
+    streamerPolicyEditorDraft.delete(expandedStreamerLogin);
+    expandedStreamerLogin = '';
+    renderStreamerEditor();
   }));
-  list.querySelectorAll('.streamer-auto-youtube-toggle').forEach(toggle => toggle.addEventListener('change', () => {
-    streamerProfileDraft = withStreamerAutoYoutubeSelection(streamerProfileDraft, toggle.dataset.streamerLogin, toggle.checked); renderStreamerEditor();
+  list.querySelectorAll('.streamer-policy-save').forEach(button => button.addEventListener('click', () => {
+    saveStreamerPolicy(button.closest('[data-streamer-login]'), button).catch(() => {});
   }));
-  list.querySelectorAll('.streamer-auto-record-toggle').forEach(toggle => {
-    toggle.addEventListener('change', () => {
-      streamerProfileDraft = withStreamerAutoRecordSelection(
-        streamerProfileDraft,
-        toggle.dataset.streamerLogin,
-        toggle.checked
-      );
-      const value = toggle.closest('.switch-control')?.querySelector('.switch-value');
-      if (value) value.textContent = toggle.checked ? 'On' : 'Off';
-    });
-  });
   list.querySelectorAll('[data-streamer-action]').forEach(button => button.addEventListener('click', () => {
+    if (streamerPolicyEditorDirty) {
+      showToast('Save or cancel the current streamer changes first.', 'warn');
+      return;
+    }
     const row = button.closest('[data-streamer-index]');
     const index = Number(row.dataset.streamerIndex);
     const current = streamerEditorNames();
@@ -1490,8 +1673,47 @@ function renderStreamerEditor() {
     if (action === 'remove') current.splice(index, 1);
     if (action === 'up' && index > 0) [current[index - 1], current[index]] = [current[index], current[index - 1]];
     if (action === 'down' && index < current.length - 1) [current[index + 1], current[index]] = [current[index], current[index + 1]];
-    setStreamerEditorNames(current);
+    setStreamerEditorNames(current, {dirty:true});
   }));
+}
+
+async function saveStreamerPolicy(row, button) {
+  const login = row?.dataset.streamerLogin || '';
+  const name = streamerEditorNames().find(item => canonicalStreamerLoginClient(item) === login);
+  const vodHandling = row?.querySelector('.streamer-vod-handling-select')?.value || '';
+  const liveRecording = row?.querySelector('.streamer-live-recording-select')?.value || '';
+  const playlistId = row?.querySelector('.streamer-playlist-select')?.value || '';
+  const feedback = row?.querySelector('.streamer-policy-feedback');
+  if (!vodHandling) {
+    if (feedback) { feedback.textContent = 'Choose a valid VOD Handling mode before saving.'; feedback.className = 'streamer-policy-feedback bad'; }
+    row?.querySelector('.streamer-vod-handling-select')?.focus();
+    return;
+  }
+  const originalText = button?.textContent || 'Save changes';
+  if (button) { button.disabled = true; button.textContent = 'Saving…'; }
+  if (feedback) { feedback.textContent = 'Saving…'; feedback.className = 'streamer-policy-feedback muted'; }
+  try {
+    const saved = await api('/api/streamers/policy', {
+      method:'POST',
+      body:JSON.stringify({streamer:name, vod_handling:vodHandling, live_recording:liveRecording, youtube_playlist_id:playlistId})
+    });
+    state.settings.streamer_profiles = saved.streamer_profiles;
+    state.automation_product = saved.automation_product;
+    streamerProfileDraft = cloneStreamerProfiles(saved.streamer_profiles);
+    streamerPolicyEditorDirty = false;
+    streamerPolicyEditorDraft.delete(login);
+    streamerPolicyFeedback.set(login, 'Saved.');
+    renderStreamerEditor();
+    renderAutomationPolicySummaries();
+    renderDashboardVodAutomation();
+    refreshAutoRecorderStatus().catch(() => {});
+    refreshAutoVodStatus().catch(() => {});
+    showToast(`${name} policy saved.`);
+  } catch (error) {
+    if (button) { button.disabled = false; button.textContent = originalText; }
+    if (feedback) { feedback.textContent = error.message || 'Streamer policy could not be saved.'; feedback.className = 'streamer-policy-feedback bad'; }
+    throw error;
+  }
 }
 
 function addStreamerFromInput() {
@@ -1504,26 +1726,37 @@ function addStreamerFromInput() {
     return;
   }
   names.push(raw);
-  setStreamerEditorNames(names);
+  setStreamerEditorNames(names, {dirty:true});
   input.value = '';
   input.focus();
 }
 
 function showSettingsTab(name) {
-  const allowed = ['general', 'streamers', 'youtube', 'advanced'];
+  const allowed = ['general', 'automation', 'streamers', 'youtube', 'advanced'];
   const target = allowed.includes(name) ? name : 'general';
   document.querySelectorAll('.settings-tab').forEach(tab => {
     const active = tab.dataset.settingsTab === target;
     tab.classList.toggle('active', active);
     tab.setAttribute('aria-selected', active ? 'true' : 'false');
+    tab.setAttribute('tabindex', active ? '0' : '-1');
   });
-  document.querySelectorAll('.settings-panel').forEach(panel => panel.classList.toggle('active', panel.dataset.settingsPanel === target));
+  document.querySelectorAll('.settings-panel').forEach(panel => {
+    const active = panel.dataset.settingsPanel === target;
+    panel.classList.toggle('active', active);
+    panel.hidden = !active;
+  });
   try { localStorage.setItem('vodSettingsTab', target); } catch {}
   if (target === 'youtube') {
     refreshYoutubeStatus().catch(() => {});
   }
   if (target === 'youtube' || target === 'streamers') {
     loadYoutubePlaylists().catch(() => {});
+  }
+  if (target === 'automation' || target === 'streamers') {
+    renderAutomationPolicySummaries();
+  }
+  if (target === 'streamers' && !streamerPolicyEditorDirty) {
+    renderStreamerEditor();
   }
 }
 
@@ -1735,6 +1968,55 @@ function collectOpenStates() {
     const id = el.dataset.queueDetailId;
     if (id) queueDetailOpenState[id] = !!el.open;
   });
+}
+
+function markAutomationSettingsDirty() {
+  const status = $('automationSaveStatus');
+  if (status) status.textContent = 'Automation changes are not saved yet.';
+}
+
+async function saveAutomationSettings() {
+  const button = $('saveAutomationSettings');
+  const status = $('automationSaveStatus');
+  const originalText = button?.textContent || 'Save Automation';
+  if (button) { button.disabled = true; button.textContent = 'Saving…'; }
+  if (status) { status.textContent = 'Saving…'; status.className = 'field-message muted'; }
+  try {
+    const saved = await api('/api/settings', {
+      method:'POST',
+      body:JSON.stringify({
+        auto_vod_enabled:$('autoVodEnabled').checked,
+        auto_vod_poll_minutes:Number($('autoVodPollMinutes').value || 60),
+        auto_youtube_enabled:$('autoYoutubeEnabled').checked,
+        auto_recorder_enabled:$('autoRecorderEnabled').checked,
+        auto_youtube_cleanup_delay_hours:Number($('autoYoutubeCleanupDelayHours').value || 0)
+      })
+    });
+    state.settings = {...state.settings, ...saved};
+    updateAutoVodSettingCopy();
+    updateAutoYoutubeSettingCopy();
+    updateAutoRecorderSettingCopy();
+    if (status) { status.textContent = `Saved ${saved._saved_at || 'now'}. Streamer policies were not changed.`; status.className = 'field-message good'; }
+    await Promise.all([
+      refreshAutoVodStatus().catch(() => null),
+      refreshAutoRecorderStatus().catch(() => null),
+      refreshDashboard().catch(() => null)
+    ]);
+    showToast('Automation settings saved.');
+  } catch (error) {
+    $('autoVodEnabled').checked = state?.settings?.auto_vod_enabled === true;
+    $('autoYoutubeEnabled').checked = state?.settings?.auto_youtube_enabled === true;
+    $('autoRecorderEnabled').checked = state?.settings?.auto_recorder_enabled === true;
+    $('autoVodPollMinutes').value = String(state?.settings?.auto_vod_poll_minutes || 60);
+    $('autoYoutubeCleanupDelayHours').value = String(state?.settings?.auto_youtube_cleanup_delay_hours || 0);
+    updateAutoVodSettingCopy();
+    updateAutoYoutubeSettingCopy();
+    updateAutoRecorderSettingCopy();
+    if (status) { status.textContent = error.message || 'Automation settings could not be saved.'; status.className = 'field-message bad'; }
+    showToast(error.message || 'Automation settings could not be saved.', 'bad');
+  } finally {
+    if (button) { button.disabled = false; button.textContent = originalText; }
+  }
 }
 
 function parseProgress(logs) {
@@ -2833,20 +3115,15 @@ function dashboardVodAutomationView(snapshot) {
   const status = autoVodStatusPresentation(snapshot);
   const kind = status.kind === 'running' && snapshot.in_progress ? 'starting' : status.kind;
   const title = ({running:'Healthy', starting:'Checking…', paused:'Paused', degraded:'Needs attention', unavailable:'Unavailable'})[kind] || 'Checking…';
-  const profiles = state?.settings?.streamer_profiles;
-  const streamers = Array.isArray(state?.streamers) ? state.streamers : [];
   const metrics = [];
   if (snapshot.initialized === true && Number.isFinite(Number(snapshot.watched_count))) metrics.push(`${Number(snapshot.watched_count)} monitored`);
-  if (profiles && streamers.length) {
-    let downloadAndYoutube = 0, downloadOnly = 0;
-    streamers.forEach(streamer => {
-      const profile = profiles[canonicalStreamerLoginClient(streamer)] || {};
-      if (profile.auto_vod_download === true && profile.auto_youtube_upload === true) downloadAndYoutube += 1;
-      else if (profile.auto_vod_download === true) downloadOnly += 1;
-    });
-    if (downloadAndYoutube) metrics.push(`${downloadAndYoutube} Download + YouTube`);
-    if (downloadOnly) metrics.push(`${downloadOnly} Download only`);
-  }
+  const summary = automationProductView().summary || {};
+  const downloadAndYoutube = Number(summary.download_and_youtube) || 0;
+  const downloadOnly = Number(summary.auto_download) || 0;
+  const needsReview = Number(summary.needs_review) || 0;
+  if (downloadAndYoutube) metrics.push(`${downloadAndYoutube} Download + YouTube`);
+  if (downloadOnly) metrics.push(`${downloadOnly} Auto Download`);
+  if (needsReview) metrics.push(`${needsReview} Needs Review`);
   return {kind, title, detail:status.detail, metrics};
 }
 
@@ -3385,7 +3662,7 @@ async function loadYoutubePlaylists() {
       : [];
     renderGlobalPlaylistSelect();
     renderLocalUploadPlaylistSelect();
-    renderStreamerEditor();
+    if (!streamerPolicyEditorDirty) renderStreamerEditor();
     if (status) {
       status.textContent = youtubePlaylistChoices.length
         ? `${youtubePlaylistChoices.length} YouTube playlist${youtubePlaylistChoices.length === 1 ? '' : 's'} available.`
@@ -3462,16 +3739,51 @@ $('streamerAddInput').addEventListener('keydown', event => {
   event.preventDefault();
   addStreamerFromInput();
 });
-$('saveStreamers').addEventListener('click', async () => {
-  const saved = await api('/api/streamers', { method:'POST', body: JSON.stringify({ streamers: $('streamersText').value, streamer_profiles:streamerProfileDraft }) });
-  await loadState();
-  if ($('streamerFileInfo')) $('streamerFileInfo').textContent = saved.streamer_file || state.streamer_file_resolved || 'unknown';
-  if ($('streamerFileStatus')) $('streamerFileStatus').textContent = `${saved.count || 0} streamers saved`;
-  refreshAutoRecorderStatus().catch(() => {});
-  showToast(`${saved.count || 0} streamer${saved.count === 1 ? '' : 's'} saved.`);
+$('streamerListSearch').addEventListener('input', event => {
+  setStreamerListDiscovery({searchQuery:event.target.value});
 });
-$('autoRecorderEnabled').addEventListener('change', updateAutoRecorderSettingCopy);
-$('autoVodEnabled').addEventListener('change', updateAutoVodSettingCopy);
+$('streamerListSearch').addEventListener('keydown', event => {
+  if (event.key !== 'Escape' || !event.currentTarget.value) return;
+  event.preventDefault();
+  setStreamerListDiscovery({searchQuery:''});
+});
+document.querySelectorAll('[data-streamer-filter]').forEach(button => {
+  button.addEventListener('click', () => {
+    setStreamerListDiscovery({filter:button.dataset.streamerFilter});
+  });
+});
+$('saveStreamers').addEventListener('click', async () => {
+  const button = $('saveStreamers');
+  const status = $('streamerListSaveStatus');
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Saving…';
+  if (status) status.textContent = 'Saving streamer order and membership…';
+  try {
+    const saved = await api('/api/streamers', { method:'POST', body: JSON.stringify({ streamers: $('streamersText').value, streamer_profiles:streamerProfileDraft }) });
+    streamerListDirty = false;
+    await loadState();
+    if ($('streamerFileInfo')) $('streamerFileInfo').textContent = saved.streamer_file || state.streamer_file_resolved || 'unknown';
+    if ($('streamerFileStatus')) $('streamerFileStatus').textContent = `${saved.count || 0} streamers saved`;
+    refreshAutoRecorderStatus().catch(() => {});
+    refreshAutoVodStatus().catch(() => {});
+    showToast(`${saved.count || 0} streamer${saved.count === 1 ? '' : 's'} saved.`);
+  } catch (error) {
+    streamerListDirty = true;
+    if (status) { status.textContent = error.message || 'Streamer list could not be saved.'; status.className = 'field-message bad'; }
+    showToast(error.message || 'Streamer list could not be saved.', 'bad');
+  } finally {
+    button.textContent = oldText;
+    updateStreamerListSaveState();
+  }
+});
+$('autoRecorderEnabled').addEventListener('change', () => { updateAutoRecorderSettingCopy(); markAutomationSettingsDirty(); });
+$('autoVodEnabled').addEventListener('change', () => { updateAutoVodSettingCopy(); markAutomationSettingsDirty(); });
+$('autoYoutubeEnabled').addEventListener('change', () => { updateAutoYoutubeSettingCopy(); markAutomationSettingsDirty(); });
+$('autoVodPollMinutes').addEventListener('change', markAutomationSettingsDirty);
+$('autoYoutubeCleanupDelayHours').addEventListener('change', markAutomationSettingsDirty);
+$('saveAutomationSettings').addEventListener('click', saveAutomationSettings);
+$('manualDownloadWorkflowMode').addEventListener('change', applyManualDownloadWorkflowChoice);
 $('checkAutoVodNow').addEventListener('click', async () => {
   try { await api('/api/auto-vod/check-now', {method:'POST', body:'{}'}); await refreshAutoVodStatus(); }
   catch (e) { showToast(e.message || 'Auto VOD is unavailable.'); }
@@ -3657,8 +3969,20 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 document.addEventListener('DOMContentLoaded', function() {
-  document.querySelectorAll('.settings-tab').forEach(tab => {
+  const settingsTabs = [...document.querySelectorAll('.settings-tab')];
+  settingsTabs.forEach((tab, index) => {
     tab.addEventListener('click', () => showSettingsTab(tab.dataset.settingsTab));
+    tab.addEventListener('keydown', event => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === 'Home'
+        ? 0
+        : event.key === 'End'
+          ? settingsTabs.length - 1
+          : (index + (event.key === 'ArrowRight' ? 1 : -1) + settingsTabs.length) % settingsTabs.length;
+      settingsTabs[next].focus();
+      showSettingsTab(settingsTabs[next].dataset.settingsTab);
+    });
   });
   let initialTab = 'general';
   try { initialTab = localStorage.getItem('vodSettingsTab') || 'general'; } catch {}

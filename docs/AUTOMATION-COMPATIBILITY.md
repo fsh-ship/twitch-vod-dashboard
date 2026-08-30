@@ -117,15 +117,22 @@ independently verified that it is unavailable.
 
 ## Retention and legacy archiving
 
-The product representation of the current Auto YouTube default is:
+The product representation of the current Auto YouTube admission default is:
 
 - `keep_local` -> persisted cleanup delay `0`;
 - `cleanup_after_delay` -> one of 1, 3, 6, 12, 24, or 48 hours.
 
-The value is a global default today, not a per-streamer persisted setting. It is
-frozen into a durable Auto YouTube record at admission. Cleanup is scheduled
-only through the existing confirmed lifecycle and ownership rules. An
-individual durable record can also carry its own `keep_local` override.
+The value is a global default today, not a per-streamer persisted setting. In
+the compatibility payload, `automatic_cleanup_configured` is false for delay
+`0` and true for a supported nonzero delay. The product mode name `keep_local`
+describes the intended default outcome only; it does **not** mean that a
+durable item-level `keep_local` override exists.
+
+The global default is frozen into a durable Auto YouTube record at admission.
+Cleanup is scheduled only through the existing confirmed lifecycle and
+ownership rules. An individual durable record can separately carry its own
+`keep_local` override. That item-specific override remains distinct from the
+global delay-`0` admission default even though both prevent automatic removal.
 
 The legacy `move_uploaded_vods` option archives media after a successful older
 upload workflow. It is technically separate and is never translated into the
