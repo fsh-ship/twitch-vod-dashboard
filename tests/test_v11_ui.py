@@ -1217,11 +1217,14 @@ class V11UiContractTests(unittest.TestCase):
         ):
             self.assertNotIn(label, TEMPLATE)
 
-    def test_queue_exposes_vod_oriented_sections_and_details(self) -> None:
+    def test_queue_exposes_process_oriented_sections_and_no_local_media_workspace(self) -> None:
+        queue_page = TEMPLATE.split('id="page-queue"', 1)[1].split('id="page-settings"', 1)[0]
         for heading in ("Running", "Up Next", "Needs Attention"):
-            self.assertIn(f">{heading}<", TEMPLATE)
-        self.assertIn(">Ready for Upload ", TEMPLATE)
-        self.assertIn("<summary>Completed ", TEMPLATE)
+            self.assertIn(f">{heading}<", queue_page)
+        self.assertIn("<summary>Completed ", queue_page)
+        self.assertNotIn("Ready for Upload", queue_page)
+        self.assertNotIn("Local VODs", queue_page)
+        self.assertNotIn("localVideoCards", queue_page)
         self.assertIn("queueItemsFromJobs", JAVASCRIPT)
         self.assertIn("downloadLogSegment", JAVASCRIPT)
         self.assertIn("Technical details", JAVASCRIPT)
@@ -1246,7 +1249,7 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn("Move Down", JAVASCRIPT)
         self.assertIn("Active work continues; no new item will start.", JAVASCRIPT)
 
-    def test_queue_operations_workspace_separates_lanes_and_keeps_local_media_temporary(self) -> None:
+    def test_queue_operations_workspace_separates_lanes_and_is_media_free(self) -> None:
         queue_page = TEMPLATE.split('id="page-queue"', 1)[1].split('id="page-settings"', 1)[0]
         for element_id in (
             "queueOperationalSummary",
@@ -1256,13 +1259,17 @@ class V11UiContractTests(unittest.TestCase):
             "queueWaitingDownloadsLane",
             "queueWaitingUploadsLane",
             "queueErrorsSection",
-            "readyForUploadSection",
             "queueCompletedDetails",
             "queueCancelledDetails",
         ):
             self.assertIn(f'id="{element_id}"', queue_page)
-        self.assertIn("Local VODs", queue_page)
-        self.assertIn("will move to VODs in the next slice", queue_page)
+        for local_media_id in (
+            "readyForUploadSection",
+            "localVideoCards",
+            "uploadSelectedLocalVideos",
+            "includeUploadedLocalVideos",
+        ):
+            self.assertNotIn(local_media_id, queue_page)
         self.assertIn("function queueOperationsView", JAVASCRIPT)
         self.assertIn("function renderQueueOperationLanes", JAVASCRIPT)
         self.assertIn("setQueueWorkspaceVisibility('queueWaitingSection', hasWaiting)", JAVASCRIPT)
@@ -1603,6 +1610,69 @@ process.stdout.write(JSON.stringify({idle, waiting}));
         self.assertNotIn('id="streamerMode"', TEMPLATE)
         self.assertNotIn('id="singleStreamer"', TEMPLATE)
 
+    def test_vod_workspace_tabs_are_mutually_exclusive_and_preserve_find_state(self) -> None:
+        if not NODE:
+            self.skipTest("Node.js is required for VOD tab UI tests")
+        runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function showVodWorkspaceTab');
+const end = source.indexOf('function selectedUrls', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('VOD tab helper not found');
+function element() {
+  const classes = new Set();
+  const attributes = new Map();
+  return {
+    hidden:false,
+    classList:{toggle(name, force) { if (force) classes.add(name); else classes.delete(name); }, contains(name) { return classes.has(name); }},
+    setAttribute(name, value) { attributes.set(name, String(value)); },
+    attribute(name) { return attributes.get(name); }
+  };
+}
+const elements = Object.fromEntries(['findVodsTab', 'localVodsTab', 'findVodsPanel', 'localVodsPanel'].map(id => [id, element()]));
+let loads = 0;
+function $(id) { return elements[id] || null; }
+function loadLocalVideos() { loads += 1; return Promise.resolve(); }
+eval(source.slice(start, end));
+const searchState = {datePreset:'last-7', streamers:['alpha'], resultCount:3};
+showVodWorkspaceTab('local');
+const local = {
+  findHidden:elements.findVodsPanel.hidden,
+  localHidden:elements.localVodsPanel.hidden,
+  findSelected:elements.findVodsTab.attribute('aria-selected'),
+  localSelected:elements.localVodsTab.attribute('aria-selected'),
+  findAriaHidden:elements.findVodsPanel.attribute('aria-hidden'),
+  localAriaHidden:elements.localVodsPanel.attribute('aria-hidden'),
+  loads
+};
+showVodWorkspaceTab('find');
+const find = {
+  findHidden:elements.findVodsPanel.hidden,
+  localHidden:elements.localVodsPanel.hidden,
+  findSelected:elements.findVodsTab.attribute('aria-selected'),
+  localSelected:elements.localVodsTab.attribute('aria-selected'),
+  searchState
+};
+process.stdout.write(JSON.stringify({local, find}));
+"""
+        completed = subprocess.run([NODE, "-e", runner], cwd=ROOT, encoding="utf-8", capture_output=True, check=False)
+        if completed.returncode != 0:
+            self.fail(completed.stderr or completed.stdout)
+        rendered = json.loads(completed.stdout)
+        self.assertTrue(rendered["local"]["findHidden"])
+        self.assertFalse(rendered["local"]["localHidden"])
+        self.assertEqual(rendered["local"]["findSelected"], "false")
+        self.assertEqual(rendered["local"]["localSelected"], "true")
+        self.assertEqual(rendered["local"]["findAriaHidden"], "true")
+        self.assertEqual(rendered["local"]["localAriaHidden"], "false")
+        self.assertEqual(rendered["local"]["loads"], 1)
+        self.assertFalse(rendered["find"]["findHidden"])
+        self.assertTrue(rendered["find"]["localHidden"])
+        self.assertEqual(rendered["find"]["findSelected"], "true")
+        self.assertEqual(rendered["find"]["localSelected"], "false")
+        self.assertEqual(rendered["find"]["searchState"], {"datePreset": "last-7", "streamers": ["alpha"], "resultCount": 3})
+        self.assertIn('.vod-workspace-panel[hidden] { display:none !important; }', STYLESHEET)
+
     def test_vod_date_presets_use_local_calendar_dates(self) -> None:
         ranges = _evaluate_vod_date_presets()
 
@@ -1676,12 +1746,103 @@ process.stdout.write(JSON.stringify({idle, waiting}));
         self.assertIn('class="rowcheck" type="checkbox"', JAVASCRIPT)
         self.assertIn("data-url=\"${escapeHtml(r.url)}\"", JAVASCRIPT)
 
-    def test_ready_for_upload_uses_compact_counts_and_no_manual_move(self) -> None:
+    def test_local_vods_workspace_owns_upload_controls_and_no_manual_move(self) -> None:
+        local_panel = TEMPLATE.split('id="localVodsPanel"', 1)[1].split('id="page-queue"', 1)[0]
         self.assertIn('id="workspacePending" class="heading-count"', TEMPLATE)
+        self.assertIn('id="localVodsFilter"', local_panel)
+        self.assertIn('id="localSelectionActions"', local_panel)
+        self.assertIn('id="uploadSelectedLocalVideos"', local_panel)
+        self.assertIn('id="includeUploadedLocalVideos"', local_panel)
+        self.assertIn('id="localVideosError"', local_panel)
         self.assertNotIn('id="workspaceTotal"', TEMPLATE)
         self.assertNotIn('id="workspaceSize"', TEMPLATE)
         self.assertNotIn("Move to Uploaded Archive", JAVASCRIPT)
         self.assertIn("Delete the local VOD file and its sidecars", JAVASCRIPT)
+        self.assertEqual(TEMPLATE.count('id="localVideoCards"'), 1)
+        self.assertEqual(TEMPLATE.count('id="uploadSelectedLocalVideos"'), 1)
+        self.assertIn("actions.hidden = selected === 0", JAVASCRIPT)
+        self.assertIn("Upload ${selected} VOD", JAVASCRIPT)
+
+    def test_local_vods_tab_loads_the_shared_media_loader_without_queue_visit(self) -> None:
+        self.assertIn("if (!find && typeof loadLocalVideos === 'function') loadLocalVideos().catch(() => {});", JAVASCRIPT)
+        self.assertIn("if (name === 'search' && !$('localVodsPanel')?.hidden && typeof loadLocalVideos === 'function') loadLocalVideos().catch(() => {});", JAVASCRIPT)
+        self.assertNotIn("name === 'queue' && typeof loadLocalVideos", JAVASCRIPT)
+        self.assertIn("/api/local-videos?include_uploaded=", JAVASCRIPT)
+        self.assertIn("localVideoCache = new Map", JAVASCRIPT)
+
+    def test_local_vod_filtering_preserves_manual_and_automatic_ownership(self) -> None:
+        if not NODE:
+            self.skipTest("Node.js is required for Local VOD UI tests")
+        runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function workspaceStatusClass');
+const end = source.indexOf('async function loadLocalVideos', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Local VOD renderer source not found');
+const UPLOADED_HISTORY_PAGE_SIZE = 20;
+function escapeHtml(value) { return String(value || ''); }
+function formatRemainingDuration(value) { return `${value} sec remaining`; }
+eval(source.slice(start, end));
+const manual = {path:'manual', local_file_exists:true, already_uploaded:false};
+const automatic = {path:'automatic', local_file_exists:true, auto_youtube_managed:true};
+const cleanup = {path:'cleanup', local_file_exists:true, auto_youtube_managed:true, auto_youtube_cleanup:{state:'scheduled'}};
+const attention = {path:'attention', local_file_exists:true, auto_youtube_managed:true, auto_youtube_cleanup:{state:'needs_attention'}};
+const uploaded = {path:'uploaded', local_file_exists:false, already_uploaded:true};
+const videos = [manual, automatic, cleanup, attention, uploaded];
+process.stdout.write(JSON.stringify({
+  states:videos.map(localVideoFilterState),
+  ready:localVideoRowsForView(videos, true, 'ready').map(item => item.path),
+  automatic:localVideoRowsForView(videos, true, 'automatic').map(item => item.path),
+  cleanup:localVideoRowsForView(videos, true, 'cleanup').map(item => item.path),
+  attention:localVideoRowsForView(videos, true, 'attention').map(item => item.path),
+  card:renderLocalVideoCard(automatic)
+}));
+"""
+        completed = subprocess.run([NODE, "-e", runner], cwd=ROOT, encoding="utf-8", capture_output=True, check=False)
+        if completed.returncode != 0:
+            self.fail(completed.stderr or completed.stdout)
+        rendered = json.loads(completed.stdout)
+        self.assertEqual(rendered["states"], ["ready", "automatic", "cleanup", "attention", "uploaded"])
+        self.assertEqual(rendered["ready"], ["manual"])
+        self.assertEqual(rendered["automatic"], ["automatic"])
+        self.assertEqual(rendered["cleanup"], ["cleanup"])
+        self.assertEqual(rendered["attention"], ["attention"])
+        self.assertIn(">Automatic<", rendered["card"])
+        self.assertNotIn('data-action="upload"', rendered["card"])
+
+    def test_local_vods_mobile_workspace_has_compact_structural_hooks(self) -> None:
+        self.assertIn(".local-vods-media-workspace", STYLESHEET)
+        self.assertIn(".local-selection-actions[hidden]", STYLESHEET)
+        self.assertIn(".local-vods-toolbar", STYLESHEET)
+        self.assertIn(".video-workspace-card .video-workflow", STYLESHEET)
+        self.assertIn("@media (max-width:430px)", STYLESHEET)
+        self.assertIn("Local media could not be loaded. Refresh to try again.", JAVASCRIPT)
+        self.assertIn("No local VODs are ready for manual upload.", JAVASCRIPT)
+
+    def test_empty_local_vods_hides_bulk_selection_control(self) -> None:
+        if not NODE:
+            self.skipTest("Node.js is required for Local VOD UI tests")
+        runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function updateLocalBulkSelectionControl');
+const end = source.indexOf('function workspaceStatusClass', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Local VOD bulk selection helper not found');
+const control = {hidden:false, disabled:false};
+function $(id) { return id === 'checkAllLocalVideos' ? control : null; }
+eval(source.slice(start, end));
+updateLocalBulkSelectionControl(false);
+const empty = {hidden:control.hidden, disabled:control.disabled};
+updateLocalBulkSelectionControl(true);
+const ready = {hidden:control.hidden, disabled:control.disabled};
+process.stdout.write(JSON.stringify({empty, ready}));
+"""
+        completed = subprocess.run([NODE, "-e", runner], cwd=ROOT, encoding="utf-8", capture_output=True, check=False)
+        if completed.returncode != 0:
+            self.fail(completed.stderr or completed.stdout)
+        rendered = json.loads(completed.stdout)
+        self.assertEqual(rendered["empty"], {"hidden": True, "disabled": True})
+        self.assertEqual(rendered["ready"], {"hidden": False, "disabled": False})
 
     def test_prepare_metadata_is_secondary_under_actions(self) -> None:
         self.assertNotIn('id="prepareSelectedLocalVideos"', TEMPLATE)

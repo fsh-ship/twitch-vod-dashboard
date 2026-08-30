@@ -330,7 +330,7 @@ function showPage(name) {
   window.vodShowPage(name);
   if (name === 'search') ensureSearchStreamerPickerStreamers();
   refreshDashboard().catch(() => {});
-  if (name === 'queue' && typeof loadLocalVideos === 'function') loadLocalVideos().catch(() => {});
+  if (name === 'search' && !$('localVodsPanel')?.hidden && typeof loadLocalVideos === 'function') loadLocalVideos().catch(() => {});
   if (typeof refreshSelectionState === 'function') refreshSelectionState();
 }
 
@@ -615,13 +615,25 @@ function updateVodFilterCount() {
 
 function showVodWorkspaceTab(name) {
   const find = name !== 'local';
-  $('findVodsTab')?.classList.toggle('active', find);
-  $('localVodsTab')?.classList.toggle('active', !find);
-  $('findVodsTab')?.setAttribute('aria-selected', find ? 'true' : 'false');
-  $('localVodsTab')?.setAttribute('aria-selected', find ? 'false' : 'true');
-  $('findVodsPanel')?.classList.toggle('active', find);
-  $('findVodsPanel').hidden = !find;
-  $('localVodsPanel').hidden = find;
+  const findTab = $('findVodsTab');
+  const localTab = $('localVodsTab');
+  const findPanel = $('findVodsPanel');
+  const localPanel = $('localVodsPanel');
+  findTab?.classList.toggle('active', find);
+  localTab?.classList.toggle('active', !find);
+  findTab?.setAttribute('aria-selected', find ? 'true' : 'false');
+  localTab?.setAttribute('aria-selected', find ? 'false' : 'true');
+  if (findPanel) {
+    findPanel.classList.toggle('active', find);
+    findPanel.hidden = !find;
+    findPanel.setAttribute('aria-hidden', find ? 'false' : 'true');
+  }
+  if (localPanel) {
+    localPanel.classList.toggle('active', !find);
+    localPanel.hidden = find;
+    localPanel.setAttribute('aria-hidden', find ? 'true' : 'false');
+  }
+  if (!find && typeof loadLocalVideos === 'function') loadLocalVideos().catch(() => {});
 }
 
 
@@ -3029,6 +3041,18 @@ function updateLocalUploadButton() {
   const selected = selectedLocalVideoPaths().length;
   const uploadBtn = $('uploadSelectedLocalVideos');
   if (uploadBtn) uploadBtn.disabled = selected === 0;
+  const actions = $('localSelectionActions');
+  if (actions) actions.hidden = selected === 0;
+  const summary = $('localSelectionSummary');
+  if (summary) summary.textContent = `${selected} VOD${selected === 1 ? '' : 's'} selected`;
+  if (uploadBtn) uploadBtn.textContent = selected ? `Upload ${selected} VOD${selected === 1 ? '' : 's'}` : 'Upload Selected';
+}
+
+function updateLocalBulkSelectionControl(hasSelectable) {
+  const selectReady = $('checkAllLocalVideos');
+  if (!selectReady) return;
+  selectReady.hidden = !hasSelectable;
+  selectReady.disabled = !hasSelectable;
 }
 
 function workspaceStatusClass(video) {
@@ -3068,6 +3092,29 @@ function localCleanupLabel(video) {
   return '';
 }
 
+function localVideoFilterState(video) {
+  const cleanupState = video?.auto_youtube_cleanup?.state;
+  if (cleanupState === 'needs_attention') return 'attention';
+  if (['scheduled', 'due', 'cleaning', 'removed', 'local_copy_missing'].includes(cleanupState)) return 'cleanup';
+  if (video?.already_uploaded) return 'uploaded';
+  if (video?.auto_youtube_managed) return 'automatic';
+  return 'ready';
+}
+
+function localVideoRowsForView(videos, includeUploaded, filter, historyLimit=UPLOADED_HISTORY_PAGE_SIZE) {
+  const visible = visibleLocalVideoRows(videos, includeUploaded, historyLimit);
+  return filter === 'all' ? visible : visible.filter(video => localVideoFilterState(video) === filter);
+}
+
+function localEmptyStateCopy(filter, includeUploaded) {
+  if (filter === 'ready') return 'No local VODs are ready for manual upload.';
+  if (filter === 'automatic') return 'No local VODs are managed by the automatic upload lifecycle.';
+  if (filter === 'cleanup') return 'No local VODs have cleanup scheduled.';
+  if (filter === 'attention') return 'No local VODs need attention.';
+  if (includeUploaded) return 'No matching local VODs or uploaded history found.';
+  return 'No local VODs found.';
+}
+
 function renderLocalVideoCard(v) {
   const uploaded = !!v.already_uploaded;
   const hasLocalFile = v.local_file_exists !== false;
@@ -3086,13 +3133,17 @@ function renderLocalVideoCard(v) {
     : cleanup.can_resume_cleanup
     ? `<button type="button" class="video-action" data-action="resume-cleanup" data-path="${escapeHtml(v.path)}">Allow automatic cleanup</button>`
     : '';
+  const workflow = autoYouTubeManaged ? 'Automatic' : uploaded ? 'History' : 'Manual';
+  const localState = cleanupLabel || (hasLocalFile
+    ? (uploaded ? 'Local copy available' : 'Local copy available')
+    : 'Local copy removed');
   return `<article class="video-workspace-card ${uploaded ? 'is-uploaded' : ''} ${hasLocalFile ? '' : 'is-local-removed'}" data-video-path="${escapeHtml(v.path)}">
     ${uploadable ? `<label class="video-select"><input class="localvideocheck" type="checkbox" data-path="${escapeHtml(v.path)}" checked><span>Select</span></label>` : `<span class="video-select muted">${autoYouTubeManaged ? 'Automatic' : 'History'}</span>`}
     <div class="video-person"><strong>${escapeHtml(v.streamer || 'Unknown streamer')}</strong><span>${escapeHtml(v.date_de || 'Unknown date')}</span></div>
     <strong class="video-display-title">${escapeHtml(v.title || v.youtube_title || v.name)}</strong>
     <span class="video-size">${hasLocalFile ? `${escapeHtml(v.size_gb)} GB` : 'Size unavailable'}</span>
-    <span class="metadata-status ${uploaded || v.prepared ? 'good' : 'muted'}">${secondaryStatus}${cleanupLabel ? `<small class="auto-youtube-cleanup-status">${escapeHtml(cleanupLabel)}</small>` : ''}</span>
-    <span class="pill ${statusClassName}">${escapeHtml(workspaceStatusLabel(v))}</span>
+    <span class="video-workflow ${autoYouTubeManaged ? 'accent' : 'muted'}">${workflow}<small>${escapeHtml(workspaceStatusLabel(v))}</small></span>
+    <span class="metadata-status ${statusClassName}">${escapeHtml(localState)}<small class="auto-youtube-cleanup-status">${escapeHtml(secondaryStatus)}</small></span>
     <div class="video-primary-actions">${uploadable ? `<button type="button" class="primary video-action" data-action="upload" data-path="${escapeHtml(v.path)}">Upload</button>` : ''}</div>
     ${hasLocalFile ? `<details class="technical-details secondary-actions"><summary>Actions</summary><div class="video-copy-actions"><button type="button" class="video-action" data-action="copy-title" data-path="${escapeHtml(v.path)}">Copy Title</button><button type="button" class="video-action" data-action="copy-description" data-path="${escapeHtml(v.path)}">Copy Description</button>${cleanupAction}${uploadable && !v.prepared ? `<button type="button" class="video-action" data-action="prepare" data-path="${escapeHtml(v.path)}">Prepare metadata</button>` : ''}${uploadable ? `<button type="button" class="video-action" data-action="mark" data-path="${escapeHtml(v.path)}">Mark as Uploaded</button>` : ''}</div><div class="danger-zone"><strong>Delete the local VOD file and its sidecars</strong><button type="button" class="danger-outline video-action" data-action="delete" data-path="${escapeHtml(v.path)}">Delete Permanently</button></div></details>` : '<span class="muted">Upload history retained; local actions are unavailable.</span>'}
   </article>`;
@@ -3107,47 +3158,62 @@ function visibleLocalVideoRows(videos, includeUploaded, historyLimit=UPLOADED_HI
 
 async function loadLocalVideos() {
   const includeUploaded = !!($('includeUploadedLocalVideos') && $('includeUploadedLocalVideos').checked);
-  const data = await api('/api/local-videos?include_uploaded=' + (includeUploaded ? '1' : '0'));
   const box = $('localVideoCards');
   const info = $('localVideosInfo');
+  const errorBox = $('localVideosError');
   if (!box) return;
+  try {
+    const data = await api('/api/local-videos?include_uploaded=' + (includeUploaded ? '1' : '0'));
+    const videos = Array.isArray(data.videos) ? data.videos.filter(video => video && typeof video === 'object') : [];
+    const counts = data.counts || {};
+    const filter = $('localVodsFilter')?.value || 'all';
+    localVideoCache = new Map(videos.filter(video => video.path).map(video => [video.path, video]));
+    const visibleVideos = localVideoRowsForView(videos, includeUploaded, filter, uploadedHistoryVisibleCount);
+    const uploadedCount = videos.filter(video => video.already_uploaded).length;
+    const hiddenUploadedCount = includeUploaded && filter === 'all'
+      ? Math.max(0, uploadedCount - uploadedHistoryVisibleCount)
+      : 0;
 
-  const videos = data.videos || [];
-  localVideoCache = new Map(videos.map(v => [v.path, v]));
-  const counts = data.counts || {};
-  const visibleVideos = visibleLocalVideoRows(
-    videos, includeUploaded, uploadedHistoryVisibleCount
-  );
-  const uploadedCount = videos.filter(video => video.already_uploaded).length;
-  const hiddenUploadedCount = includeUploaded
-    ? Math.max(0, uploadedCount - uploadedHistoryVisibleCount)
-    : 0;
+    if (errorBox) { errorBox.hidden = true; errorBox.textContent = ''; }
+    if ($('workspacePending')) $('workspacePending').textContent = String(counts.pending || 0);
+    if (info) {
+      const automatic = videos.filter(video => video.auto_youtube_managed && !video.already_uploaded).length;
+      info.textContent = includeUploaded
+        ? `${counts.pending || 0} ready · ${automatic} automatic · ${counts.uploaded || 0} uploaded or archived`
+        : `${counts.pending || 0} ready · ${automatic} automatic`;
+      info.className = 'inline-status muted';
+    }
 
-  if ($('workspacePending')) $('workspacePending').textContent = String(counts.pending || 0);
-  if (info) {
-    info.textContent = includeUploaded ? `${counts.pending || 0} ready · ${counts.uploaded || 0} uploaded or archived` : `${counts.pending || 0} ready for upload`;
-    info.className = 'inline-status muted';
-  }
+    if (!visibleVideos.length) {
+      box.innerHTML = `<div class="empty-workspace muted">${escapeHtml(localEmptyStateCopy(filter, includeUploaded))}</div>`;
+      updateLocalBulkSelectionControl(false);
+      updateLocalUploadButton();
+      return;
+    }
 
-  if (!videos.length) {
-    box.innerHTML = '<div class="empty-workspace muted">No matching VOD files found.</div>';
+    box.innerHTML = visibleVideos.map(renderLocalVideoCard).join('') + (
+      hiddenUploadedCount
+        ? `<button type="button" id="showMoreUploadedHistory" class="quiet-button show-more-upload-history">Show more · ${hiddenUploadedCount} older upload${hiddenUploadedCount === 1 ? '' : 's'}</button>`
+        : ''
+    );
+    box.querySelectorAll('.localvideocheck').forEach(cb => cb.addEventListener('change', updateLocalUploadButton));
+    box.querySelectorAll('.video-action').forEach(btn => btn.addEventListener('click', () => handleLocalVideoAction(btn.dataset.action, btn.dataset.path)));
+    const showMore = $('showMoreUploadedHistory');
+    if (showMore) showMore.addEventListener('click', () => {
+      uploadedHistoryVisibleCount += UPLOADED_HISTORY_PAGE_SIZE;
+      loadLocalVideos().catch(error => alert(error.message));
+    });
+    updateLocalBulkSelectionControl(box.querySelectorAll('.localvideocheck').length > 0);
     updateLocalUploadButton();
-    return;
+  } catch (error) {
+    localVideoCache = new Map();
+    if (info) info.textContent = 'Local media could not be loaded.';
+    if (errorBox) { errorBox.hidden = false; errorBox.textContent = error.message || 'Unable to load local media.'; }
+    box.innerHTML = '<div class="empty-workspace muted">Local media could not be loaded. Refresh to try again.</div>';
+    updateLocalBulkSelectionControl(false);
+    updateLocalUploadButton();
+    throw error;
   }
-
-  box.innerHTML = visibleVideos.map(renderLocalVideoCard).join('') + (
-    hiddenUploadedCount
-      ? `<button type="button" id="showMoreUploadedHistory" class="quiet-button show-more-upload-history">Show more · ${hiddenUploadedCount} older upload${hiddenUploadedCount === 1 ? '' : 's'}</button>`
-      : ''
-  );
-  document.querySelectorAll('.localvideocheck').forEach(cb => cb.addEventListener('change', updateLocalUploadButton));
-  document.querySelectorAll('.video-action').forEach(btn => btn.addEventListener('click', () => handleLocalVideoAction(btn.dataset.action, btn.dataset.path)));
-  const showMore = $('showMoreUploadedHistory');
-  if (showMore) showMore.addEventListener('click', () => {
-    uploadedHistoryVisibleCount += UPLOADED_HISTORY_PAGE_SIZE;
-    loadLocalVideos().catch(error => alert(error.message));
-  });
-  updateLocalUploadButton();
 }
 
 async function handleLocalVideoAction(action, path) {
@@ -3377,6 +3443,13 @@ $('searchStreamersNone').addEventListener('click', () => setAllSearchStreamers(f
 $('closeSearchStreamerPicker').addEventListener('click', () => closeSearchStreamerPicker({returnFocus:true}));
 $('findVodsTab').addEventListener('click', () => showVodWorkspaceTab('find'));
 $('localVodsTab').addEventListener('click', () => showVodWorkspaceTab('local'));
+[$('findVodsTab'), $('localVodsTab')].forEach((tab, index, tabs) => tab?.addEventListener('keydown', event => {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+  event.preventDefault();
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+  tabs[next]?.focus();
+  showVodWorkspaceTab(next === 0 ? 'find' : 'local');
+}));
 ['includeUnknownDates', 'strictDateFilter', 'excludeLiveStreams', 'onlyRealVodUrls'].forEach(id => $(id).addEventListener('change', updateVodFilterCount));
 $('searchBtn').addEventListener('click', () => searchVods().catch(e => alert(e.message)));
 $('checkAll').addEventListener('change', e => { document.querySelectorAll('.rowcheck').forEach(cb => cb.checked = e.target.checked); refreshSelectionState(); });
@@ -3494,6 +3567,8 @@ loadState().then(() => {
       document.querySelectorAll('.localvideocheck').forEach(cb => cb.checked = false);
       updateLocalUploadButton();
     };
+    const filter = document.getElementById('localVodsFilter');
+    if (filter) filter.onchange = function() { loadLocalVideos().catch(e => alert(e.message)); };
   });
 })();
 

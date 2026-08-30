@@ -113,7 +113,7 @@
             <button class="vod-tab active" id="findVodsTab" type="button" role="tab" aria-selected="true" aria-controls="findVodsPanel">Find VODs</button>
             <button class="vod-tab" id="localVodsTab" type="button" role="tab" aria-selected="false" aria-controls="localVodsPanel">Local VODs</button>
           </div>
-          <section class="vod-workspace-panel active" id="findVodsPanel" role="tabpanel" aria-labelledby="findVodsTab">
+          <section class="vod-workspace-panel active" id="findVodsPanel" role="tabpanel" aria-labelledby="findVodsTab" aria-hidden="false">
             <section class="card vod-search-workspace">
               <div class="vod-search-heading"><div><p class="eyebrow">Manual discovery</p><h2>Find VODs</h2><p class="muted">Search completed Twitch broadcasts, then choose eligible VODs to download.</p></div><button class="primary" id="searchBtn" type="button">Find VODs</button></div>
               <div class="vod-search-toolbar">
@@ -136,7 +136,21 @@
               <div class="table-wrap search-results-wrap"><table class="search-results-table"><thead><tr><th><input type="checkbox" id="checkAll" aria-label="Select all eligible results"></th><th>Date</th><th>Streamer</th><th>Title</th><th>Status</th><th>Link</th></tr></thead><tbody id="resultsBody"><tr><td colspan="6" class="muted">Run a manual search to see matching VODs.</td></tr></tbody></table></div>
             </section>
           </section>
-          <section class="vod-workspace-panel" id="localVodsPanel" role="tabpanel" aria-labelledby="localVodsTab" hidden><section class="card vod-local-placeholder"><h2>Local VODs</h2><p class="muted">Local media management will move here in a following slice. Ready for Upload remains in Queue for now.</p></section></section>
+          <section class="vod-workspace-panel local-vods-workspace" id="localVodsPanel" role="tabpanel" aria-labelledby="localVodsTab" aria-hidden="true" hidden>
+            <section class="card local-vods-media-workspace" aria-labelledby="localVodsTitle">
+              <div class="local-vods-heading"><div><p class="eyebrow">Local media</p><h2 id="localVodsTitle">Local VODs <span id="workspacePending" class="heading-count">0</span></h2><p class="muted">Review downloaded media, upload eligible VODs, and keep track of local retention.</p></div><button id="refreshLocalVideos" class="quiet-button" type="button">Refresh</button></div>
+              <div class="local-vods-toolbar">
+                <label class="local-vods-filter">View <select id="localVodsFilter"><option value="all">All local media</option><option value="ready">Ready to upload</option><option value="automatic">Automatic lifecycle</option><option value="cleanup">Cleanup scheduled</option><option value="attention">Needs attention</option></select></label>
+                <label class="inlinecheck local-uploaded-toggle"><input type="checkbox" id="includeUploadedLocalVideos"> Show uploaded history</label>
+                <button id="checkAllLocalVideos" class="quiet-button" type="button">Select ready VODs</button>
+              </div>
+              <div id="localVideosInfo" class="field-message muted" aria-live="polite">Local media has not been loaded yet.</div>
+              <div id="localVideosError" class="field-message bad" role="alert" hidden></div>
+              <div id="localSelectionActions" class="local-selection-actions" hidden aria-live="polite"><strong id="localSelectionSummary">0 VODs selected</strong><div class="button-row"><button id="uploadSelectedLocalVideos" class="primary" type="button" disabled>Upload Selected</button><button id="uncheckAllLocalVideos" class="quiet-button" type="button">Clear</button></div><label class="local-upload-playlist-field">Upload Playlist <select id="localUploadPlaylistId"><option value="" data-playlist-mode="streamer-default">Streamer Default</option><option value="" data-playlist-mode="no-playlist">No Playlist</option></select></label></div>
+              <div class="local-video-table-head" aria-hidden="true"><span>Select</span><span>Streamer / Date</span><span>Title</span><span>Size</span><span>Workflow</span><span>Local state</span><span>Action</span><span></span></div>
+              <div id="localVideoCards" class="video-workspace-grid"><div class="empty-workspace muted">Open Local VODs to load local media.</div></div>
+            </section>
+          </section>
         </section>
 
         <section class="page" id="page-queue">
@@ -167,13 +181,6 @@
           <section id="queueErrorsSection" class="queue-section queue-attention-section" aria-labelledby="queueErrorsTitle" hidden>
             <div class="queue-workspace-heading"><div><p class="eyebrow">Action required</p><h2 id="queueErrorsTitle">Needs Attention</h2></div><span id="queueFailed" class="section-count">0</span></div>
             <div id="queueErrors" class="queue-vod-list"></div>
-          </section>
-          <section class="queue-section queue-local-media-section" id="readyForUploadSection" aria-labelledby="readyForUploadTitle">
-            <div class="queue-workspace-heading"><div><p class="eyebrow">Temporary local media</p><h2 id="readyForUploadTitle">Local VODs <span id="workspacePending" class="heading-count">0</span></h2><p class="muted">Ready for Upload remains here for now. Local media management will move to VODs in the next slice.</p></div><button id="refreshLocalVideos" type="button">Refresh</button></div>
-            <div class="workspace-toolbar"><div class="button-row"><button id="uploadSelectedLocalVideos" class="primary" type="button" disabled>Upload Selected</button><button id="checkAllLocalVideos" type="button">Select All</button><button id="uncheckAllLocalVideos" type="button">Clear Selection</button></div><label class="local-upload-playlist-field">Upload Playlist <select id="localUploadPlaylistId"><option value="" data-playlist-mode="streamer-default">Streamer Default</option><option value="" data-playlist-mode="no-playlist">No Playlist</option></select></label><label class="inlinecheck"><input type="checkbox" id="includeUploadedLocalVideos"> Show Uploaded Archive</label></div>
-            <div id="localVideosInfo" class="field-message muted">Not loaded yet.</div>
-            <div class="local-video-table-head" aria-hidden="true"><span>Select</span><span>Streamer / Date</span><span>Title</span><span>Size</span><span>Metadata</span><span>Status</span><span>Action</span><span></span></div>
-            <div id="localVideoCards" class="video-workspace-grid"><div class="empty-workspace muted">No uploads are waiting.</div></div>
           </section>
           <section class="queue-section queue-history-section completed-section" aria-label="Queue history">
             <div class="completed-history-heading"><details id="queueCompletedDetails"><summary>Completed <span id="queueDone">0</span></summary><div id="queueCompleted" class="queue-vod-list muted">No completed jobs.</div></details><button id="clearCompletedJobs" class="quiet-button hidden" type="button" aria-label="Clear completed job history" disabled>Clear completed history</button></div>
