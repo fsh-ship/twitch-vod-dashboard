@@ -299,6 +299,7 @@ let liveStatusLastUpdatedAt = null;
 let liveRecordingJobs = [];
 let liveRecordingActions = new Map();
 let autoRecorderStatusSnapshot = null;
+let autoVodStatusSnapshot = null;
 
 const LIVE_STATUS_CONCURRENCY = 2;
 const AUTO_RECORDER_STATUS_REFRESH_MS = 15000;
@@ -448,6 +449,9 @@ function renderState() {
   renderSearchStreamerCheckboxes();
   updateVodFilterCount();
   syncLiveStreamers(state.streamers);
+  renderDashboardVodAutomation();
+  renderDashboardLiveRecording();
+  renderDashboardLiveSummary();
 }
 
 function escapeHtml(s) {
@@ -902,6 +906,7 @@ function autoVodStatusPresentation(snapshot) {
 
 async function refreshAutoVodStatus() {
   let snapshot; try { snapshot = await api('/api/auto-vod/status'); } catch { snapshot = {unavailable:true}; }
+  autoVodStatusSnapshot = snapshot;
   const box = $('autoVodStatus'); if (!box) return snapshot; const view = autoVodStatusPresentation(snapshot);
   box.className = `auto-recorder-status is-${view.kind}`;
   const title = box.querySelector('strong'), detail = box.querySelector('span');
@@ -909,6 +914,7 @@ async function refreshAutoVodStatus() {
   if (detail) detail.textContent = view.detail;
   const checkNow = $('checkAutoVodNow');
   if (checkNow) checkNow.disabled = snapshot.initialized !== true || snapshot.running !== true || snapshot.enabled !== true;
+  renderDashboardVodAutomation(snapshot);
   return snapshot;
 }
 
@@ -955,6 +961,7 @@ function renderAutoRecorderStatus(snapshot=autoRecorderStatusSnapshot) {
   const view = autoRecorderStatusPresentation(snapshot);
   box.className = `auto-recorder-status is-${view.kind}`;
   box.innerHTML = `<strong>${escapeHtml(view.title)}</strong><span>${escapeHtml(view.detail)}</span>`;
+  renderDashboardLiveRecording(snapshot);
   if (liveStreamers.length) renderLiveStreams();
 }
 
@@ -1100,6 +1107,24 @@ function liveStreamSummaryText(featured, offline) {
   return `${liveCount} Live · ${recordingCount} Recording · ${offline.length} Offline`;
 }
 
+function renderDashboardLiveSummary() {
+  const summary = $('dashboardLiveSummary');
+  const names = $('dashboardLiveNames');
+  if (!summary || !names) return;
+  if (!liveStreamers.length) {
+    summary.textContent = 'No streamers configured.';
+    names.innerHTML = '';
+    return;
+  }
+  const live = liveStreamers.filter(streamer => {
+    const login = canonicalStreamerLoginClient(streamer);
+    return liveStreamStatuses.get(login)?.state === 'live';
+  });
+  const recordings = liveRecordingJobs.filter(job => ACTIVE_RECORDING_STATES.has(job?.state)).length;
+  summary.textContent = `${live.length} Live · ${recordings} Recording`;
+  names.innerHTML = live.slice(0, 3).map(streamer => `<span><i aria-hidden="true"></i>${escapeHtml(streamer)}</span>`).join('') + (live.length > 3 ? `<span>+${live.length - 3} more</span>` : '');
+}
+
 function renderLiveStreamCard(streamer) {
   const login = canonicalStreamerLoginClient(streamer);
   const status = liveStreamStatuses.get(login) || {state:'unknown', streamer:login};
@@ -1177,7 +1202,7 @@ function renderLiveStreams() {
   const activeSection = activeBox?.closest('.active-recordings-section');
   if (!liveStreamers.length) {
     if (summary) summary.textContent = '0 Live · 0 Recording · 0 Offline';
-    if (dashboardSummary) dashboardSummary.textContent = 'No streamers configured.';
+    renderDashboardLiveSummary();
     if (activeBox) activeBox.innerHTML = '<div class="live-stream-empty muted">No active recordings.</div>';
     activeSection?.classList.add('is-empty');
     box.innerHTML = '<div class="live-stream-empty muted">No streamers are configured. Add streamers in Settings.</div>';
@@ -1201,6 +1226,7 @@ function renderLiveStreams() {
   const summaryText = liveStreamSummaryText(featured, offline);
   if (summary) summary.textContent = summaryText;
   if (dashboardSummary) dashboardSummary.textContent = summaryText.replace(/ · \d+ Offline$/, '');
+  renderDashboardLiveSummary();
   const initialCheckPending = liveStatusLastUpdatedAt === null && (
     liveStatusRefreshPromise !== null
     || liveStatusRequests.size > 0
@@ -2685,33 +2711,221 @@ async function pollJobs() {
 }
 
 
+function dashboardStatusKind(kind) {
+  return ({running:'healthy', starting:'checking', paused:'paused', degraded:'attention', unavailable:'unavailable', loading:'loading'})[kind] || 'loading';
+}
+
+function setDashboardStatus(cardId, statusId, view) {
+  const card = $(cardId);
+  const box = $(statusId);
+  if (!card || !box) return;
+  const kind = view.kind || 'loading';
+  const statusKind = dashboardStatusKind(kind);
+  card.dataset.status = statusKind;
+  const dot = card.querySelector('.dashboard-status-dot');
+  if (dot) dot.className = `dashboard-status-dot is-${statusKind}`;
+  box.className = `dashboard-status-copy is-${statusKind}`;
+  box.innerHTML = `<strong>${escapeHtml(view.title || 'Checking…')}</strong><span>${escapeHtml(view.detail || '')}</span>`;
+}
+
+function dashboardVodAutomationView(snapshot) {
+  if (!snapshot) return {kind:'loading', title:'Checking…', detail:'Loading monitor status.', metrics:[]};
+  const status = autoVodStatusPresentation(snapshot);
+  const kind = status.kind === 'running' && snapshot.in_progress ? 'starting' : status.kind;
+  const title = ({running:'Healthy', starting:'Checking…', paused:'Paused', degraded:'Needs attention', unavailable:'Unavailable'})[kind] || 'Checking…';
+  const profiles = state?.settings?.streamer_profiles;
+  const streamers = Array.isArray(state?.streamers) ? state.streamers : [];
+  const metrics = [];
+  if (snapshot.initialized === true && Number.isFinite(Number(snapshot.watched_count))) metrics.push(`${Number(snapshot.watched_count)} monitored`);
+  if (profiles && streamers.length) {
+    let downloadAndYoutube = 0, downloadOnly = 0;
+    streamers.forEach(streamer => {
+      const profile = profiles[canonicalStreamerLoginClient(streamer)] || {};
+      if (profile.auto_vod_download === true && profile.auto_youtube_upload === true) downloadAndYoutube += 1;
+      else if (profile.auto_vod_download === true) downloadOnly += 1;
+    });
+    if (downloadAndYoutube) metrics.push(`${downloadAndYoutube} Download + YouTube`);
+    if (downloadOnly) metrics.push(`${downloadOnly} Download only`);
+  }
+  return {kind, title, detail:status.detail, metrics};
+}
+
+function renderDashboardVodAutomation(snapshot=autoVodStatusSnapshot) {
+  const view = dashboardVodAutomationView(snapshot);
+  setDashboardStatus('dashboardVodAutomationCard', 'autoVodStatus', view);
+  const metrics = $('dashboardVodAutomationMetrics');
+  if (metrics) metrics.innerHTML = (view.metrics || []).map(metric => `<span>${escapeHtml(metric)}</span>`).join('');
+}
+
+function dashboardLiveRecordingView(snapshot=autoRecorderStatusSnapshot) {
+  if (!snapshot) return {kind:'loading', title:'Checking…', detail:'Loading monitor status.', metrics:[]};
+  const status = autoRecorderStatusPresentation(snapshot);
+  const kind = status.kind === 'running' ? 'running' : status.kind;
+  const title = ({running:'Healthy', starting:'Checking…', paused:'Paused', degraded:'Needs attention', unavailable:'Unavailable', loading:'Checking…'})[kind] || 'Checking…';
+  const metrics = [];
+  if (snapshot.unavailable !== true && Number.isFinite(Number(snapshot.watched_count))) metrics.push(`${Number(snapshot.watched_count)} monitored`);
+  const recordings = liveRecordingJobs.filter(job => ACTIVE_RECORDING_STATES.has(job?.state)).length;
+  metrics.push(`${recordings} recording now`);
+  return {kind, title, detail:status.detail, metrics};
+}
+
+function renderDashboardLiveRecording(snapshot=autoRecorderStatusSnapshot) {
+  const view = dashboardLiveRecordingView(snapshot);
+  setDashboardStatus('dashboardLiveRecordingCard', 'dashboardLiveRecordingStatus', view);
+  const metrics = $('dashboardLiveRecordingMetrics');
+  if (metrics) metrics.innerHTML = (view.metrics || []).map(metric => `<span>${escapeHtml(metric)}</span>`).join('');
+}
+
+function dashboardQueueView(queue) {
+  const operational = (queue || []).filter(item => item.job?.type !== 'recording');
+  const active = operational.filter(item => item.state === 'running' || item.state === 'cancelling');
+  const waiting = operational.filter(item => item.state === 'waiting');
+  const unresolvedErrors = operational.filter(item => item.state === 'error' && !item.resolved);
+  const errors = [...unresolvedErrors, ...operational.filter(item => item.state === 'interrupted' && !item.resolved)];
+  const downloads = active.filter(item => item.job?.type === 'download').length;
+  const uploads = active.filter(item => item.job?.type === 'youtube_upload').length;
+  const title = errors.length ? 'Needs attention' : active.length ? `${active.length} running` : waiting.length ? 'Waiting' : 'Healthy';
+  const detail = errors.length ? `${errors.length} item${errors.length === 1 ? '' : 's'} need review.` : active.length ? 'Queue is processing work.' : waiting.length ? `${waiting.length} item${waiting.length === 1 ? '' : 's'} waiting to start.` : 'No active or waiting work.';
+  const metrics = [];
+  if (downloads) metrics.push(`${downloads} download${downloads === 1 ? '' : 's'}`);
+  if (uploads) metrics.push(`${uploads} upload${uploads === 1 ? '' : 's'}`);
+  if (waiting.length) metrics.push(`${waiting.length} waiting`);
+  if (errors.length) metrics.push(`${errors.length} error${errors.length === 1 ? '' : 's'}`);
+  return {kind:errors.length ? 'degraded' : 'running', title, detail, metrics, active, waiting, errors};
+}
+
+function dashboardYoutubeView(youtube={}) {
+  if (youtube.google_libs_available === false) return {kind:'unavailable', title:'Unavailable', detail:'Required YouTube libraries are not available.', metrics:[]};
+  if (youtube.connected === true) {
+    const metrics = state?.settings?.youtube_privacy_status ? [`Default ${state.settings.youtube_privacy_status}`] : [];
+    return {kind:'running', title:'Connected', detail:youtube.channel_title ? `Connected as ${youtube.channel_title}` : 'Connection is ready.', metrics};
+  }
+  const enabled = state?.settings?.youtube_enabled === true;
+  return {kind:enabled ? 'degraded' : 'paused', title:enabled ? 'Needs attention' : 'Not connected', detail:enabled ? 'Connect YouTube before starting an upload.' : 'Connect YouTube when uploads are needed.', metrics:[]};
+}
+
+function renderDashboardSystemOverview(data={}, queue=[]) {
+  const queueView = dashboardQueueView(queue);
+  setDashboardStatus('dashboardQueueCard', 'dashboardQueueStatus', queueView);
+  const queueMetrics = $('dashboardQueueMetrics');
+  if (queueMetrics) queueMetrics.innerHTML = queueView.metrics.map(metric => `<span>${escapeHtml(metric)}</span>`).join('');
+  const youtubeView = dashboardYoutubeView(data.youtube || {});
+  setDashboardStatus('dashboardYoutubeCard', 'dashboardYoutubeStatus', youtubeView);
+  const youtubeMetrics = $('dashboardYoutubeMetrics');
+  if (youtubeMetrics) youtubeMetrics.innerHTML = youtubeView.metrics.map(metric => `<span>${escapeHtml(metric)}</span>`).join('');
+  const disk = data.disk || {};
+  const storageCard = $('dashboardStorageCard');
+  if (storageCard) {
+    const free = Number(disk.free_gb), total = Number(disk.total_gb);
+    const available = disk.ok === true && Number.isFinite(free) && Number.isFinite(total);
+    storageCard.hidden = !available;
+    if (available) {
+      const low = free < 50;
+      setDashboardStatus('dashboardStorageCard', 'dashboardStorageStatus', {
+        kind:low ? 'degraded' : 'running', title:low ? 'Low space' : 'Available', detail:`${free.toFixed(1)} GB free of ${total.toFixed(1)} GB`
+      });
+    }
+  }
+  renderDashboardVodAutomation();
+  renderDashboardLiveRecording();
+  return queueView;
+}
+
+function dashboardLifecycleHtml(item) {
+  const playlist = item.job?.auto_youtube_playlist;
+  const cleanup = item.job?.auto_youtube_cleanup;
+  if (item.job?.origin !== 'auto_youtube' || (!playlist && !cleanup)) return '';
+  const uploadState = item.state === 'completed' ? 'complete' : 'current';
+  const playlistLabel = playlist?.state === 'playlist_added' ? 'Playlist added' : playlist?.state === 'needs_attention' ? 'Playlist review' : playlist?.state === 'playlist_pending' ? 'Playlist pending' : '';
+  const cleanupLabel = cleanup?.state === 'removed' ? 'Local copy removed' : cleanup?.state === 'scheduled' ? 'Cleanup scheduled' : cleanup?.state === 'needs_attention' ? 'Cleanup review' : '';
+  return `<div class="dashboard-lifecycle" aria-label="Automatic YouTube lifecycle"><span class="is-${uploadState}">YouTube upload</span>${playlistLabel ? `<span class="is-${playlist?.state === 'needs_attention' ? 'attention' : 'pending'}">${escapeHtml(playlistLabel)}</span>` : ''}${cleanupLabel ? `<span class="is-${cleanup?.state === 'needs_attention' ? 'attention' : 'pending'}">${escapeHtml(cleanupLabel)}</span>` : ''}</div>`;
+}
+
+function dashboardActivityCardHtml(item) {
+  const lane = item.job?.type === 'youtube_upload' ? 'Upload' : 'Download';
+  const progress = Number(item.progress);
+  const hasProgress = Number.isFinite(progress);
+  return `<article class="dashboard-activity-card is-${lane.toLowerCase()}"><div class="dashboard-activity-card-head"><span class="dashboard-activity-lane">${lane}</span><span class="pill accent">${escapeHtml(item.operation || 'Running')}</span></div><strong>${escapeHtml(item.streamer || item.title || 'Current item')}</strong><span class="dashboard-activity-title">${escapeHtml(item.title || item.filename || item.job?.label || '')}</span>${hasProgress ? `<div class="dashboard-activity-progress"><span><strong>${Math.max(0, Math.min(100, progress)).toFixed(progress % 1 ? 1 : 0)}%</strong><small>${escapeHtml(item.extra || '')}</small></span><div class="progress-bar"><span style="width:${Math.max(0, Math.min(100, progress))}%"></span></div></div>` : `<span class="dashboard-activity-detail">${escapeHtml(item.extra || item.operation || 'Processing')}</span>`}${dashboardLifecycleHtml(item)}</article>`;
+}
+
+function dashboardCurrentActivityState(queueView={}) {
+  const active = queueView.active || [];
+  const waiting = queueView.waiting || [];
+  return {active, waiting, idle:!active.length && !waiting.length};
+}
+
+function renderDashboardCurrentActivity(queueView) {
+  const box = $('dashboardRunning');
+  const count = $('dashboardActivityCount');
+  if (!box) return;
+  const section = $('dashboardRunningSection');
+  const {active, waiting, idle} = dashboardCurrentActivityState(queueView);
+  section?.classList.toggle('is-idle', idle);
+  box.classList.toggle('muted', idle);
+  box.classList.toggle('dashboard-activity-idle', idle);
+  box.innerHTML = active.length ? active.slice(0, 2).map(dashboardActivityCardHtml).join('') : idle ? 'Nothing is running right now.' : 'No downloads or uploads are currently running.';
+  if (count) {
+    count.hidden = idle;
+    count.textContent = active.length ? `· ${active.length} running` : waiting.length ? `· ${waiting.length} waiting` : '';
+  }
+  const upcoming = $('dashboardUpcomingSection');
+  const upcomingBox = $('dashboardUpcoming');
+  if (upcoming && upcomingBox) {
+    upcoming.hidden = !waiting.length;
+    upcomingBox.innerHTML = waiting.length ? waiting.slice(0, 3).map(item => `<span>${escapeHtml(item.operation || 'Waiting')} · ${escapeHtml(item.streamer || item.title || item.job?.label || 'Queue item')}</span>`).join('') : '';
+  }
+}
+
+function dashboardAttentionIssues(queueView, data={}) {
+  const issues = [];
+  if (queueView.errors.length) issues.push({kind:'danger', title:`${queueView.errors.length} queue item${queueView.errors.length === 1 ? '' : 's'} need attention`, detail:queueView.errors[0].title || queueView.errors[0].job?.label || 'Review the affected Queue item.', page:'queue', label:'Open Queue'});
+  const vod = dashboardVodAutomationView(autoVodStatusSnapshot);
+  if (vod.kind === 'degraded') issues.push({kind:'warning', title:'VOD Automation needs attention', detail:vod.detail, page:'settings', target:'streamers', label:'Review Streamers'});
+  const live = dashboardLiveRecordingView(autoRecorderStatusSnapshot);
+  if (live.kind === 'degraded') issues.push({kind:'warning', title:'Live Recording needs attention', detail:live.detail, page:'live', label:'View Live'});
+  const youtube = dashboardYoutubeView(data.youtube || {});
+  if (youtube.kind === 'degraded') issues.push({kind:'warning', title:'YouTube is not connected', detail:youtube.detail, page:'settings', target:'youtube', label:'Open YouTube Settings'});
+  const disk = data.disk || {};
+  if (disk.ok === true && Number(disk.free_gb) < 50) issues.push({kind:'warning', title:'Storage is running low', detail:`${Number(disk.free_gb).toFixed(1)} GB is available for VOD downloads.`, page:'settings', target:'advanced', label:'Review Settings'});
+  return issues;
+}
+
+function renderDashboardAttention(queueView, data={}) {
+  const section = $('dashboardAttentionSection');
+  const box = $('dashboardAlerts');
+  if (!section || !box) return;
+  const issues = dashboardAttentionIssues(queueView, data);
+  section.hidden = !issues.length;
+  if (!issues.length) {
+    box.innerHTML = '';
+    return;
+  }
+  box.innerHTML = issues.map(issue => `<article class="dashboard-attention-row is-${issue.kind}"><div><strong>${escapeHtml(issue.title)}</strong><span>${escapeHtml(issue.detail)}</span></div><button type="button" class="goto-page quiet-button" data-page="${escapeHtml(issue.page)}"${issue.target ? ` data-settings-target="${escapeHtml(issue.target)}"` : ''}>${escapeHtml(issue.label)}</button></article>`).join('');
+}
+
+function wireDashboardNavigation() {
+  document.querySelectorAll('#page-dashboard .goto-page').forEach(button => button.onclick = () => {
+    showPage(button.dataset.page);
+    if (button.dataset.settingsTarget) showSettingsTab(button.dataset.settingsTarget);
+  });
+}
+
 async function refreshDashboard() {
   try {
     const [data, jobsData] = await Promise.all([api('/api/dashboard'), api('/api/jobs')]);
-    const yt = data.youtube || {};
-    const disk = data.disk || {};
     const queue = queueItemsFromJobs(jobsData.jobs || []);
     updateLiveRecordingJobs(jobsData.jobs || []);
-    const running = queue.filter(item => item.state === 'running' || item.state === 'cancelling');
-    const waiting = queue.filter(item => item.state === 'waiting');
-    const errors = queue.filter(item => item.state === 'error' && !item.resolved);
-    const hasActivity = running.length > 0 || waiting.length > 0;
-    renderQueueGroup('dashboardRunning', running.slice(0, 4), 'No downloads or uploads are currently running.', true);
-    renderQueueGroup('dashboardUpcoming', waiting.slice(0, 5), 'Nothing is waiting.', true);
-    $('dashboardRunningSection').classList.toggle('hidden', !hasActivity);
-    $('dashboardUpcomingSection').classList.toggle('hidden', !hasActivity);
-
-    const alerts = [];
-    if (errors.length) alerts.push(`<article class="action-alert bad-alert"><div><strong>${errors.length} VOD${errors.length === 1 ? '' : 's'} need attention</strong><span>${escapeHtml(errors[0].title || errors[0].job.label)}${errors.length > 1 ? ` and ${errors.length - 1} more` : ''}</span></div><button type="button" class="goto-page" data-page="queue">View Error${errors.length === 1 ? '' : 's'}</button></article>`);
-    if (state && state.settings && state.settings.youtube_enabled && !yt.connected) alerts.push('<article class="action-alert warn-alert"><div><strong>YouTube is not connected</strong><span>Connect YouTube before starting an upload.</span></div><button type="button" class="goto-page" data-page="settings" data-settings-target="youtube">Open YouTube Settings</button></article>');
-    if (disk.ok && disk.free_gb < 50) alerts.push(`<article class="action-alert warn-alert"><div><strong>Storage is running low</strong><span>${escapeHtml(disk.free_gb)} GB is available for VOD downloads.</span></div><button type="button" class="goto-page" data-page="settings" data-settings-target="advanced">Review Settings</button></article>`);
-    $('dashboardAlerts').innerHTML = alerts.join('');
-    document.querySelectorAll('#page-dashboard .goto-page').forEach(btn => btn.onclick = () => {
-      showPage(btn.dataset.page);
-      if (btn.dataset.settingsTarget) showSettingsTab(btn.dataset.settingsTarget);
-    });
-  } catch (e) {
-    if ($('dashboardAlerts')) $('dashboardAlerts').innerHTML = `<article class="action-alert bad-alert"><div><strong>Dashboard status could not be loaded</strong><span>${escapeHtml(e.message)}</span></div></article>`;
+    const queueView = renderDashboardSystemOverview(data, queue);
+    renderDashboardCurrentActivity(queueView);
+    renderDashboardAttention(queueView, data);
+    wireDashboardNavigation();
+  } catch (error) {
+    const section = $('dashboardAttentionSection');
+    const box = $('dashboardAlerts');
+    if (section && box) {
+      section.hidden = false;
+      box.innerHTML = `<article class="dashboard-attention-row is-danger"><div><strong>Dashboard status could not be loaded</strong><span>${escapeHtml(error.message)}</span></div></article>`;
+    }
   }
 }
 

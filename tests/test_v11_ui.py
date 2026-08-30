@@ -227,6 +227,40 @@ process.stdout.write(JSON.stringify({loaded, loading, failed, empty}));
     return json.loads(completed.stdout)
 
 
+def _evaluate_dashboard_queue_views() -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for dashboard UI tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function dashboardQueueView');
+const end = source.indexOf('function dashboardYoutubeView', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Dashboard queue helpers not found');
+eval(source.slice(start, end));
+const download = {state:'running', job:{type:'download'}, operation:'Downloading'};
+const upload = {state:'running', job:{type:'youtube_upload'}, operation:'Uploading to YouTube'};
+const waiting = {state:'waiting', job:{type:'download'}, operation:'Waiting to download'};
+const failure = {state:'error', resolved:false, job:{type:'youtube_upload'}, operation:'YouTube upload failed'};
+const resolved = {state:'error', resolved:true, job:{type:'download'}, operation:'Download failed'};
+process.stdout.write(JSON.stringify({
+  simultaneous: dashboardQueueView([download, upload, waiting]),
+  oneLane: dashboardQueueView([download]),
+  idle: dashboardQueueView([]),
+  attention: dashboardQueueView([failure, resolved])
+}));
+"""
+    completed = subprocess.run(
+        [NODE, "-e", runner],
+        cwd=ROOT,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
 def _classify_download_jobs(
     jobs: list[dict], results: list[dict] | None = None
 ) -> list[dict]:
@@ -1212,11 +1246,123 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn("Move Down", JAVASCRIPT)
         self.assertIn("Active work continues; no new item will start.", JAVASCRIPT)
 
-    def test_dashboard_idle_state_is_conditional_and_compact(self) -> None:
+    def test_dashboard_idle_state_is_intentional_and_compact(self) -> None:
         self.assertIn('id="dashboardRunningSection"', TEMPLATE)
         self.assertIn('id="dashboardUpcomingSection"', TEMPLATE)
-        self.assertIn("const hasActivity = running.length > 0 || waiting.length > 0", JAVASCRIPT)
-        self.assertIn("classList.toggle('hidden', !hasActivity)", JAVASCRIPT)
+        self.assertIn("Nothing is running right now.", JAVASCRIPT)
+        self.assertIn("const {active, waiting, idle} = dashboardCurrentActivityState(queueView);", JAVASCRIPT)
+        self.assertIn("upcoming.hidden = !waiting.length", JAVASCRIPT)
+        self.assertIn("count.hidden = idle", JAVASCRIPT)
+        self.assertIn(".heading-count[hidden] { display:none !important; }", STYLESHEET)
+        self.assertIn(".dashboard-upcoming[hidden] { display:none !important; }", STYLESHEET)
+        self.assertIn("Current Activity", TEMPLATE)
+
+    def test_dashboard_empty_sections_and_overview_layout_have_explicit_hooks(self) -> None:
+        self.assertIn("section.hidden = !issues.length", JAVASCRIPT)
+        self.assertIn("box.innerHTML = '';", JAVASCRIPT)
+        self.assertIn(".dashboard-attention[hidden] { display:none; }", STYLESHEET)
+        self.assertIn(".dashboard-overview-grid { display:grid; grid-template-columns:repeat(5, minmax(0,1fr));", STYLESHEET)
+        self.assertIn("#dashboardStorageCard { grid-column:1 / -1; min-height:92px; }", STYLESHEET)
+
+    def test_dashboard_activity_state_distinguishes_idle_and_waiting_work(self) -> None:
+        if not NODE:
+            self.skipTest("Node.js is required for dashboard activity UI tests")
+        runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function dashboardCurrentActivityState');
+const end = source.indexOf('function renderDashboardCurrentActivity', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Dashboard activity helper not found');
+eval(source.slice(start, end));
+process.stdout.write(JSON.stringify({
+  idle: dashboardCurrentActivityState({active:[], waiting:[]}),
+  waiting: dashboardCurrentActivityState({active:[], waiting:[{id:'waiting'}]}),
+  active: dashboardCurrentActivityState({active:[{id:'active'}], waiting:[]})
+}));
+"""
+        completed = subprocess.run([NODE, "-e", runner], cwd=ROOT, encoding="utf-8", capture_output=True, check=False)
+        if completed.returncode != 0:
+            self.fail(completed.stderr or completed.stdout)
+        states = json.loads(completed.stdout)
+        self.assertTrue(states["idle"]["idle"])
+        self.assertFalse(states["waiting"]["idle"])
+        self.assertFalse(states["active"]["idle"])
+
+    def test_dashboard_activity_render_hides_idle_dom_and_restores_waiting_up_next(self) -> None:
+        if not NODE:
+            self.skipTest("Node.js is required for dashboard activity UI tests")
+        runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function dashboardCurrentActivityState');
+const end = source.indexOf('function dashboardAttentionIssues', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Dashboard activity renderer not found');
+const elements = {};
+for (const id of ['dashboardRunningSection','dashboardRunning','dashboardActivityCount','dashboardUpcomingSection','dashboardUpcoming']) {
+  elements[id] = {hidden:false, innerHTML:'', textContent:'', classList:{toggle(){}}};
+}
+function $(id) { return elements[id]; }
+function escapeHtml(value) { return String(value).replace(/[&<>\"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[character])); }
+eval(source.slice(start, end));
+renderDashboardCurrentActivity({active:[], waiting:[]});
+const idle = {countHidden:elements.dashboardActivityCount.hidden, upcomingHidden:elements.dashboardUpcomingSection.hidden, copy:elements.dashboardRunning.innerHTML};
+renderDashboardCurrentActivity({active:[], waiting:[{operation:'Waiting', streamer:'demo'}]});
+const waiting = {countHidden:elements.dashboardActivityCount.hidden, upcomingHidden:elements.dashboardUpcomingSection.hidden, upcoming:elements.dashboardUpcoming.innerHTML};
+process.stdout.write(JSON.stringify({idle, waiting}));
+"""
+        completed = subprocess.run([NODE, "-e", runner], cwd=ROOT, encoding="utf-8", capture_output=True, check=False)
+        if completed.returncode != 0:
+            self.fail(completed.stderr or completed.stdout)
+        rendered = json.loads(completed.stdout)
+        self.assertTrue(rendered["idle"]["countHidden"])
+        self.assertTrue(rendered["idle"]["upcomingHidden"])
+        self.assertEqual(rendered["idle"]["copy"], "Nothing is running right now.")
+        self.assertFalse(rendered["waiting"]["countHidden"])
+        self.assertFalse(rendered["waiting"]["upcomingHidden"])
+        self.assertIn("demo", rendered["waiting"]["upcoming"])
+
+    def test_dashboard_control_center_sections_and_safe_shortcuts(self) -> None:
+        dashboard_page = TEMPLATE.split('id="page-dashboard"', 1)[1].split('id="page-live"', 1)[0]
+        for section_id in (
+            "dashboardOverviewTitle",
+            "dashboardAttentionSection",
+            "dashboardRunningSection",
+            "dashboardLiveTitle",
+            "dashboardQuickActionsTitle",
+        ):
+            self.assertIn(section_id, dashboard_page)
+        for label in ("VOD Automation", "Live Recording", "Queue", "YouTube", "Quick Actions"):
+            self.assertIn(label, dashboard_page)
+        self.assertIn('data-page="search"', dashboard_page)
+        self.assertIn('data-page="queue"', dashboard_page)
+        self.assertIn('data-page="live"', dashboard_page)
+        self.assertNotIn("Start Recording", dashboard_page)
+        self.assertNotIn("Stop Recording", dashboard_page)
+        self.assertEqual(TEMPLATE.count('id="dashboardAlerts"'), 1)
+
+    def test_dashboard_queue_presentations_cover_parallel_idle_and_attention_states(self) -> None:
+        views = _evaluate_dashboard_queue_views()
+
+        self.assertEqual(views["simultaneous"]["title"], "2 running")
+        self.assertIn("1 download", views["simultaneous"]["metrics"])
+        self.assertIn("1 upload", views["simultaneous"]["metrics"])
+        self.assertIn("1 waiting", views["simultaneous"]["metrics"])
+        self.assertEqual(views["oneLane"]["title"], "1 running")
+        self.assertEqual(views["idle"]["title"], "Healthy")
+        self.assertEqual(views["idle"]["detail"], "No active or waiting work.")
+        self.assertEqual(views["attention"]["kind"], "degraded")
+        self.assertEqual(len(views["attention"]["errors"]), 1)
+
+    def test_dashboard_uses_status_specific_data_without_legacy_automation_presentation(self) -> None:
+        self.assertIn("function dashboardVodAutomationView", JAVASCRIPT)
+        self.assertIn("title:'Unavailable'", JAVASCRIPT)
+        self.assertIn("function dashboardAttentionIssues", JAVASCRIPT)
+        self.assertIn("function dashboardLifecycleHtml", JAVASCRIPT)
+        self.assertIn("item.job?.origin !== 'auto_youtube'", JAVASCRIPT)
+        self.assertIn("function renderDashboardLiveSummary", JAVASCRIPT)
+        self.assertIn("renderDashboardVodAutomation();", JAVASCRIPT)
+        self.assertIn("renderDashboardLiveRecording();", JAVASCRIPT)
+        self.assertIn("renderDashboardLiveSummary();", JAVASCRIPT)
 
     def test_search_diagnostics_are_not_in_normal_results(self) -> None:
         self.assertIn("Technical search details", TEMPLATE)

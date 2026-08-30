@@ -41,20 +41,51 @@
 
       <main>
         <section class="page active" id="page-dashboard">
-          <section id="dashboardAlerts" class="dashboard-alerts" aria-live="polite"></section>
-          <section class="card dashboard-live-summary" aria-labelledby="dashboardLiveTitle">
-            <div class="section-heading"><div><p class="eyebrow">Live</p><h2 id="dashboardLiveTitle">Live status</h2><p id="dashboardLiveSummary" class="muted" aria-live="polite">Checking configured streamers…</p></div><button type="button" class="goto-page quiet-button" data-page="live">View Live</button></div>
+          <section class="dashboard-overview" aria-labelledby="dashboardOverviewTitle">
+            <div class="dashboard-section-heading"><div><p class="eyebrow">System overview</p><h2 id="dashboardOverviewTitle">Operations at a glance</h2></div></div>
+            <div class="dashboard-overview-grid">
+              <article class="dashboard-status-card" id="dashboardVodAutomationCard">
+                <div class="dashboard-card-heading"><span class="dashboard-card-label">VOD Automation</span><span class="dashboard-status-dot is-loading" aria-hidden="true"></span></div>
+                <div id="autoVodStatus" class="dashboard-status-copy is-loading" role="status" aria-live="polite"><strong>Checking…</strong><span>Loading monitor status.</span></div>
+                <div id="dashboardVodAutomationMetrics" class="dashboard-card-metrics"></div>
+                <button type="button" class="quiet-button dashboard-card-action" id="checkAutoVodNow" disabled>Check now</button>
+              </article>
+              <article class="dashboard-status-card" id="dashboardLiveRecordingCard">
+                <div class="dashboard-card-heading"><span class="dashboard-card-label">Live Recording</span><span class="dashboard-status-dot is-loading" aria-hidden="true"></span></div>
+                <div id="dashboardLiveRecordingStatus" class="dashboard-status-copy is-loading" role="status" aria-live="polite"><strong>Checking…</strong><span>Loading monitor status.</span></div>
+                <div id="dashboardLiveRecordingMetrics" class="dashboard-card-metrics"></div>
+              </article>
+              <article class="dashboard-status-card" id="dashboardQueueCard">
+                <div class="dashboard-card-heading"><span class="dashboard-card-label">Queue</span><span class="dashboard-status-dot is-loading" aria-hidden="true"></span></div>
+                <div id="dashboardQueueStatus" class="dashboard-status-copy is-loading" role="status"><strong>Checking…</strong><span>Loading queue status.</span></div>
+                <div id="dashboardQueueMetrics" class="dashboard-card-metrics"></div>
+              </article>
+              <article class="dashboard-status-card" id="dashboardYoutubeCard">
+                <div class="dashboard-card-heading"><span class="dashboard-card-label">YouTube</span><span class="dashboard-status-dot is-loading" aria-hidden="true"></span></div>
+                <div id="dashboardYoutubeStatus" class="dashboard-status-copy is-loading" role="status"><strong>Checking…</strong><span>Loading connection status.</span></div>
+                <div id="dashboardYoutubeMetrics" class="dashboard-card-metrics"></div>
+              </article>
+              <article class="dashboard-status-card" id="dashboardStorageCard" hidden>
+                <div class="dashboard-card-heading"><span class="dashboard-card-label">Storage</span><span class="dashboard-status-dot" aria-hidden="true"></span></div>
+                <div id="dashboardStorageStatus" class="dashboard-status-copy" role="status"></div>
+              </article>
+            </div>
           </section>
-          <section class="card dashboard-automation-summary">
-            <div class="section-heading"><div id="autoVodStatus" class="auto-recorder-status is-loading" role="status" aria-live="polite"><strong>Auto VOD · Checking…</strong><span>Loading monitor status.</span></div><button type="button" class="quiet-button" id="checkAutoVodNow" disabled>Check now</button></div>
+          <section id="dashboardAttentionSection" class="dashboard-attention" aria-labelledby="dashboardAttentionTitle" hidden>
+            <div class="dashboard-section-heading"><div><p class="eyebrow">Action required</p><h2 id="dashboardAttentionTitle">Needs Attention</h2></div></div>
+            <div id="dashboardAlerts" class="dashboard-alerts" aria-live="polite"></div>
           </section>
-          <section class="card" id="dashboardRunningSection">
-            <div class="section-heading"><div><p class="eyebrow">Current activity</p><h2>Running</h2></div><button type="button" class="goto-page quiet-button" data-page="queue">View Queue</button></div>
-            <div id="dashboardRunning" class="activity-list muted">No downloads or uploads are currently running.</div>
+          <section class="dashboard-current-activity" id="dashboardRunningSection" aria-labelledby="dashboardActivityTitle">
+            <div class="dashboard-section-heading"><div><p class="eyebrow">Current activity</p><h2 id="dashboardActivityTitle">Current Activity <span id="dashboardActivityCount" class="heading-count"></span></h2></div><button type="button" class="goto-page quiet-button" data-page="queue">Open Queue</button></div>
+            <div id="dashboardRunning" class="dashboard-activity-list muted">Checking current activity…</div>
+            <div id="dashboardUpcomingSection" class="dashboard-upcoming" hidden><p class="dashboard-upcoming-title">Up next</p><div id="dashboardUpcoming" class="dashboard-upcoming-list"></div></div>
           </section>
-          <section class="card" id="dashboardUpcomingSection">
-            <div class="section-heading"><div><p class="eyebrow">Waiting</p><h2>Up Next</h2></div></div>
-            <div id="dashboardUpcoming" class="activity-list muted">Nothing is waiting.</div>
+          <section class="dashboard-live-summary" aria-labelledby="dashboardLiveTitle">
+            <div class="dashboard-section-heading"><div><p class="eyebrow">Live now</p><h2 id="dashboardLiveTitle">Live summary</h2><p id="dashboardLiveSummary" class="muted" aria-live="polite">Checking configured streamers…</p><div id="dashboardLiveNames" class="dashboard-live-names"></div></div><button type="button" class="goto-page quiet-button" data-page="live">View Live</button></div>
+          </section>
+          <section class="dashboard-quick-actions" aria-labelledby="dashboardQuickActionsTitle">
+            <div class="dashboard-section-heading"><div><p class="eyebrow">Shortcuts</p><h2 id="dashboardQuickActionsTitle">Quick Actions</h2></div></div>
+            <div class="dashboard-quick-action-list"><button type="button" class="goto-page" data-page="search">Find VODs</button><button type="button" class="goto-page" data-page="live">View Live</button><button type="button" class="goto-page" data-page="queue">Open Queue</button><button type="button" class="goto-page" data-page="settings" data-settings-target="streamers">Manage Streamers</button><button type="button" class="goto-page" data-page="settings" data-settings-target="youtube">YouTube Settings</button></div>
           </section>
         </section>
 

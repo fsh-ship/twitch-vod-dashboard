@@ -639,7 +639,8 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertIn("Downloaded and uploaded media are not deleted.", TEMPLATE)
         self.assertNotIn("completed in this session", TEMPLATE.lower())
         self.assertNotIn("cancelled in this session", TEMPLATE.lower())
-        self.assertLess(TEMPLATE.index("Running"), TEMPLATE.index("Needs Attention"))
+        queue_page = TEMPLATE.split('id="page-queue"', 1)[1].split('id="page-settings"', 1)[0]
+        self.assertLess(queue_page.index("Running"), queue_page.index("Needs Attention"))
         self.assertIn("@media (max-width:430px)", STYLESHEET)
         self.assertIn("min-height:44px", STYLESHEET)
 
