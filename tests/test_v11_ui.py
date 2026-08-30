@@ -747,6 +747,19 @@ class _IdParser(HTMLParser):
 
 
 class V11UiContractTests(unittest.TestCase):
+    def test_design_foundation_exposes_semantic_tokens_and_shared_controls(self) -> None:
+        for token in (
+            "--surface-app:", "--surface-panel:", "--border-default:",
+            "--text-primary:", "--text-muted:", "--color-accent:",
+            "--color-success:", "--color-warning:", "--color-danger:",
+            "--color-info:", "--space-1:", "--radius-md:", "--shadow-sm:",
+            "--focus-ring:", "--control-height:",
+        ):
+            self.assertIn(token, STYLESHEET)
+        self.assertIn("@media (prefers-reduced-motion:reduce)", STYLESHEET)
+        self.assertIn("button:active:not(:disabled)", STYLESHEET)
+        self.assertIn("input:not([type=\"checkbox\"]):not([type=\"radio\"])", STYLESHEET)
+
     def test_live_streams_section_uses_configured_streamers_and_safe_states(self) -> None:
         result = _evaluate_live_stream_ui()
 
@@ -919,11 +932,11 @@ class V11UiContractTests(unittest.TestCase):
     def test_auto_recorder_status_states_are_truthful_and_compact(self) -> None:
         result = _evaluate_live_stream_ui()["autoRecorderViews"]
 
-        self.assertEqual(result["loading"]["title"], "Auto Recorder · Checking…")
-        self.assertEqual(result["running"]["title"], "Auto Recorder · Running")
+        self.assertEqual(result["loading"]["title"], "Automatic Live Recording · Checking…")
+        self.assertEqual(result["running"]["title"], "Automatic Live Recording · Running")
         self.assertIn("Watching 4", result["running"]["detail"])
         self.assertIn("Last checked", result["running"]["detail"])
-        self.assertEqual(result["paused"]["title"], "Auto Recorder · Paused")
+        self.assertEqual(result["paused"]["title"], "Automatic Live Recording · Paused")
         self.assertEqual(result["paused"]["detail"], "4 streamers selected")
         self.assertEqual(result["zero"]["kind"], "running")
         self.assertEqual(result["zero"]["detail"], "No streamers selected")
@@ -931,10 +944,10 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("State file invalid", result["degraded"]["detail"])
         self.assertIn("paused for safety", result["degraded"]["detail"])
         self.assertEqual(
-            result["failed"]["title"], "Auto Recorder status unavailable"
+            result["failed"]["title"], "Automatic Live Recording status unavailable"
         )
         self.assertNotIn("Paused", result["failed"]["title"])
-        self.assertEqual(result["native"]["title"], "Auto Recorder · Unavailable")
+        self.assertEqual(result["native"]["title"], "Automatic Live Recording · Unavailable")
 
     def test_live_cards_explain_auto_recording_without_competing_with_live_state(self) -> None:
         result = _evaluate_live_stream_ui()
@@ -1015,21 +1028,64 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn(".offline-stream-grid[hidden] { display:none; }", STYLESHEET)
 
     def test_primary_navigation_is_task_oriented(self) -> None:
-        buttons = re.findall(
-            r'class="nav-btn(?: active)?" data-page="([^"]+)">([^<]+)</button>',
-            TEMPLATE,
-        )
+        buttons = re.findall(r'class="nav-btn(?: active)?" data-page="([^"]+)"[^>]*>.*?<span>([^<]+)</span></button>', TEMPLATE)
         self.assertEqual(
             buttons,
             [
                 ("dashboard", "Dashboard"),
-                ("search", "Search VODs"),
+                ("search", "VODs"),
+                ("live", "Live"),
                 ("queue", "Queue"),
                 ("settings", "Settings"),
             ],
         )
+        live_page = TEMPLATE.split('id="page-live"', 1)[1].split('id="page-search"', 1)[0]
+        dashboard_page = TEMPLATE.split('id="page-dashboard"', 1)[1].split('id="page-live"', 1)[0]
+        self.assertIn('id="page-live"', TEMPLATE)
+        self.assertNotIn("Live management is moving here", TEMPLATE)
+        self.assertIn('id="liveStreamsSection"', live_page)
+        self.assertIn('id="liveActiveRecordings"', live_page)
+        self.assertIn('id="autoRecorderStatus"', live_page)
+        self.assertIn('id="refreshLiveStatuses"', live_page)
+        self.assertNotIn('id="liveStreamsSection"', dashboard_page)
+        self.assertNotIn('id="liveStreamsList"', dashboard_page)
+        self.assertIn('id="dashboardLiveSummary"', dashboard_page)
+        self.assertIn("No active recordings.", live_page)
+        self.assertEqual(TEMPLATE.count('id="liveStreamsList"'), 1)
+        self.assertEqual(TEMPLATE.count('id="autoRecorderStatus"'), 1)
+        self.assertEqual(TEMPLATE.count('id="refreshLiveStatuses"'), 1)
+        self.assertIn("search: ['VODs', 'Find, download, and manage Twitch VODs.']", JAVASCRIPT)
+        self.assertIn("live: ['Live', 'Monitor live streamers and recordings.']", JAVASCRIPT)
+        self.assertIn("btn.setAttribute('aria-current', 'page')", JAVASCRIPT)
+        self.assertIn('aria-current="page"', TEMPLATE)
         self.assertNotIn("Ready for another VOD?", TEMPLATE)
         self.assertNotIn('id="dashboardIdle"', TEMPLATE)
+
+    def test_mobile_navigation_drawer_has_keyboard_and_backdrop_hooks(self) -> None:
+        self.assertIn('id="sidebarBackdrop"', TEMPLATE)
+        self.assertIn('aria-controls="appSidebar" aria-expanded="false"', TEMPLATE)
+        self.assertIn("const closeMobileNav", JAVASCRIPT)
+        self.assertIn("const openMobileNav", JAVASCRIPT)
+        self.assertIn("event.key === 'Escape'", JAVASCRIPT)
+        self.assertIn("backdrop.addEventListener('click'", JAVASCRIPT)
+        self.assertIn("firstNavItem.focus()", JAVASCRIPT)
+        self.assertIn("if (returnFocus) toggle.focus()", JAVASCRIPT)
+        self.assertIn(".sidebar-backdrop", STYLESHEET)
+
+    def test_live_workspace_uses_dense_rows_and_a_compact_recording_empty_state(self) -> None:
+        self.assertIn('active-recordings-section is-empty', TEMPLATE)
+        self.assertIn("const activeSection = activeBox?.closest('.active-recordings-section');", JAVASCRIPT)
+        self.assertIn("activeSection?.classList.toggle('is-empty', !activeRecordings.length);", JAVASCRIPT)
+        self.assertIn('class="live-stream-primary"', JAVASCRIPT)
+        self.assertIn('class="live-stream-details"', JAVASCRIPT)
+        self.assertIn('class="live-stream-footer"', JAVASCRIPT)
+        self.assertIn('class="live-stream-metadata"', JAVASCRIPT)
+        self.assertIn("No active recordings.", TEMPLATE + JAVASCRIPT)
+        self.assertIn("#page-live .live-stream-grid { grid-template-columns:minmax(0, 1fr);", STYLESHEET)
+        self.assertIn("#page-live .active-recordings-section.is-empty", STYLESHEET)
+        self.assertIn("#page-live .live-stream-footer { display:grid;", STYLESHEET)
+        self.assertIn("#page-live .live-stream-actions button {\n    width:auto;", STYLESHEET)
+        self.assertIn("#page-live .live-stream-name { min-width:0;", STYLESHEET)
 
     def test_settings_sections_replace_old_primary_pages(self) -> None:
         self.assertEqual(

@@ -242,7 +242,8 @@ const MANUAL_UPLOAD_DEFAULT_FILENAME_TEMPLATE = '{date_de} - {streamer} - {title
 
 const pageMetaEarly = {
     dashboard: ['Dashboard', 'What needs attention and what is happening now.'],
-    search: ['Search VODs', 'Choose a date range and streamers, then select VODs to download.'],
+    search: ['VODs', 'Find, download, and manage Twitch VODs.'],
+    live: ['Live', 'Monitor live streamers and recordings.'],
     queue: ['Queue', 'Follow individual VODs from download through YouTube upload.'],
     settings: ['Settings', 'Manage downloads, streamers, YouTube, and advanced options.']
   };
@@ -252,7 +253,10 @@ const pageMetaEarly = {
       page.classList.toggle('active', page.id === 'page-' + name);
     });
     document.querySelectorAll('.nav-btn').forEach(function(btn) {
-      btn.classList.toggle('active', btn.dataset.page === name);
+      const active = btn.dataset.page === name;
+      btn.classList.toggle('active', active);
+      if (active) btn.setAttribute('aria-current', 'page');
+      else btn.removeAttribute('aria-current');
     });
     const meta = pageMetaEarly[name];
     if (byId('pageTitle')) byId('pageTitle').textContent = meta[0];
@@ -304,7 +308,8 @@ const MANUAL_UPLOAD_DEFAULT_FILENAME_TEMPLATE = '{date_de} - {streamer} - {title
 
 const pageMeta = {
   dashboard: ['Dashboard', 'What needs attention and what is happening now.'],
-  search: ['Search VODs', 'Choose a date range and streamers, then select VODs to download.'],
+  search: ['VODs', 'Find, download, and manage Twitch VODs.'],
+  live: ['Live', 'Monitor live streamers and recordings.'],
   queue: ['Queue', 'Follow individual VODs from download through YouTube upload.'],
   settings: ['Settings', 'Manage downloads, streamers, YouTube, and advanced options.']
 };
@@ -785,10 +790,10 @@ async function refreshAutoVodStatus() {
 
 function autoRecorderStatusPresentation(snapshot) {
   if (!snapshot) {
-    return {kind:'loading', title:'Auto Recorder · Checking…', detail:'Loading monitor status.'};
+    return {kind:'loading', title:'Automatic Live Recording · Checking…', detail:'Loading monitor status.'};
   }
   if (snapshot.unavailable === true) {
-    return {kind:'unavailable', title:'Auto Recorder status unavailable', detail:'Will retry automatically.'};
+    return {kind:'unavailable', title:'Automatic Live Recording status unavailable', detail:'Will retry automatically.'};
   }
   const watched = Math.max(0, Number(snapshot.watched_count) || 0);
   const selectedText = `${watched} streamer${watched === 1 ? '' : 's'} selected`;
@@ -798,24 +803,24 @@ function autoRecorderStatusPresentation(snapshot) {
       : ['state_persistence_failed', 'unreadable_state'].includes(snapshot.last_error_code)
         ? 'State file unavailable'
         : 'Monitor error';
-    return {kind:'degraded', title:'Auto Recorder · Degraded', detail:`${reason} · automatic recordings are paused for safety.`};
+    return {kind:'degraded', title:'Automatic Live Recording · Degraded', detail:`${reason} · automatic recordings are paused for safety.`};
   }
   if (snapshot.enabled !== true) {
-    return {kind:'paused', title:'Auto Recorder · Paused', detail:selectedText};
+    return {kind:'paused', title:'Automatic Live Recording · Paused', detail:selectedText};
   }
   if (snapshot.running !== true) {
-    return {kind:'unavailable', title:'Auto Recorder · Unavailable', detail:'Production monitor is not running.'};
+    return {kind:'unavailable', title:'Automatic Live Recording · Unavailable', detail:'Production monitor is not running.'};
   }
   if (snapshot.phase === 'starting') {
-    return {kind:'starting', title:'Auto Recorder · Starting', detail:selectedText};
+    return {kind:'starting', title:'Automatic Live Recording · Starting', detail:selectedText};
   }
   if (watched === 0) {
-    return {kind:'running', title:'Auto Recorder · Running', detail:'No streamers selected'};
+    return {kind:'running', title:'Automatic Live Recording · Running', detail:'No streamers selected'};
   }
   const checkedAt = formatAutoRecorderTimestamp(snapshot.last_check_completed_at);
   return {
     kind:'running',
-    title:'Auto Recorder · Running',
+    title:'Automatic Live Recording · Running',
     detail:`Watching ${watched}${checkedAt ? ` · Last checked ${checkedAt}` : ' · Awaiting first check'}`
   };
 }
@@ -1002,8 +1007,8 @@ function renderLiveStreamCard(streamer) {
   } else if (status.state === 'live' && !activeHere) {
     actionHtml = `<button type="button" class="primary live-recording-start" data-streamer="${escapeHtml(login)}" ${canStart ? '' : 'disabled'} title="${escapeHtml(startDisabledReason)}">Start Recording</button>`;
   }
-  const secondary = [
-    title ? `<span class="live-stream-title">${escapeHtml(title)}</span>` : '',
+  const titleHtml = title ? `<span class="live-stream-title">${escapeHtml(title)}</span>` : '';
+  const metadata = [
     started ? `<span class="live-stream-time">Live since ${escapeHtml(started)}</span>` : '',
     (activeHere || terminalHere) ? `<span class="live-recording-status">${escapeHtml(recordingStatusText(job))}</span>` : '',
     autoStartedNote ? `<span class="live-auto-origin-note">${escapeHtml(autoStartedNote)}</span>` : '',
@@ -1015,11 +1020,9 @@ function renderLiveStreamCard(streamer) {
   return `<article class="live-stream-card is-${stateClass}" data-live-streamer="${escapeHtml(login)}">
     <div class="live-stream-indicator" aria-hidden="true"></div>
     <div class="live-stream-copy">
-      <span class="live-stream-state">${escapeHtml(statusLabel)}</span>
-      <strong class="live-stream-name">${escapeHtml(streamer)}</strong>
-      ${secondary}
+      <div class="live-stream-primary"><span class="live-stream-state">${escapeHtml(statusLabel)}</span><strong class="live-stream-name">${escapeHtml(streamer)}</strong></div>
+      <div class="live-stream-details">${titleHtml}<div class="live-stream-footer"><div class="live-stream-metadata">${metadata}</div><div class="live-stream-actions">${actionHtml}</div></div></div>
     </div>
-    <div class="live-stream-actions">${actionHtml}</div>
   </article>`;
 }
 
@@ -1045,8 +1048,14 @@ function renderLiveStreams() {
   const box = $('liveStreamsList');
   if (!box) return;
   const summary = $('liveStreamsSummary');
+  const dashboardSummary = $('dashboardLiveSummary');
+  const activeBox = $('liveActiveRecordings');
+  const activeSection = activeBox?.closest('.active-recordings-section');
   if (!liveStreamers.length) {
     if (summary) summary.textContent = '0 Live · 0 Recording · 0 Offline';
+    if (dashboardSummary) dashboardSummary.textContent = 'No streamers configured.';
+    if (activeBox) activeBox.innerHTML = '<div class="live-stream-empty muted">No active recordings.</div>';
+    activeSection?.classList.add('is-empty');
     box.innerHTML = '<div class="live-stream-empty muted">No streamers are configured. Add streamers in Settings.</div>';
     return;
   }
@@ -1065,7 +1074,9 @@ function renderLiveStreams() {
         && !liveStreamerIsFeatured(item.streamer);
     })
     .map(item => item.streamer);
-  if (summary) summary.textContent = liveStreamSummaryText(featured, offline);
+  const summaryText = liveStreamSummaryText(featured, offline);
+  if (summary) summary.textContent = summaryText;
+  if (dashboardSummary) dashboardSummary.textContent = summaryText.replace(/ · \d+ Offline$/, '');
   const initialCheckPending = liveStatusLastUpdatedAt === null && (
     liveStatusRefreshPromise !== null
     || liveStatusRequests.size > 0
@@ -1075,8 +1086,21 @@ function renderLiveStreams() {
       return state === 'unknown' || state === 'checking';
     })
   );
-  const liveContent = featured.length
-    ? `<div class="live-stream-grid${featured.length === 1 ? ' is-single' : ''}">${featured.map(streamer => renderLiveStreamCard(streamer)).join('')}</div>`
+  const activeRecordings = featured.filter(streamer => {
+    const job = recordingJobForStreamer(streamer);
+    return !!job && ACTIVE_RECORDING_STATES.has(job.state);
+  });
+  const liveNow = activeBox
+    ? featured.filter(streamer => !activeRecordings.includes(streamer))
+    : featured;
+  if (activeBox) {
+    activeSection?.classList.toggle('is-empty', !activeRecordings.length);
+    activeBox.innerHTML = activeRecordings.length
+      ? `<div class="live-stream-grid live-active-recording-grid${activeRecordings.length === 1 ? ' is-single' : ''}">${activeRecordings.map(streamer => renderLiveStreamCard(streamer)).join('')}</div>`
+      : '<div class="live-stream-empty muted">No active recordings.</div>';
+  }
+  const liveContent = liveNow.length
+    ? `<div class="live-stream-grid${liveNow.length === 1 ? ' is-single' : ''}">${liveNow.map(streamer => renderLiveStreamCard(streamer)).join('')}</div>`
     : `<div class="live-stream-empty muted">${initialCheckPending ? 'Checking live status…' : 'No configured streamer is currently live.'}</div>`;
   const offlineContent = offline.length
     ? `<section class="offline-streams">
@@ -1087,12 +1111,13 @@ function renderLiveStreams() {
       </section>`
     : '';
   box.innerHTML = liveContent + offlineContent;
-  box.querySelectorAll('.live-recording-start').forEach(button => button.addEventListener('click', () => {
+  const actionRoots = [box, activeBox].filter(Boolean);
+  actionRoots.forEach(root => root.querySelectorAll('.live-recording-start').forEach(button => button.addEventListener('click', () => {
     startLiveRecording(button.dataset.streamer).catch(() => {});
-  }));
-  box.querySelectorAll('.live-recording-stop').forEach(button => button.addEventListener('click', () => {
+  })));
+  actionRoots.forEach(root => root.querySelectorAll('.live-recording-stop').forEach(button => button.addEventListener('click', () => {
     stopLiveRecording(button.dataset.jobId, button.dataset.streamer).catch(() => {});
-  }));
+  })));
   box.querySelector('.offline-streams-toggle')?.addEventListener('click', toggleOfflineStreamers);
 }
 
@@ -3117,16 +3142,37 @@ document.addEventListener('DOMContentLoaded', function() {
 
   const toggle = document.getElementById('mobileNavToggle');
   const sidebar = document.getElementById('appSidebar');
+  const backdrop = document.getElementById('sidebarBackdrop');
   if (toggle && sidebar) {
-    toggle.addEventListener('click', () => {
-      const open = sidebar.classList.toggle('mobile-open');
-      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-      toggle.textContent = open ? 'Close' : 'Menu';
-    });
-    sidebar.querySelectorAll('.nav-btn').forEach(btn => btn.addEventListener('click', () => {
+    const closeMobileNav = function(returnFocus) {
       sidebar.classList.remove('mobile-open');
+      if (backdrop) backdrop.hidden = true;
       toggle.setAttribute('aria-expanded', 'false');
       toggle.textContent = 'Menu';
+      if (returnFocus) toggle.focus();
+    };
+    const openMobileNav = function() {
+      sidebar.classList.add('mobile-open');
+      if (backdrop) backdrop.hidden = false;
+      toggle.setAttribute('aria-expanded', 'true');
+      toggle.textContent = 'Close menu';
+      const firstNavItem = sidebar.querySelector('.nav-btn');
+      if (firstNavItem) firstNavItem.focus();
+    };
+    toggle.addEventListener('click', () => {
+      const open = sidebar.classList.contains('mobile-open');
+      if (open) closeMobileNav(true);
+      else openMobileNav();
+    });
+    if (backdrop) backdrop.addEventListener('click', () => closeMobileNav(true));
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && sidebar.classList.contains('mobile-open')) {
+        event.preventDefault();
+        closeMobileNav(true);
+      }
+    });
+    sidebar.querySelectorAll('.nav-btn').forEach(btn => btn.addEventListener('click', () => {
+      if (sidebar.classList.contains('mobile-open')) closeMobileNav(false);
     }));
   }
 });

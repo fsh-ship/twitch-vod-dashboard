@@ -18,10 +18,11 @@
         <div><h1>Twitch VOD Dashboard</h1><p>Find, download, and upload VODs</p></div>
       </div>
       <nav class="nav" aria-label="Primary navigation">
-        <button type="button" class="nav-btn active" data-page="dashboard">Dashboard</button>
-        <button type="button" class="nav-btn" data-page="search">Search VODs</button>
-        <button type="button" class="nav-btn" data-page="queue">Queue</button>
-        <button type="button" class="nav-btn" data-page="settings">Settings</button>
+        <button type="button" class="nav-btn active" data-page="dashboard" aria-current="page"><span class="nav-icon" aria-hidden="true">⌂</span><span>Dashboard</span></button>
+        <button type="button" class="nav-btn" data-page="search"><span class="nav-icon" aria-hidden="true">▣</span><span>VODs</span></button>
+        <button type="button" class="nav-btn" data-page="live"><span class="nav-icon" aria-hidden="true">◉</span><span>Live</span></button>
+        <button type="button" class="nav-btn" data-page="queue"><span class="nav-icon" aria-hidden="true">↻</span><span>Queue</span></button>
+        <button type="button" class="nav-btn" data-page="settings"><span class="nav-icon" aria-hidden="true">⚙</span><span>Settings</span></button>
       </nav>
       {% if not auth_disabled %}
       <form action="/logout" method="post" class="logout-form">
@@ -30,6 +31,7 @@
       </form>
       {% endif %}
     </aside>
+    <div class="sidebar-backdrop" id="sidebarBackdrop" hidden aria-hidden="true"></div>
 
     <div class="content-shell">
       <header class="topbar">
@@ -40,28 +42,11 @@
       <main>
         <section class="page active" id="page-dashboard">
           <section id="dashboardAlerts" class="dashboard-alerts" aria-live="polite"></section>
-          <section class="card live-streams-section" id="liveStreamsSection">
-            <div class="section-heading live-streams-heading">
-              <div><p class="eyebrow">Manual recorder</p><h2>Live Streams</h2><p class="muted">Check configured Twitch channels and start one recording at a time.</p></div>
-              <div class="live-heading-statuses">
-                <div id="autoRecorderStatus" class="auto-recorder-status is-loading" role="status" aria-live="polite">
-                  <strong>Auto Recorder · Checking…</strong>
-                  <span>Loading monitor status.</span>
-                </div>
-                <div id="autoVodStatus" class="auto-recorder-status is-loading" role="status" aria-live="polite">
-                  <strong>Auto VOD · Checking…</strong><span>Loading monitor status.</span>
-                </div>
-                <button type="button" class="quiet-button" id="checkAutoVodNow" disabled>Check now</button>
-                <div class="live-refresh-controls">
-                  <button type="button" class="quiet-button" id="refreshLiveStatuses">Refresh Status</button>
-                  <div id="liveStreamsRefreshStatus" class="live-refresh-status muted" role="status" aria-live="polite">Not updated yet.</div>
-                </div>
-              </div>
-            </div>
-            <div id="liveStreamsSummary" class="live-stream-summary" aria-live="polite">0 Live · 0 Recording · 0 Offline</div>
-            <div id="liveStreamsList" class="live-stream-list" aria-live="polite">
-              <div class="live-stream-empty muted">Configured streamers have not been loaded yet.</div>
-            </div>
+          <section class="card dashboard-live-summary" aria-labelledby="dashboardLiveTitle">
+            <div class="section-heading"><div><p class="eyebrow">Live</p><h2 id="dashboardLiveTitle">Live status</h2><p id="dashboardLiveSummary" class="muted" aria-live="polite">Checking configured streamers…</p></div><button type="button" class="goto-page quiet-button" data-page="live">View Live</button></div>
+          </section>
+          <section class="card dashboard-automation-summary">
+            <div class="section-heading"><div id="autoVodStatus" class="auto-recorder-status is-loading" role="status" aria-live="polite"><strong>Auto VOD · Checking…</strong><span>Loading monitor status.</span></div><button type="button" class="quiet-button" id="checkAutoVodNow" disabled>Check now</button></div>
           </section>
           <section class="card" id="dashboardRunningSection">
             <div class="section-heading"><div><p class="eyebrow">Current activity</p><h2>Running</h2></div><button type="button" class="goto-page quiet-button" data-page="queue">View Queue</button></div>
@@ -70,6 +55,25 @@
           <section class="card" id="dashboardUpcomingSection">
             <div class="section-heading"><div><p class="eyebrow">Waiting</p><h2>Up Next</h2></div></div>
             <div id="dashboardUpcoming" class="activity-list muted">Nothing is waiting.</div>
+          </section>
+        </section>
+
+        <section class="page" id="page-live">
+          <section class="live-workspace-overview" aria-label="Live recording overview">
+            <div class="auto-recorder-status is-loading" id="autoRecorderStatus" role="status" aria-live="polite">
+              <strong>Automatic Live Recording · Checking…</strong>
+              <span>Loading monitor status.</span>
+            </div>
+            <div id="liveStreamsSummary" class="live-stream-summary" aria-live="polite">0 Live · 0 Recording · 0 Offline</div>
+            <div class="live-refresh-controls"><button type="button" class="quiet-button" id="refreshLiveStatuses">Refresh status</button><div id="liveStreamsRefreshStatus" class="live-refresh-status muted" role="status" aria-live="polite">Not updated yet.</div></div>
+          </section>
+          <section class="card live-workspace-section active-recordings-section is-empty" aria-labelledby="activeRecordingsTitle">
+            <div class="section-heading"><div><p class="eyebrow">Recording</p><h2 id="activeRecordingsTitle">Active Recordings</h2><p class="muted">Manual and automatic recordings currently in progress.</p></div></div>
+            <div id="liveActiveRecordings" class="live-active-recordings" aria-live="polite"><div class="live-stream-empty muted">No active recordings.</div></div>
+          </section>
+          <section class="card live-workspace-section" id="liveStreamsSection" aria-labelledby="liveNowTitle">
+            <div class="section-heading"><div><p class="eyebrow">Live now</p><h2 id="liveNowTitle">Live Streamers</h2><p class="muted">Check configured Twitch channels and start one recording at a time.</p></div></div>
+            <div id="liveStreamsList" class="live-stream-list" aria-live="polite"><div class="live-stream-empty muted">Configured streamers have not been loaded yet.</div></div>
           </section>
         </section>
 
