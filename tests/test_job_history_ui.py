@@ -106,6 +106,8 @@ const elements = Object.fromEntries([
   'queueRunning', 'queueWaiting', 'queueErrors', 'queueCompleted',
   'queueCancelled', 'queueDone', 'queueCancelledCount', 'queueFailed',
   'queueActive', 'queueWaitingCount', 'clearCompletedJobs',
+  'queueRunningDownloads', 'queueRunningUploads',
+  'queueWaitingDownloads', 'queueWaitingUploads',
   'queueCancelledSection', 'queueErrorsSection', 'queuePersistenceWarning',
   'queueCompletedDetails'
 ].map(id => [id, element()]));

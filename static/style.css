@@ -811,6 +811,8 @@ main { width:100%; max-width:1320px; }
 .queue-retry-relationship { color:#bcefd2; font-weight:700; }
 .section-count { min-width:32px; height:32px; display:grid; place-items:center; padding:0 10px; border:1px solid var(--line); border-radius:999px; color:#dbe7ff; font-weight:800; }
 .running-estimate { display:grid; gap:3px; min-width:0; margin:-2px 0 12px; padding:9px 12px; border-left:2px solid rgba(122,162,255,.55); color:#cbd9f0; font-size:13px; overflow-wrap:anywhere; }
+.running-estimate.hidden,
+.running-estimate[hidden] { display:none !important; }
 .running-estimate span { color:var(--muted); }
 .running-estimate strong { font-size:13px; font-weight:700; }
 .queue-vod-item { display:grid; gap:10px; padding:14px; border:1px solid var(--line); border-radius:16px; background:#0e1522; min-width:0; }
@@ -1354,6 +1356,82 @@ textarea:focus-visible {
   .dashboard-section-heading .quiet-button { min-height:40px; padding-inline:10px; }
   .dashboard-quick-action-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }
   .dashboard-quick-action-list button { padding-inline:9px; font-size:12px; }
+}
+
+/* Slice 6: Queue operations workspace */
+#page-queue { gap:var(--space-4); }
+.queue-operational-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:var(--space-2); }
+.queue-summary-card,
+.queue-section { border:1px solid var(--border-default); border-radius:var(--radius-lg); background:var(--surface-panel); box-shadow:var(--shadow-sm); }
+.queue-summary-card { display:grid; align-content:start; gap:var(--space-1); min-height:100px; padding:var(--space-3); }
+.queue-summary-card > span,
+.queue-lane-kicker { color:var(--text-muted); font-size:var(--font-size-xs); font-weight:var(--font-weight-semibold); letter-spacing:.08em; text-transform:uppercase; }
+.queue-summary-card > strong { font-size:var(--font-size-lg); line-height:1.2; }
+.queue-summary-card > small { color:var(--text-secondary); font-size:var(--font-size-xs); line-height:1.35; }
+.queue-summary-card.is-running strong { color:var(--color-info); }
+.queue-summary-card.is-paused strong,
+.queue-summary-card.is-waiting strong { color:var(--color-warning); }
+.queue-summary-card.is-attention { border-color:rgba(255,184,107,.5); }
+.queue-summary-card.is-attention strong { color:var(--color-warning); }
+.queue-section { display:grid; gap:var(--space-3); padding:var(--space-4); }
+.queue-section[hidden],
+.queue-operation-lane[hidden],
+.queue-upcoming-lane[hidden],
+.queue-idle-state[hidden] { display:none !important; }
+.queue-workspace-heading,
+.queue-lane-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:var(--space-3); }
+.queue-workspace-heading h2,
+.queue-lane-heading h3 { margin:0; }
+.queue-workspace-heading .eyebrow { margin-bottom:var(--space-1); }
+.queue-lane-heading { align-items:center; }
+.queue-lane-heading h3 { font-size:var(--font-size-base); }
+.queue-running-section { gap:var(--space-3); }
+.queue-running-section .queue-lane-controls { margin:0; }
+.queue-running-section .section-count[hidden] { display:none !important; }
+.queue-running-section.is-idle { gap:var(--space-2); padding-block:var(--space-3); }
+.queue-running-section.is-idle .queue-lane-controls { gap:var(--space-2); }
+.queue-running-section.is-idle .queue-lane-control { padding:8px 10px; }
+.queue-running-lanes { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:var(--space-3); min-width:0; }
+.queue-running-lanes.is-idle { display:block; }
+.queue-operation-lane { display:grid; align-content:start; gap:var(--space-3); min-width:0; padding:var(--space-3); border:1px solid var(--border-subtle); border-radius:var(--radius-md); background:var(--surface-app-raised); }
+.queue-operation-lane .queue-vod-list { gap:var(--space-2); }
+.queue-operation-lane .queue-vod-item { background:var(--surface-panel); }
+.queue-idle-state { display:flex; align-items:center; min-height:0; color:var(--text-secondary); font-size:var(--font-size-sm); }
+.queue-waiting-section { gap:var(--space-3); }
+.queue-waiting-lanes { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:var(--space-3); min-width:0; }
+.queue-upcoming-lane { display:grid; gap:var(--space-2); min-width:0; }
+.queue-upcoming-lane + .queue-upcoming-lane { padding-left:var(--space-3); border-left:1px solid var(--border-subtle); }
+.queue-upcoming-lane .queue-vod-list { gap:var(--space-2); }
+.queue-attention-section { border-color:rgba(255,184,107,.48); }
+.queue-local-media-section { margin-top:var(--space-2); background:var(--surface-app-raised); }
+.queue-local-media-section .queue-workspace-heading { margin-bottom:0; }
+.queue-local-media-section .workspace-toolbar { margin-top:0; }
+.queue-history-section { gap:0; padding-block:var(--space-3); }
+.queue-history-section .completed-history-heading,
+.queue-history-section > details { padding-inline:var(--space-1); }
+.queue-history-section details > summary { min-height:32px; }
+.queue-history-section .queue-vod-list { margin-top:var(--space-3); }
+
+@media (max-width:1240px) {
+  .queue-operational-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
+@media (max-width:700px) {
+  #page-queue { gap:var(--space-3); }
+  .queue-section { padding:var(--space-3); }
+  .queue-running-lanes,
+  .queue-waiting-lanes { grid-template-columns:1fr; gap:var(--space-2); }
+  .queue-running-section.is-idle .queue-lane-control { align-items:center; }
+  .queue-upcoming-lane + .queue-upcoming-lane { padding:var(--space-2) 0 0; border-top:1px solid var(--border-subtle); border-left:0; }
+  .queue-operation-lane { padding:var(--space-3); }
+}
+@media (max-width:430px) {
+  .queue-operational-summary { gap:var(--space-2); }
+  .queue-summary-card { min-height:88px; padding:var(--space-2); }
+  .queue-summary-card > strong { font-size:16px; }
+  .queue-summary-card > small { font-size:11px; }
+  .queue-section { padding:var(--space-3); }
+  .queue-workspace-heading { gap:var(--space-2); }
+  .queue-workspace-heading .section-count { flex:0 0 auto; }
 }
 
 /* Slice 3b: compact Live workspace */

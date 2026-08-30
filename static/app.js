@@ -1858,6 +1858,7 @@ function renderOverallRunningEstimate(items) {
   if (!box) return;
   const estimate = overallRunningEstimate(items);
   box.classList.toggle('hidden', !estimate);
+  box.hidden = !estimate;
   box.innerHTML = estimate
     ? `<span>${escapeHtml(estimate.completionLabel)}</span><strong>${escapeHtml(estimate.remainingLabel)}</strong>`
     : '';
@@ -2449,6 +2450,10 @@ function renderQueueGroup(id, items, emptyMessage, compact=false) {
   if (!box) return;
   box.classList.toggle('muted', !items.length);
   box.innerHTML = items.length ? items.map(item => renderQueueVodItem(item, compact)).join('') : escapeHtml(emptyMessage);
+  wireQueueItemInteractions(box);
+}
+
+function wireQueueItemInteractions(box) {
   box.querySelectorAll('.queue-resolve-error').forEach(button => button.addEventListener('click', async () => {
     button.disabled = true;
     try {
@@ -2536,6 +2541,20 @@ function friendlyQueueActionError(error) {
   return messages[String(error?.reason || '')] || String(error?.message || 'The Queue action could not be completed.');
 }
 
+function queueLaneControlView(control={}, known=false) {
+  const paused = control?.queue_paused === true;
+  return {
+    paused,
+    note:!known
+      ? 'Lane control unavailable'
+      : paused
+        ? (control.stop_after_current && control.has_active_item ? 'Stops after current' : 'Paused')
+        : 'Processing enabled',
+    action:paused ? 'resume' : 'pause',
+    label:paused ? 'Resume Queue' : 'Pause Queue',
+  };
+}
+
 function renderQueueLaneControls(queueControls={}) {
   const box = $('queueLaneControls');
   if (!box) return;
@@ -2545,11 +2564,9 @@ function renderQueueLaneControls(queueControls={}) {
   ];
   box.innerHTML = lanes.map(([lane, label]) => {
     const control = queueControls[lane] || {};
-    const paused = !!control.queue_paused;
-    const note = paused
-      ? (control.stop_after_current && control.has_active_item ? 'Stops after current' : 'Queue paused')
-      : 'Queue running';
-    return `<div class="queue-lane-control"><span><strong>${label}</strong><small>${note}</small></span><button type="button" class="quiet-button queue-lane-action" data-lane="${lane}" data-action="${paused ? 'resume' : 'pause'}">${paused ? 'Resume Queue' : 'Pause Queue'}</button></div>`;
+    const known = Object.prototype.hasOwnProperty.call(queueControls, lane);
+    const view = queueLaneControlView(control, known);
+    return `<div class="queue-lane-control"><span><strong>${label}</strong><small>${escapeHtml(view.note)}</small></span><button type="button" class="quiet-button queue-lane-action" data-lane="${lane}" data-action="${view.action}"${known ? '' : ' disabled'}>${view.label}</button></div>`;
   }).join('');
   box.querySelectorAll('.queue-lane-action').forEach(button => button.addEventListener('click', async () => {
     button.disabled = true;
@@ -2604,24 +2621,95 @@ function renderQueuePersistenceStatus(status={}) {
   box.hidden = false;
 }
 
+function queueOperationsView(items, queueControls={}) {
+  const active = (items || []).filter(item => item.state === 'running' || item.state === 'cancelling');
+  const waiting = (items || []).filter(item => item.state === 'waiting');
+  const errors = (items || []).filter(item => (item.state === 'error' || item.state === 'interrupted') && !item.resolved);
+  const lane = type => ({
+    active:active.filter(item => item.job?.type === type),
+    waiting:waiting.filter(item => item.job?.type === type),
+    control:queueControls?.[type] || null,
+  });
+  return {active, waiting, errors, download:lane('download'), upload:lane('youtube_upload')};
+}
+
+function setQueueWorkspaceVisibility(id, visible) {
+  const element = $(id);
+  if (element) element.hidden = !visible;
+}
+
+function setQueueWorkspaceCount(id, value) {
+  const element = $(id);
+  if (element) element.textContent = String(value);
+}
+
+function queueLaneSummary(label, lane) {
+  const paused = lane.control?.queue_paused === true;
+  const knownControl = lane.control !== null;
+  const state = paused ? 'Paused' : lane.active.length ? 'Running' : lane.waiting.length ? 'Waiting' : knownControl ? 'Idle' : 'Status unavailable';
+  const detail = knownControl
+    ? `${lane.active.length} running · ${lane.waiting.length} waiting`
+    : `${lane.active.length} running · ${lane.waiting.length} waiting · Lane status unavailable`;
+  return `<article class="queue-summary-card is-${paused ? 'paused' : lane.active.length ? 'running' : lane.waiting.length ? 'waiting' : 'idle'}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(state)}</strong><small>${escapeHtml(detail)}</small></article>`;
+}
+
+function renderQueueOperationalSummary(view) {
+  const box = $('queueOperationalSummary');
+  if (!box) return;
+  const reviewTitle = view.errors.length ? `${view.errors.length} need review` : 'None';
+  const activeDetail = view.active.length
+    ? `${view.download.active.length} download · ${view.upload.active.length} upload`
+    : 'No active processes';
+  box.innerHTML = [
+    queueLaneSummary('Downloads', view.download),
+    queueLaneSummary('Uploads', view.upload),
+    `<article class="queue-summary-card is-${view.active.length ? 'running' : 'idle'}"><span>Running</span><strong>${view.active.length ? `${view.active.length} active` : 'Idle'}</strong><small>${escapeHtml(activeDetail)}</small></article>`,
+    `<article class="queue-summary-card is-${view.errors.length ? 'attention' : 'idle'}"><span>Needs review</span><strong>${escapeHtml(reviewTitle)}</strong><small>${view.errors.length ? 'Action is required in Queue.' : 'No actionable Queue issues.'}</small></article>`,
+  ].join('');
+}
+
+function renderQueueOperationLanes(view) {
+  const hasRunning = view.active.length > 0;
+  $('queueRunningSection')?.classList.toggle('is-idle', !hasRunning);
+  $('queueRunning')?.classList.toggle('is-idle', !hasRunning);
+  const activeCount = $('queueActive');
+  if (activeCount) activeCount.hidden = !hasRunning;
+  setQueueWorkspaceVisibility('queueRunningDownloadsLane', view.download.active.length > 0);
+  setQueueWorkspaceVisibility('queueRunningUploadsLane', view.upload.active.length > 0);
+  setQueueWorkspaceVisibility('queueRunningIdle', !hasRunning);
+  setQueueWorkspaceCount('queueRunningDownloadsCount', view.download.active.length);
+  setQueueWorkspaceCount('queueRunningUploadsCount', view.upload.active.length);
+  renderQueueGroup('queueRunningDownloads', view.download.active, '', false);
+  renderQueueGroup('queueRunningUploads', view.upload.active, '', false);
+
+  const hasWaiting = view.waiting.length > 0;
+  setQueueWorkspaceVisibility('queueWaitingSection', hasWaiting);
+  setQueueWorkspaceVisibility('queueWaitingDownloadsLane', view.download.waiting.length > 0);
+  setQueueWorkspaceVisibility('queueWaitingUploadsLane', view.upload.waiting.length > 0);
+  setQueueWorkspaceCount('queueWaitingDownloadsCount', view.download.waiting.length);
+  setQueueWorkspaceCount('queueWaitingUploadsCount', view.upload.waiting.length);
+  renderQueueGroup('queueWaitingDownloads', view.download.waiting, '', true);
+  renderQueueGroup('queueWaitingUploads', view.upload.waiting, '', true);
+}
+
 function renderVodQueue(jobs, queueControls={}, persistenceStatus={}) {
   const items = queueItemsFromJobs(jobs);
-  const running = items.filter(item => item.state === 'running' || item.state === 'cancelling');
-  const waiting = items.filter(item => item.state === 'waiting');
-  const errors = distinguishQueueItems(queueHistoryNewest(items.filter(item => (item.state === 'error' || item.state === 'interrupted') && !item.resolved)));
+  const operations = queueOperationsView(items, queueControls);
+  const {active:running, waiting} = operations;
+  const errors = distinguishQueueItems(queueHistoryNewest(operations.errors));
   const completed = distinguishQueueItems(queueHistoryNewest(items.filter(item => item.state === 'completed')));
   const cancelled = distinguishQueueItems(queueHistoryNewest(items.filter(item => item.state === 'cancelled')));
-  renderQueueGroup('queueRunning', running, 'No downloads or uploads are currently running.');
-  renderQueueGroup('queueWaiting', waiting, 'Nothing is waiting.', true);
+  renderQueueOperationalSummary({...operations, errors});
+  renderQueueOperationLanes({...operations, errors});
   renderQueueGroup('queueErrors', errors, 'No jobs need attention.', true);
   renderQueueGroup('queueCompleted', completed, 'No completed jobs.', true);
   renderQueueGroup('queueCancelled', cancelled, 'No cancelled jobs.', true);
   renderQueueLaneControls(queueControls);
   renderQueuePersistenceStatus(persistenceStatus);
   renderOverallRunningEstimate(running);
-  if ($('queueActive')) $('queueActive').textContent = String(running.length);
-  if ($('queueWaitingCount')) $('queueWaitingCount').textContent = String(waiting.length);
-  if ($('queueFailed')) $('queueFailed').textContent = String(errors.length);
+  setQueueWorkspaceCount('queueActive', running.length);
+  setQueueWorkspaceCount('queueWaitingCount', waiting.length);
+  setQueueWorkspaceCount('queueFailed', errors.length);
   if ($('queueDone')) $('queueDone').textContent = String(completed.length);
   const hasEligibleAutoYoutubePlaylist = completed.some(item => (
     item.job?.type === 'youtube_upload'
@@ -2636,14 +2724,14 @@ function renderVodQueue(jobs, queueControls={}, persistenceStatus={}) {
     if (history) history.open = true;
     autoYoutubePlaylistHistoryAutoOpened = true;
   }
-  if ($('queueCancelledCount')) $('queueCancelledCount').textContent = String(cancelled.length);
+  setQueueWorkspaceCount('queueCancelledCount', cancelled.length);
   if ($('clearCompletedJobs')) {
     $('clearCompletedJobs').disabled = completed.length === 0;
     $('clearCompletedJobs').classList.toggle('hidden', completed.length === 0);
   }
-  if ($('queueCancelledSection')) $('queueCancelledSection').classList.toggle('hidden', cancelled.length === 0);
-  if ($('queueErrorsSection')) $('queueErrorsSection').classList.toggle('hidden', errors.length === 0);
-  return {items, running, waiting, errors, completed, cancelled};
+  setQueueWorkspaceVisibility('queueCancelledSection', cancelled.length > 0);
+  setQueueWorkspaceVisibility('queueErrorsSection', errors.length > 0);
+  return {items, running, waiting, errors, completed, cancelled, operations};
 }
 
 

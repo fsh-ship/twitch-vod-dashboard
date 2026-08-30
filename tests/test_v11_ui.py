@@ -1246,6 +1246,222 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn("Move Down", JAVASCRIPT)
         self.assertIn("Active work continues; no new item will start.", JAVASCRIPT)
 
+    def test_queue_operations_workspace_separates_lanes_and_keeps_local_media_temporary(self) -> None:
+        queue_page = TEMPLATE.split('id="page-queue"', 1)[1].split('id="page-settings"', 1)[0]
+        for element_id in (
+            "queueOperationalSummary",
+            "queueRunningDownloadsLane",
+            "queueRunningUploadsLane",
+            "queueWaitingSection",
+            "queueWaitingDownloadsLane",
+            "queueWaitingUploadsLane",
+            "queueErrorsSection",
+            "readyForUploadSection",
+            "queueCompletedDetails",
+            "queueCancelledDetails",
+        ):
+            self.assertIn(f'id="{element_id}"', queue_page)
+        self.assertIn("Local VODs", queue_page)
+        self.assertIn("will move to VODs in the next slice", queue_page)
+        self.assertIn("function queueOperationsView", JAVASCRIPT)
+        self.assertIn("function renderQueueOperationLanes", JAVASCRIPT)
+        self.assertIn("setQueueWorkspaceVisibility('queueWaitingSection', hasWaiting)", JAVASCRIPT)
+        self.assertIn("setQueueWorkspaceVisibility('queueErrorsSection', errors.length > 0)", JAVASCRIPT)
+        self.assertIn("function queueLaneControlView", JAVASCRIPT)
+        self.assertIn("Processing enabled", JAVASCRIPT)
+        self.assertIn("$('queueActive')", JAVASCRIPT)
+        self.assertIn(".queue-running-lanes", STYLESHEET)
+        self.assertIn(".queue-waiting-lanes", STYLESHEET)
+        self.assertIn(".queue-section[hidden]", STYLESHEET)
+        self.assertIn(".running-estimate[hidden] { display:none !important; }", STYLESHEET)
+        self.assertIn(".queue-running-section .section-count[hidden] { display:none !important; }", STYLESHEET)
+
+    def test_queue_operations_view_preserves_parallel_lanes_and_waiting_order(self) -> None:
+        if not NODE:
+            self.skipTest("Node.js is required for Queue workspace UI tests")
+        runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function queueOperationsView');
+const end = source.indexOf('function setQueueWorkspaceVisibility', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Queue operations helper not found');
+eval(source.slice(start, end));
+const download = {state:'running', job:{type:'download', id:'download-1'}};
+const upload = {state:'running', job:{type:'youtube_upload', id:'upload-1'}};
+const waitingDownload = {state:'waiting', job:{type:'download', id:'download-2'}};
+const waitingUpload = {state:'waiting', job:{type:'youtube_upload', id:'upload-2'}};
+const failed = {state:'error', resolved:false, job:{type:'youtube_upload', id:'upload-3'}};
+const view = queueOperationsView(
+  [download, upload, waitingDownload, waitingUpload, failed],
+  {download:{queue_paused:false}, youtube_upload:{queue_paused:true}}
+);
+process.stdout.write(JSON.stringify({
+  active:view.active.map(item => item.job.id),
+  downloadWaiting:view.download.waiting.map(item => item.job.id),
+  uploadWaiting:view.upload.waiting.map(item => item.job.id),
+  errors:view.errors.map(item => item.job.id),
+  uploadPaused:view.upload.control.queue_paused
+}));
+"""
+        completed = subprocess.run([NODE, "-e", runner], cwd=ROOT, encoding="utf-8", capture_output=True, check=False)
+        if completed.returncode != 0:
+            self.fail(completed.stderr or completed.stdout)
+        view = json.loads(completed.stdout)
+        self.assertEqual(view["active"], ["download-1", "upload-1"])
+        self.assertEqual(view["downloadWaiting"], ["download-2"])
+        self.assertEqual(view["uploadWaiting"], ["upload-2"])
+        self.assertEqual(view["errors"], ["upload-3"])
+        self.assertTrue(view["uploadPaused"])
+
+    def test_queue_lane_control_copy_distinguishes_processing_from_active_work(self) -> None:
+        if not NODE:
+            self.skipTest("Node.js is required for Queue workspace UI tests")
+        runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function queueLaneControlView');
+const end = source.indexOf('function renderQueueLaneControls', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Queue control helper not found');
+eval(source.slice(start, end));
+process.stdout.write(JSON.stringify({
+  enabled:queueLaneControlView({queue_paused:false}, true),
+  paused:queueLaneControlView({queue_paused:true}, true),
+  unavailable:queueLaneControlView({}, false)
+}));
+"""
+        completed = subprocess.run([NODE, "-e", runner], cwd=ROOT, encoding="utf-8", capture_output=True, check=False)
+        if completed.returncode != 0:
+            self.fail(completed.stderr or completed.stdout)
+        rendered = json.loads(completed.stdout)
+        self.assertEqual(rendered["enabled"]["note"], "Processing enabled")
+        self.assertEqual(rendered["enabled"]["action"], "pause")
+        self.assertEqual(rendered["paused"]["note"], "Paused")
+        self.assertEqual(rendered["paused"]["action"], "resume")
+        self.assertEqual(rendered["unavailable"]["note"], "Lane control unavailable")
+
+    def test_queue_idle_estimate_is_hidden_without_an_empty_marker(self) -> None:
+        if not NODE:
+            self.skipTest("Node.js is required for Queue workspace UI tests")
+        runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function formatRemainingDuration');
+const end = source.indexOf('function niceStatus', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Queue estimate renderer not found');
+const classes = new Set();
+const estimate = {hidden:false, innerHTML:'', classList:{toggle(name, force) { if (force) classes.add(name); else classes.delete(name); }}};
+function $(id) { return id === 'queueRunningEstimate' ? estimate : null; }
+function escapeHtml(value) { return String(value); }
+eval(source.slice(start, end));
+renderOverallRunningEstimate([]);
+const idle = {hidden:estimate.hidden, html:estimate.innerHTML, hiddenClass:classes.has('hidden')};
+renderOverallRunningEstimate([{state:'running', etaSeconds:60}]);
+const active = {hidden:estimate.hidden, html:estimate.innerHTML, hiddenClass:classes.has('hidden')};
+process.stdout.write(JSON.stringify({idle, active}));
+"""
+        completed = subprocess.run([NODE, "-e", runner], cwd=ROOT, encoding="utf-8", capture_output=True, check=False)
+        if completed.returncode != 0:
+            self.fail(completed.stderr or completed.stdout)
+        rendered = json.loads(completed.stdout)
+        self.assertTrue(rendered["idle"]["hidden"])
+        self.assertTrue(rendered["idle"]["hiddenClass"])
+        self.assertEqual(rendered["idle"]["html"], "")
+        self.assertFalse(rendered["active"]["hidden"])
+        self.assertFalse(rendered["active"]["hiddenClass"])
+        self.assertIn("Estimated completion", rendered["active"]["html"])
+
+    def test_queue_lane_renderer_hides_empty_up_next_and_restores_waiting_lanes(self) -> None:
+        if not NODE:
+            self.skipTest("Node.js is required for Queue workspace UI tests")
+        runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function queueOperationsView');
+const end = source.indexOf('function renderVodQueue', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Queue lane renderer not found');
+function element() {
+  const classes = new Set();
+  return {
+    hidden:false, textContent:'', innerHTML:'',
+    classList:{
+      toggle(name, force) { if (force) classes.add(name); else classes.delete(name); },
+      contains(name) { return classes.has(name); }
+    }
+  };
+}
+const elements = Object.fromEntries([
+  'queueOperationalSummary', 'queueRunningDownloadsLane', 'queueRunningUploadsLane',
+  'queueRunningIdle', 'queueRunningDownloadsCount', 'queueRunningUploadsCount',
+  'queueRunningSection', 'queueRunning', 'queueActive',
+  'queueWaitingSection', 'queueWaitingDownloadsLane', 'queueWaitingUploadsLane',
+  'queueWaitingDownloadsCount', 'queueWaitingUploadsCount',
+  'queueRunningDownloads', 'queueRunningUploads', 'queueWaitingDownloads', 'queueWaitingUploads'
+].map(id => [id, element()]));
+function $(id) { return elements[id] || null; }
+function escapeHtml(value) { return String(value); }
+function renderQueueGroup(id, items) { elements[id].items = items; }
+eval(source.slice(start, end));
+const controls = {download:{queue_paused:false}, youtube_upload:{queue_paused:false}};
+renderQueueOperationLanes(queueOperationsView([], controls));
+const idle = {
+  upNextHidden:elements.queueWaitingSection.hidden,
+  idleVisible:!elements.queueRunningIdle.hidden,
+  activeCountHidden:elements.queueActive.hidden,
+  runningSectionCompact:elements.queueRunningSection.classList.contains('is-idle'),
+  runningContainerCompact:elements.queueRunning.classList.contains('is-idle'),
+  downloadLaneHidden:elements.queueRunningDownloadsLane.hidden,
+  uploadLaneHidden:elements.queueRunningUploadsLane.hidden
+};
+renderQueueOperationLanes(queueOperationsView([
+  {state:'waiting', job:{type:'download', id:'download-2'}},
+  {state:'waiting', job:{type:'youtube_upload', id:'upload-2'}}
+], controls));
+const waiting = {
+  upNextHidden:elements.queueWaitingSection.hidden,
+  downloadLaneHidden:elements.queueWaitingDownloadsLane.hidden,
+  uploadLaneHidden:elements.queueWaitingUploadsLane.hidden,
+  downloadItems:elements.queueWaitingDownloads.items.map(item => item.job.id),
+  uploadItems:elements.queueWaitingUploads.items.map(item => item.job.id)
+};
+renderQueueOperationLanes(queueOperationsView([
+  {state:'running', job:{type:'download', id:'download-1'}},
+  {state:'running', job:{type:'youtube_upload', id:'upload-1'}}
+], controls));
+const active = {
+  idleHidden:elements.queueRunningIdle.hidden,
+  activeCountHidden:elements.queueActive.hidden,
+  runningSectionCompact:elements.queueRunningSection.classList.contains('is-idle'),
+  downloadLaneHidden:elements.queueRunningDownloadsLane.hidden,
+  uploadLaneHidden:elements.queueRunningUploadsLane.hidden,
+  downloadItems:elements.queueRunningDownloads.items.map(item => item.job.id),
+  uploadItems:elements.queueRunningUploads.items.map(item => item.job.id)
+};
+process.stdout.write(JSON.stringify({idle, waiting, active}));
+"""
+        completed = subprocess.run([NODE, "-e", runner], cwd=ROOT, encoding="utf-8", capture_output=True, check=False)
+        if completed.returncode != 0:
+            self.fail(completed.stderr or completed.stdout)
+        rendered = json.loads(completed.stdout)
+        self.assertTrue(rendered["idle"]["upNextHidden"])
+        self.assertTrue(rendered["idle"]["idleVisible"])
+        self.assertTrue(rendered["idle"]["activeCountHidden"])
+        self.assertTrue(rendered["idle"]["runningSectionCompact"])
+        self.assertTrue(rendered["idle"]["runningContainerCompact"])
+        self.assertTrue(rendered["idle"]["downloadLaneHidden"])
+        self.assertTrue(rendered["idle"]["uploadLaneHidden"])
+        self.assertFalse(rendered["waiting"]["upNextHidden"])
+        self.assertFalse(rendered["waiting"]["downloadLaneHidden"])
+        self.assertFalse(rendered["waiting"]["uploadLaneHidden"])
+        self.assertEqual(rendered["waiting"]["downloadItems"], ["download-2"])
+        self.assertEqual(rendered["waiting"]["uploadItems"], ["upload-2"])
+        self.assertTrue(rendered["active"]["idleHidden"])
+        self.assertFalse(rendered["active"]["activeCountHidden"])
+        self.assertFalse(rendered["active"]["runningSectionCompact"])
+        self.assertFalse(rendered["active"]["downloadLaneHidden"])
+        self.assertFalse(rendered["active"]["uploadLaneHidden"])
+        self.assertEqual(rendered["active"]["downloadItems"], ["download-1"])
+        self.assertEqual(rendered["active"]["uploadItems"], ["upload-1"])
+
     def test_dashboard_idle_state_is_intentional_and_compact(self) -> None:
         self.assertIn('id="dashboardRunningSection"', TEMPLATE)
         self.assertIn('id="dashboardUpcomingSection"', TEMPLATE)
