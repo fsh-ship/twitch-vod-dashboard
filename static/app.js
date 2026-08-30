@@ -277,6 +277,9 @@ const pageMetaEarly = {
 })();
 
 let state = null;
+let stateLoadPromise = null;
+let searchStreamerLoadState = 'loading';
+let searchStreamerLoadError = '';
 let lastResults = [];
 let jobOpenState = {};
 let queueDetailOpenState = {};
@@ -324,6 +327,7 @@ function showPage(name) {
     selectionBar.setAttribute('aria-hidden', 'true');
   }
   window.vodShowPage(name);
+  if (name === 'search') ensureSearchStreamerPickerStreamers();
   refreshDashboard().catch(() => {});
   if (name === 'queue' && typeof loadLocalVideos === 'function') loadLocalVideos().catch(() => {});
   if (typeof refreshSelectionState === 'function') refreshSelectionState();
@@ -348,12 +352,45 @@ async function api(path, options = {}) {
   return data;
 }
 
+function localCalendarDate(date) {
+  const value = new Date(date);
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, '0');
+  const day = String(value.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function dateRangeForPreset(preset, now = new Date()) {
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const start = new Date(end);
+  if (preset === 'yesterday-today') start.setDate(start.getDate() - 1);
+  else if (preset === 'last-7') start.setDate(start.getDate() - 6);
+  else if (preset === 'last-30') start.setDate(start.getDate() - 29);
+  return { from: localCalendarDate(start), to: localCalendarDate(end) };
+}
+
+function setDatePreset(preset) {
+  if (preset !== 'custom') {
+    const range = dateRangeForPreset(preset);
+    $('fromDate').value = range.from;
+    $('toDate').value = range.to;
+  }
+  document.querySelectorAll('[data-date-preset]').forEach(button => {
+    const active = button.dataset.datePreset === preset;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+  const custom = preset === 'custom';
+  $('customDateRange')?.classList.toggle('is-custom', custom);
+  const summary = $('resolvedDateRange');
+  if (summary) {
+    summary.hidden = custom;
+    if (!custom) summary.textContent = `${$('fromDate').value} → ${$('toDate').value}`;
+  }
+}
+
 function setDateRange(days) {
-  const end = new Date();
-  const start = new Date();
-  start.setDate(end.getDate() - days + 1);
-  $('fromDate').value = start.toISOString().slice(0,10);
-  $('toDate').value = end.toISOString().slice(0,10);
+  setDatePreset(days === 1 ? 'today' : (days === 7 ? 'last-7' : 'last-30'));
 }
 
 function renderState() {
@@ -408,8 +445,8 @@ function renderState() {
   $('youtubeUploadMode').value = state.settings.youtube_upload_mode || 'stable';
   renderGlobalPlaylistSelect();
   renderLocalUploadPlaylistSelect();
-  $('singleStreamer').innerHTML = state.streamers.map(s => `<option>${escapeHtml(s)}</option>`).join('');
   renderSearchStreamerCheckboxes();
+  updateVodFilterCount();
   syncLiveStreamers(state.streamers);
 }
 
@@ -418,9 +455,25 @@ function escapeHtml(s) {
 }
 
 async function loadState() {
-  state = await api('/api/state');
-  renderState();
-  initializeLiveStatuses();
+  if (stateLoadPromise) return stateLoadPromise;
+  searchStreamerLoadState = 'loading';
+  searchStreamerLoadError = '';
+  renderSearchStreamerCheckboxes();
+  stateLoadPromise = api('/api/state').then(nextState => {
+    state = nextState;
+    if (!Array.isArray(state.streamers)) throw new Error('Configured streamers could not be read.');
+    searchStreamerLoadState = 'ready';
+    renderState();
+    initializeLiveStatuses();
+  }).catch(error => {
+    searchStreamerLoadState = 'error';
+    searchStreamerLoadError = error.message || 'Unable to load configured streamers.';
+    renderSearchStreamerCheckboxes();
+    throw error;
+  }).finally(() => {
+    stateLoadPromise = null;
+  });
+  return stateLoadPromise;
 }
 window.loadState = loadState;
 
@@ -439,29 +492,61 @@ function saveSearchStreamerSelection(names) {
   try { localStorage.setItem('vodSearchStreamerSelection', JSON.stringify(names || [])); } catch {}
 }
 
+function configuredSearchStreamers() {
+  return Array.isArray(state?.streamers) ? [...new Set(state.streamers)] : [];
+}
+
+function ensureSearchStreamerPickerStreamers() {
+  if (Array.isArray(state?.streamers) || stateLoadPromise) return;
+  loadState().catch(() => {});
+}
+
 function renderSearchStreamerCheckboxes() {
   const box = $('searchStreamerCheckboxes');
   const info = $('searchStreamerToggleInfo');
-  if (!box || !state || !state.streamers) return;
+  if (!box) return;
 
-  const saved = storedSearchStreamerSelection();
-  const valid = new Set(state.streamers);
-  let selected = saved.filter(s => valid.has(s));
-  if (!saved.length) selected = [...state.streamers];
-  const selectedSet = new Set(selected);
-
-  if (!state.streamers.length) {
-    box.innerHTML = '<div class="muted">No streamers loaded.</div>';
-    if (info) info.textContent = '0 selected';
+  if (searchStreamerLoadState === 'loading') {
+    box.innerHTML = '<div class="muted">Loading configured streamers…</div>';
+    if (info) {
+      info.textContent = 'Loading streamers…';
+      info.setAttribute('aria-label', 'Loading configured streamers');
+    }
+    return;
+  }
+  if (searchStreamerLoadState === 'error') {
+    box.innerHTML = `<div class="bad">Unable to load configured streamers. ${escapeHtml(searchStreamerLoadError)}</div>`;
+    if (info) {
+      info.textContent = 'Unable to load';
+      info.setAttribute('aria-label', 'Unable to load configured streamers');
+    }
     return;
   }
 
-  box.innerHTML = state.streamers.map(s => `
-    <label class="streamer-toggle-pill">
+  const streamers = configuredSearchStreamers();
+
+  const saved = storedSearchStreamerSelection();
+  const valid = new Set(streamers);
+  let selected = saved.filter(s => valid.has(s));
+  if (!saved.length) selected = [...streamers];
+  const selectedSet = new Set(selected);
+
+  if (!streamers.length) {
+    box.innerHTML = '<div class="muted">No configured streamers.</div>';
+    if (info) {
+      info.textContent = '0 selected';
+      info.setAttribute('aria-label', '0 of 0 configured streamers selected');
+    }
+    return;
+  }
+
+  const filter = String($('searchStreamerFilter')?.value || '').trim().toLowerCase();
+  box.innerHTML = streamers.map(s => `
+    <label class="streamer-toggle-pill"${filter && !s.toLowerCase().includes(filter) ? ' hidden' : ''}>
       <input type="checkbox" class="search-streamer-check" value="${escapeHtml(s)}" ${selectedSet.has(s) ? 'checked' : ''}>
       <span>${escapeHtml(s)}</span>
     </label>
-  `).join('');
+  `).join('') || '<div class="muted">No streamers loaded.</div>';
 
   document.querySelectorAll('.search-streamer-check').forEach(cb => {
     cb.addEventListener('change', () => {
@@ -480,9 +565,11 @@ function selectedSearchStreamersFromCheckboxes() {
 function updateSearchStreamerToggleInfo() {
   const info = $('searchStreamerToggleInfo');
   if (!info) return;
+  if (searchStreamerLoadState !== 'ready') return;
   const selected = selectedSearchStreamersFromCheckboxes();
-  const total = state && state.streamers ? state.streamers.length : 0;
-  info.textContent = `${selected.length}/${total} selected`;
+  const total = configuredSearchStreamers().length;
+  info.textContent = `${selected.length} selected`;
+  info.setAttribute('aria-label', `${selected.length} of ${total} streamers selected`);
 }
 
 function setAllSearchStreamers(checked) {
@@ -492,10 +579,45 @@ function setAllSearchStreamers(checked) {
 }
 
 function selectedSearchStreamersForSearch() {
-  const mode = $('streamerMode').value;
-  if (mode === 'one') return [$('singleStreamer').value].filter(Boolean);
-  if (mode === 'all') return state.streamers || [];
   return selectedSearchStreamersFromCheckboxes();
+}
+
+function closeSearchStreamerPicker({ returnFocus = false } = {}) {
+  const panel = $('searchStreamerPickerPanel');
+  const toggle = $('searchStreamerPickerToggle');
+  if (!panel || !toggle) return;
+  panel.hidden = true;
+  toggle.setAttribute('aria-expanded', 'false');
+  if (returnFocus) toggle.focus();
+}
+
+function toggleSearchStreamerPicker() {
+  const panel = $('searchStreamerPickerPanel');
+  const toggle = $('searchStreamerPickerToggle');
+  if (!panel || !toggle) return;
+  const opening = panel.hidden;
+  panel.hidden = !opening;
+  toggle.setAttribute('aria-expanded', opening ? 'true' : 'false');
+  if (opening) $('searchStreamerFilter')?.focus();
+}
+
+function updateVodFilterCount() {
+  const controls = ['includeUnknownDates', 'strictDateFilter', 'excludeLiveStreams', 'onlyRealVodUrls'];
+  const defaults = { includeUnknownDates:true, strictDateFilter:false, excludeLiveStreams:true, onlyRealVodUrls:true };
+  const count = controls.filter(id => !!$(id) && $(id).checked !== defaults[id]).length;
+  const label = $('vodFilterCount');
+  if (label) label.textContent = `${count} active`;
+}
+
+function showVodWorkspaceTab(name) {
+  const find = name !== 'local';
+  $('findVodsTab')?.classList.toggle('active', find);
+  $('localVodsTab')?.classList.toggle('active', !find);
+  $('findVodsTab')?.setAttribute('aria-selected', find ? 'true' : 'false');
+  $('localVodsTab')?.setAttribute('aria-selected', find ? 'false' : 'true');
+  $('findVodsPanel')?.classList.toggle('active', find);
+  $('findVodsPanel').hidden = !find;
+  $('localVodsPanel').hidden = find;
 }
 
 
@@ -512,7 +634,7 @@ function refreshSelectionState() {
   }
 
   const bar = $('searchSelectionBar');
-  const stickyBtn = $('stickyDownloadSelected');
+  const stickyBtn = $('downloadSelected');
   const stickyCount = $('searchSelectionBarCount');
   const page = currentPageName();
   const visible = count > 0 && page === 'search';
@@ -527,6 +649,8 @@ function refreshSelectionState() {
     stickyBtn.textContent = count ? `Download ${count} VODs` : 'Download Selected';
   }
   if (stickyCount) stickyCount.textContent = `${count} VOD${count === 1 ? '' : 's'} selected`;
+  const clear = $('clearResultsSelection');
+  if (clear) clear.classList.toggle('hidden', count === 0);
 }
 
 function setStreamerSelection(streamer, checked) {
@@ -1438,13 +1562,13 @@ function renderResults(results, errors, debug) {
     rows.push(`<tr class="streamer-group-row"><td colspan="6"><div class="streamer-group-head"><div><strong>${escapeHtml(streamer)}</strong><span>${items.length} VOD(s), ${openCount} ready to download</span></div><div><button type="button" class="group-select" data-streamer="${escapeHtml(streamer)}">Select All</button><button type="button" class="group-clear" data-streamer="${escapeHtml(streamer)}">Clear</button></div></div></td></tr>`);
     items.forEach(r => {
       rows.push(`
-        <tr>
-          <td><input class="rowcheck" type="checkbox" data-url="${escapeHtml(r.url)}" data-streamer="${escapeHtml(r.streamer)}" data-already-downloaded="${r.already_downloaded ? 'true' : 'false'}"></td>
-          <td data-label="Date">${escapeHtml(r.date)}</td>
-          <td data-label="Streamer">${escapeHtml(r.streamer)}</td>
-          <td data-label="Title">${escapeHtml(r.title)}</td>
-          <td data-label="Status" class="${r.already_downloaded ? 'good' : ''}">${searchResultStatusHtml(r)}</td>
-          <td data-label="Link"><a href="${escapeHtml(r.url)}" target="_blank" rel="noopener">Open Twitch</a></td>
+        <tr class="vod-result-row">
+          <td class="vod-result-select"><input class="rowcheck" type="checkbox" data-url="${escapeHtml(r.url)}" data-streamer="${escapeHtml(r.streamer)}" data-already-downloaded="${r.already_downloaded ? 'true' : 'false'}"></td>
+          <td data-label="Date" class="vod-result-date">${escapeHtml(r.date)}</td>
+          <td data-label="Streamer" class="vod-result-streamer">${escapeHtml(r.streamer)}</td>
+          <td data-label="Title" class="vod-result-title">${escapeHtml(r.title)}</td>
+          <td data-label="Status" class="vod-result-status ${r.already_downloaded ? 'good' : ''}">${searchResultStatusHtml(r)}</td>
+          <td data-label="Link" class="vod-result-link"><a href="${escapeHtml(r.url)}" target="_blank" rel="noopener">Open Twitch</a></td>
         </tr>`);
     });
   }
@@ -1463,8 +1587,17 @@ async function searchVods() {
   $('downloadSelected').disabled = true;
   const streamers = selectedSearchStreamersForSearch();
   if (!streamers.length || !streamers[0]) { alert('No streamers are configured. Save at least one streamer first.'); return; }
-  const data = await api('/api/search', { method:'POST', body: JSON.stringify({ streamers, from: $('fromDate').value, to: $('toDate').value, limit: $('limit').value, include_unknown_dates: $('includeUnknownDates').checked, strict_date_filter: $('strictDateFilter').checked, exclude_live_streams: $('excludeLiveStreams').checked, only_real_vod_urls: $('onlyRealVodUrls').checked }) });
-  renderResults(data.results, data.errors, data.debug);
+  try {
+    const data = await api('/api/search', { method:'POST', body: JSON.stringify({ streamers, from: $('fromDate').value, to: $('toDate').value, limit: $('limit').value, include_unknown_dates: $('includeUnknownDates').checked, strict_date_filter: $('strictDateFilter').checked, exclude_live_streams: $('excludeLiveStreams').checked, only_real_vod_urls: $('onlyRealVodUrls').checked }) });
+    renderResults(data.results, data.errors, data.debug);
+  } catch (error) {
+    lastResults = [];
+    $('resultsBody').innerHTML = '<tr><td colspan="6" class="bad">Search failed. Check the filters and try again.</td></tr>';
+    $('searchErrors').innerHTML = `<div class="errorbox">${escapeHtml(error.message || 'Search failed.')}</div>`;
+    if ($('searchResultSummary')) $('searchResultSummary').textContent = 'Search failed.';
+    refreshSelectionState();
+    throw error;
+  }
 }
 
 
@@ -2918,19 +3051,33 @@ async function saveYoutubeSettings() {
   alert('YouTube settings saved.\n\nFile: ' + (saved._settings_file || state.settings_file || 'unknown'));
 }
 
-$('presetToday').addEventListener('click', () => setDateRange(1));
-$('preset7').addEventListener('click', () => setDateRange(7));
-$('preset30').addEventListener('click', () => setDateRange(30));
-$('streamerMode').addEventListener('change', () => {
-  const mode = $('streamerMode').value;
-  $('singleStreamerBox').classList.toggle('hidden', mode !== 'one');
-  $('searchStreamerToggleCard').classList.toggle('hidden', mode === 'one' || mode === 'all');
+$('presetToday').addEventListener('click', () => setDatePreset('today'));
+$('presetYesterdayToday').addEventListener('click', () => setDatePreset('yesterday-today'));
+$('preset7').addEventListener('click', () => setDatePreset('last-7'));
+$('preset30').addEventListener('click', () => setDatePreset('last-30'));
+$('presetCustom').addEventListener('click', () => setDatePreset('custom'));
+$('fromDate').addEventListener('change', () => setDatePreset('custom'));
+$('toDate').addEventListener('change', () => setDatePreset('custom'));
+$('searchStreamerPickerToggle').addEventListener('click', toggleSearchStreamerPicker);
+$('searchStreamerFilter').addEventListener('input', renderSearchStreamerCheckboxes);
+$('searchStreamerFilter').addEventListener('keydown', event => {
+  if (event.key === 'Escape') closeSearchStreamerPicker({returnFocus:true});
+});
+document.addEventListener('click', event => {
+  const picker = document.querySelector('.streamer-picker');
+  if (picker && !picker.contains(event.target)) closeSearchStreamerPicker();
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && !$('searchStreamerPickerPanel')?.hidden) closeSearchStreamerPicker({returnFocus:true});
 });
 $('searchStreamersAll').addEventListener('click', () => setAllSearchStreamers(true));
 $('searchStreamersNone').addEventListener('click', () => setAllSearchStreamers(false));
+$('closeSearchStreamerPicker').addEventListener('click', () => closeSearchStreamerPicker({returnFocus:true}));
+$('findVodsTab').addEventListener('click', () => showVodWorkspaceTab('find'));
+$('localVodsTab').addEventListener('click', () => showVodWorkspaceTab('local'));
+['includeUnknownDates', 'strictDateFilter', 'excludeLiveStreams', 'onlyRealVodUrls'].forEach(id => $(id).addEventListener('change', updateVodFilterCount));
 $('searchBtn').addEventListener('click', () => searchVods().catch(e => alert(e.message)));
 $('checkAll').addEventListener('change', e => { document.querySelectorAll('.rowcheck').forEach(cb => cb.checked = e.target.checked); refreshSelectionState(); });
-$('downloadSelected').addEventListener('click', () => downloadSelectedWithConfirm().catch(e => alert(e.message)));
 $('selectNewResults').addEventListener('click', () => selectNewResults());
 $('clearResultsSelection').addEventListener('click', () => clearResultsSelection());
 $('singleDownload').addEventListener('click', () => startSingleVodDownload().catch(e => { setSingleVodStatus('Error: ' + e.message, 'bad'); alert('VOD download failed:\n\n' + e.message); }));
@@ -3086,7 +3233,7 @@ document.addEventListener('DOMContentLoaded', function(){
 
 
 document.addEventListener('DOMContentLoaded', function() {
-  const stickyDownload = document.getElementById('stickyDownloadSelected');
+  const stickyDownload = document.getElementById('downloadSelected');
   if (stickyDownload) stickyDownload.onclick = function(ev) {
     ev.preventDefault();
     downloadSelectedWithConfirm().catch(e => alert(e.message));

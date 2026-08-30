@@ -78,54 +78,34 @@
         </section>
 
         <section class="page" id="page-search">
-          <section class="card search-flow-card">
-            <div class="section-head"><div><p class="eyebrow">1. Choose when</p><h2>Date Range</h2></div></div>
-            <div class="quick-range-row"><button id="presetToday" type="button">Today</button><button id="preset7" type="button">Last 7 Days</button><button id="preset30" type="button">Last 30 Days</button></div>
-            <div class="grid two"><label>Start Date <input type="date" id="fromDate"></label><label>End Date <input type="date" id="toDate"></label></div>
-          </section>
-
-          <section class="card search-flow-card">
-            <div class="section-head"><div><p class="eyebrow">2. Choose who</p><h2>Streamers</h2></div><span id="searchStreamerToggleInfo" class="muted">Not loaded yet.</span></div>
-            <div class="streamer-toggle-card" id="searchStreamerToggleCard">
-              <div class="streamer-toggle-head"><span>Select the channels to include.</span><div class="button-row"><button id="searchStreamersAll" type="button">Select All</button><button id="searchStreamersNone" type="button">Clear All</button></div></div>
-              <div id="searchStreamerCheckboxes" class="streamer-checkbox-grid"></div>
-            </div>
-            <div class="grid two hidden" id="singleStreamerBox"><label>Streamer <select id="singleStreamer"></select></label></div>
-          </section>
-
-          <section class="card search-flow-card">
-            <div class="section-heading"><div><p class="eyebrow">3. Find VODs</p><h2>Search</h2><p class="muted">Results are sorted by date and keep your streamer selection for next time.</p></div><button class="primary" id="searchBtn" type="button">Search VODs</button></div>
-            <details class="advanced-options">
-              <summary>Advanced options</summary>
-              <div class="grid two advanced-options-grid">
-                <label>Search Depth per Streamer <input type="number" id="limit" min="1" value="150"></label>
-                <label>Streamer Selection Mode <select id="streamerMode"><option value="checked" selected>Selected Streamers</option><option value="all">All Streamers</option><option value="one">One Streamer</option></select></label>
+          <div class="vod-tabs" role="tablist" aria-label="VOD workspace sections">
+            <button class="vod-tab active" id="findVodsTab" type="button" role="tab" aria-selected="true" aria-controls="findVodsPanel">Find VODs</button>
+            <button class="vod-tab" id="localVodsTab" type="button" role="tab" aria-selected="false" aria-controls="localVodsPanel">Local VODs</button>
+          </div>
+          <section class="vod-workspace-panel active" id="findVodsPanel" role="tabpanel" aria-labelledby="findVodsTab">
+            <section class="card vod-search-workspace">
+              <div class="vod-search-heading"><div><p class="eyebrow">Manual discovery</p><h2>Find VODs</h2><p class="muted">Search completed Twitch broadcasts, then choose eligible VODs to download.</p></div><button class="primary" id="searchBtn" type="button">Find VODs</button></div>
+              <div class="vod-search-toolbar">
+                <div class="vod-date-control"><span class="control-label">Date range</span><div class="date-preset-row" role="group" aria-label="Date range presets"><button id="presetToday" type="button" data-date-preset="today">Today</button><button id="presetYesterdayToday" type="button" data-date-preset="yesterday-today">Yesterday → Today</button><button id="preset7" type="button" data-date-preset="last-7">Last 7 days</button><button id="preset30" type="button" data-date-preset="last-30">Last 30 days</button><button id="presetCustom" type="button" data-date-preset="custom">Custom</button></div><p id="resolvedDateRange" class="resolved-date-range" aria-live="polite">Resolved date range</p><div class="vod-custom-dates" id="customDateRange"><label>Start date <input type="date" id="fromDate"></label><label>End date <input type="date" id="toDate"></label></div></div>
+                <div class="streamer-picker">
+                  <button id="searchStreamerPickerToggle" class="streamer-picker-toggle" type="button" aria-expanded="false" aria-controls="searchStreamerPickerPanel"><span class="control-label">Streamers</span><strong id="searchStreamerToggleInfo">Loading streamers…</strong></button>
+                  <div id="searchStreamerPickerPanel" class="streamer-picker-panel" hidden>
+                    <div class="streamer-picker-tools"><label class="sr-only" for="searchStreamerFilter">Filter streamers</label><input id="searchStreamerFilter" type="search" placeholder="Filter streamers"><div class="button-row"><button id="searchStreamersAll" class="quiet-button" type="button">Select all</button><button id="searchStreamersNone" class="quiet-button" type="button">Clear</button><button id="closeSearchStreamerPicker" class="quiet-button" type="button">Close</button></div></div>
+                    <div id="searchStreamerCheckboxes" class="streamer-checkbox-grid"></div>
+                  </div>
+                </div>
+                <details class="vod-filter-details" id="vodFilterDetails"><summary>Filters <span id="vodFilterCount" class="subtle-count">0 active</span></summary><div class="vod-filter-content"><label>Search depth per streamer <input type="number" id="limit" min="1" value="150"></label><div class="option-row"><label class="inlinecheck"><input type="checkbox" id="includeUnknownDates" checked> Include VODs with unknown dates</label><label class="inlinecheck"><input type="checkbox" id="strictDateFilter"> Enforce date range</label><label class="inlinecheck"><input type="checkbox" id="excludeLiveStreams" checked> Hide live and upcoming streams</label><label class="inlinecheck"><input type="checkbox" id="onlyRealVodUrls" checked> Twitch VOD links only</label></div></div></details>
+                <details class="search-technical-details"><summary>Technical search details</summary><div id="archiveCount" class="subtle-count">Archive: ...</div><div id="searchDiagnostics" class="debugbox muted">No search diagnostics yet.</div></details>
+                <section class="vod-direct-panel" aria-labelledby="directVodTitle"><div><p class="eyebrow">Direct VOD</p><h3 id="directVodTitle">Download by link or ID</h3></div><div class="single-vod-row"><label>Twitch VOD link or ID <input id="singleUrl" placeholder="https://www.twitch.tv/videos/2786742616"></label><button class="primary" id="singleDownload" type="button">Download VOD</button></div><div id="singleVodStatus" class="field-message muted" aria-live="polite"></div></section>
               </div>
-              <div class="option-row">
-                <label class="inlinecheck"><input type="checkbox" id="includeUnknownDates" checked> Include VODs with Unknown Dates</label>
-                <label class="inlinecheck"><input type="checkbox" id="strictDateFilter"> Enforce Date Range</label>
-                <label class="inlinecheck"><input type="checkbox" id="excludeLiveStreams" checked> Hide Live and Upcoming Streams</label>
-                <label class="inlinecheck"><input type="checkbox" id="onlyRealVodUrls" checked> Twitch VOD Links Only</label>
-              </div>
-              <details class="search-technical-details">
-                <summary>Technical search details</summary>
-                <div id="archiveCount" class="subtle-count">Archive: ...</div>
-                <div id="searchDiagnostics" class="debugbox muted">No search diagnostics yet.</div>
-              </details>
-            </details>
-            <div id="searchErrors"></div>
+              <div id="searchErrors" aria-live="polite"></div>
+            </section>
+            <section class="card search-results-card" aria-labelledby="searchResultsTitle">
+              <div class="section-heading"><div><p class="eyebrow">Results</p><h2 id="searchResultsTitle">Search results</h2><p id="searchResultSummary" class="muted" aria-live="polite">No search performed yet.</p></div><div class="button-row result-group-actions"><button id="selectNewResults" class="quiet-button" type="button">Select ready VODs</button><button id="clearResultsSelection" class="quiet-button" type="button">Clear selection</button></div></div>
+              <div class="table-wrap search-results-wrap"><table class="search-results-table"><thead><tr><th><input type="checkbox" id="checkAll" aria-label="Select all eligible results"></th><th>Date</th><th>Streamer</th><th>Title</th><th>Status</th><th>Link</th></tr></thead><tbody id="resultsBody"><tr><td colspan="6" class="muted">Run a manual search to see matching VODs.</td></tr></tbody></table></div>
+            </section>
           </section>
-
-          <section class="card search-results-card">
-            <div class="section-heading"><div><p class="eyebrow">4. Select and download</p><h2>Search Results</h2><p id="searchResultSummary" class="muted">No search started yet.</p></div><div class="button-row"><button id="selectNewResults" type="button">Select New VODs</button><button id="clearResultsSelection" type="button">Clear Selection</button><button id="downloadSelected" class="primary" type="button" disabled>Download Selected</button></div></div>
-            <div class="table-wrap search-results-wrap"><table class="search-results-table"><thead><tr><th><input type="checkbox" id="checkAll" aria-label="Select all results"></th><th>Date</th><th>Streamer</th><th>Title</th><th>Status</th><th>Link</th></tr></thead><tbody id="resultsBody"><tr><td colspan="6" class="muted">No search started yet.</td></tr></tbody></table></div>
-          </section>
-
-          <section class="card action-card">
-            <div class="section-heading"><div><p class="eyebrow">Direct link</p><h2>Download a Single VOD</h2><p class="muted">Paste a Twitch VOD link or numeric VOD ID.</p></div></div>
-            <div class="single-vod-row"><label>Twitch VOD Link or ID <input id="singleUrl" placeholder="https://www.twitch.tv/videos/2786742616"></label><button class="primary" id="singleDownload" type="button">Download VOD</button></div>
-            <div id="singleVodStatus" class="field-message muted" aria-live="polite"></div>
-          </section>
+          <section class="vod-workspace-panel" id="localVodsPanel" role="tabpanel" aria-labelledby="localVodsTab" hidden><section class="card vod-local-placeholder"><h2>Local VODs</h2><p class="muted">Local media management will move here in a following slice. Ready for Upload remains in Queue for now.</p></section></section>
         </section>
 
         <section class="page" id="page-queue">
@@ -217,7 +197,7 @@
 
   <div id="searchSelectionBar" class="selection-action-bar hidden" aria-live="polite">
     <div><strong id="searchSelectionBarCount">0 VODs selected</strong><span>Selection stays available while you review results.</span></div>
-    <div class="button-row"><button id="stickyClearSelection" type="button">Clear Selection</button><button id="stickyDownloadSelected" class="primary" type="button">Download Selected</button></div>
+    <div class="button-row"><button id="stickyClearSelection" type="button">Clear Selection</button><button id="downloadSelected" class="primary" type="button">Download Selected</button></div>
   </div>
   <dialog id="clearCompletedDialog" class="confirmation-dialog" aria-labelledby="clearCompletedDialogTitle" aria-describedby="clearCompletedDialogDescription">
     <form method="dialog">

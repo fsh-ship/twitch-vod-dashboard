@@ -149,6 +149,84 @@ process.stdout.write(searchResultStatusHtml(JSON.parse(fs.readFileSync(0, 'utf8'
     return completed.stdout
 
 
+def _evaluate_vod_date_presets() -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for VOD date preset tests")
+    runner = r"""
+process.env.TZ = 'Pacific/Auckland';
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function localCalendarDate');
+const end = source.indexOf('function renderState', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('VOD date helpers not found');
+eval(source.slice(start, end));
+const now = new Date(2026, 0, 1, 0, 30, 0);
+process.stdout.write(JSON.stringify({
+  today: dateRangeForPreset('today', now),
+  yesterdayToday: dateRangeForPreset('yesterday-today', now),
+  last7: dateRangeForPreset('last-7', now),
+  last30: dateRangeForPreset('last-30', now)
+}));
+"""
+    completed = subprocess.run(
+        [NODE, "-e", runner], cwd=ROOT, encoding="utf-8",
+        capture_output=True, check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
+def _evaluate_search_streamer_picker() -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for streamer picker UI tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function storedSearchStreamerSelection');
+const end = source.indexOf('function selectedUrls', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Streamer picker helpers not found');
+const elements = {
+  searchStreamerCheckboxes: {innerHTML:''},
+  searchStreamerToggleInfo: {textContent:'', attributes:{}, setAttribute(name, value) { this.attributes[name] = value; }},
+  searchStreamerFilter: {value:''}
+};
+function $(id) { return elements[id] || null; }
+const localStore = new Map([['vodSearchStreamerSelection', JSON.stringify(['beta', 'removed_streamer'])]]);
+const localStorage = {getItem: key => localStore.get(key) || null, setItem: (key, value) => localStore.set(key, value)};
+const document = {querySelectorAll: selector => selector === '.search-streamer-check:checked' ? [{value:'beta'}] : []};
+function escapeHtml(value) { return String(value); }
+let state = {streamers:['alpha', 'beta', 'alpha']};
+let searchStreamerLoadState = 'ready';
+let searchStreamerLoadError = '';
+eval(source.slice(start, end));
+renderSearchStreamerCheckboxes();
+const loaded = {html: elements.searchStreamerCheckboxes.innerHTML, info: elements.searchStreamerToggleInfo.textContent};
+searchStreamerLoadState = 'loading';
+renderSearchStreamerCheckboxes();
+const loading = {html: elements.searchStreamerCheckboxes.innerHTML, info: elements.searchStreamerToggleInfo.textContent};
+searchStreamerLoadState = 'error';
+searchStreamerLoadError = 'Network unavailable';
+renderSearchStreamerCheckboxes();
+const failed = {html: elements.searchStreamerCheckboxes.innerHTML, info: elements.searchStreamerToggleInfo.textContent};
+searchStreamerLoadState = 'ready';
+state = {streamers:[]};
+renderSearchStreamerCheckboxes();
+const empty = {html: elements.searchStreamerCheckboxes.innerHTML, info: elements.searchStreamerToggleInfo.textContent};
+process.stdout.write(JSON.stringify({loaded, loading, failed, empty}));
+"""
+    completed = subprocess.run(
+        [NODE, "-e", runner],
+        cwd=ROOT,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
 def _classify_download_jobs(
     jobs: list[dict], results: list[dict] | None = None
 ) -> list[dict]:
@@ -1146,6 +1224,81 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("$('searchErrors').innerHTML = errHtml;", JAVASCRIPT)
         self.assertIn("Ready to Download", JAVASCRIPT)
         self.assertNotIn("New/Pending", JAVASCRIPT)
+
+    def test_find_vods_workspace_replaces_the_numbered_search_wizard(self) -> None:
+        self.assertIn('id="findVodsTab"', TEMPLATE)
+        self.assertIn('id="localVodsTab"', TEMPLATE)
+        self.assertIn('id="findVodsPanel"', TEMPLATE)
+        self.assertIn('id="localVodsPanel"', TEMPLATE)
+        self.assertIn('id="searchStreamerPickerToggle"', TEMPLATE)
+        self.assertIn('id="searchStreamerPickerPanel"', TEMPLATE)
+        self.assertIn('id="vodFilterDetails"', TEMPLATE)
+        self.assertIn('id="singleUrl"', TEMPLATE)
+        self.assertNotIn("1. Choose when", TEMPLATE)
+        self.assertNotIn("2. Choose who", TEMPLATE)
+        self.assertNotIn("3. Find VODs", TEMPLATE)
+        self.assertNotIn("4. Select and download", TEMPLATE)
+        self.assertNotIn('id="streamerMode"', TEMPLATE)
+        self.assertNotIn('id="singleStreamer"', TEMPLATE)
+
+    def test_vod_date_presets_use_local_calendar_dates(self) -> None:
+        ranges = _evaluate_vod_date_presets()
+
+        self.assertEqual(ranges["today"], {"from": "2026-01-01", "to": "2026-01-01"})
+        self.assertEqual(ranges["yesterdayToday"], {"from": "2025-12-31", "to": "2026-01-01"})
+        self.assertEqual(ranges["last7"], {"from": "2025-12-26", "to": "2026-01-01"})
+        self.assertEqual(ranges["last30"], {"from": "2025-12-03", "to": "2026-01-01"})
+        helper_source = JAVASCRIPT.split("function localCalendarDate", 1)[1].split("function renderState", 1)[0]
+        self.assertNotIn("toISOString", helper_source)
+
+    def test_vod_picker_and_selection_controls_have_accessibility_hooks(self) -> None:
+        self.assertIn('aria-expanded="false" aria-controls="searchStreamerPickerPanel"', TEMPLATE)
+        self.assertIn("function closeSearchStreamerPicker", JAVASCRIPT)
+        self.assertIn("function toggleSearchStreamerPicker", JAVASCRIPT)
+        self.assertIn("event.key === 'Escape'", JAVASCRIPT)
+        self.assertIn('id="searchStreamerFilter" type="search"', TEMPLATE)
+        self.assertIn("showVodWorkspaceTab", JAVASCRIPT)
+        self.assertIn(".vod-search-workspace", STYLESHEET)
+        self.assertIn("Selection stays available while you review results.", TEMPLATE)
+
+    def test_vod_picker_loads_shared_configured_streamers_without_settings_visit(self) -> None:
+        picker = _evaluate_search_streamer_picker()
+
+        self.assertIn('value="alpha"', picker["loaded"]["html"])
+        self.assertIn('value="beta"', picker["loaded"]["html"])
+        self.assertEqual(picker["loaded"]["html"].count('value="alpha"'), 1)
+        self.assertEqual(picker["loaded"]["html"].count('value="beta"'), 1)
+        self.assertIn('value="beta" checked', picker["loaded"]["html"])
+        self.assertNotIn("removed_streamer", picker["loaded"]["html"])
+        self.assertEqual(picker["loaded"]["info"], "1 selected")
+        self.assertIn("Loading configured streamers", picker["loading"]["html"])
+        self.assertIn("Unable to load configured streamers", picker["failed"]["html"])
+        self.assertIn("No configured streamers", picker["empty"]["html"])
+        self.assertIn("ensureSearchStreamerPickerStreamers", JAVASCRIPT)
+        self.assertIn("if (name === 'search') ensureSearchStreamerPickerStreamers();", JAVASCRIPT)
+
+    def test_find_vods_mobile_polish_has_compact_rows_and_bounded_picker(self) -> None:
+        self.assertIn('id="resolvedDateRange"', TEMPLATE)
+        self.assertIn('id="closeSearchStreamerPicker"', TEMPLATE)
+        self.assertIn('class="vod-result-row"', JAVASCRIPT)
+        for class_name in (
+            "vod-result-select",
+            "vod-result-streamer",
+            "vod-result-date",
+            "vod-result-title",
+            "vod-result-status",
+            "vod-result-link",
+        ):
+            self.assertIn(class_name, JAVASCRIPT)
+        self.assertIn("summary.hidden = custom;", JAVASCRIPT)
+        self.assertIn("clear.classList.toggle('hidden', count === 0);", JAVASCRIPT)
+        self.assertIn("closeSearchStreamerPicker({returnFocus:true})", JAVASCRIPT)
+        self.assertIn("max-height:58vh", STYLESHEET)
+        self.assertIn("overflow-y:auto", STYLESHEET)
+        self.assertIn("grid-template-areas:", STYLESHEET)
+        self.assertIn(".vod-result-title { grid-area:title; display:-webkit-box;", STYLESHEET)
+        self.assertIn("td[data-label]::before { display:none; }", STYLESHEET)
+        self.assertIn(".vod-custom-dates:not(.is-custom) { display:none; }", STYLESHEET)
 
     def test_baseline_search_status_keeps_manual_download_available(self) -> None:
         self.assertEqual(
