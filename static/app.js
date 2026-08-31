@@ -99,6 +99,15 @@ async function startSingleVodDownload() {
     const el = byId(id);
     if (el) el.textContent = text;
   }
+  function setScopeStatus(scope, text) {
+    const statusId = scope === 'youtube'
+      ? 'youtubeSaveStatus'
+      : scope === 'advanced'
+        ? 'advancedSaveStatus'
+        : 'generalSaveStatus';
+    setText(statusId, text);
+    if (scope === 'advanced') setText('settingsSaveStatus', text);
+  }
   function collectSettingsFallback() {
     return {
       download_path: val('downloadPath'),
@@ -172,10 +181,10 @@ async function startSingleVodDownload() {
         btn.disabled = true;
         btn.textContent = 'Saving...';
       }
-      setText('settingsSaveStatus', 'saving...');
+      setScopeStatus(scope, 'Saving...');
       const saved = await postJson('/api/settings', collectSettingsFallback());
       if (saved._settings_file) setText('settingsFilePath', saved._settings_file);
-      setText('settingsSaveStatus', 'saved: ' + (saved._saved_at || new Date().toLocaleTimeString()));
+      setScopeStatus(scope, 'Saved ' + (saved._saved_at || new Date().toLocaleTimeString()) + '.');
       if (typeof window.loadState === 'function') {
         try { await window.loadState(); } catch(e) {}
       }
@@ -185,7 +194,8 @@ async function startSingleVodDownload() {
       if (typeof window.refreshAutoRecorderStatus === 'function') {
         try { await window.refreshAutoRecorderStatus(); } catch(e) {}
       }
-      alert((scope === 'youtube' ? 'YouTube settings' : 'Settings') + ' saved.\n\nFile: ' + (saved._settings_file || 'unknown'));
+      const label = scope === 'youtube' ? 'YouTube settings' : scope === 'advanced' ? 'Advanced settings' : 'General settings';
+      alert(label + ' saved.\n\nFile: ' + (saved._settings_file || 'unknown'));
       return saved;
     } catch (e) {
       console.error(e);
@@ -194,7 +204,7 @@ async function startSingleVodDownload() {
         autoRecorder.checked = state.settings.auto_recorder_enabled === true;
         if (typeof updateAutoRecorderSettingCopy === 'function') updateAutoRecorderSettingCopy();
       }
-      setText('settingsSaveStatus', 'Error: ' + e.message);
+      setScopeStatus(scope, 'Save failed: ' + e.message);
       alert('Save failed:\n\n' + e.message);
       throw e;
     } finally {
@@ -227,9 +237,9 @@ async function startSingleVodDownload() {
   };
 
   document.addEventListener('click', function(ev) {
-    const btn = ev.target.closest && ev.target.closest('#saveSettings, #saveYoutubeSettings, #saveYoutubeSettingsBottom');
+    const btn = ev.target.closest && ev.target.closest('#saveSettings, #saveYoutubeSettings, #saveAdvancedSettings');
     if (btn) {
-      window.vodRobustSaveSettings(ev, btn.id === 'saveSettings' ? 'settings' : 'youtube');
+      window.vodRobustSaveSettings(ev, btn.id === 'saveYoutubeSettings' ? 'youtube' : btn.id === 'saveAdvancedSettings' ? 'advanced' : 'general');
     }
   }, true);
 })();
@@ -1731,19 +1741,35 @@ function addStreamerFromInput() {
   input.focus();
 }
 
+function ensureActiveSettingsTabVisible(tab) {
+  const strip = tab?.closest('.settings-tabs');
+  if (!strip || !tab) return;
+  const stripBounds = strip.getBoundingClientRect();
+  const tabBounds = tab.getBoundingClientRect();
+  if (tabBounds.left < stripBounds.left) {
+    strip.scrollLeft += tabBounds.left - stripBounds.left;
+  } else if (tabBounds.right > stripBounds.right) {
+    strip.scrollLeft += tabBounds.right - stripBounds.right;
+  }
+}
+
 function showSettingsTab(name) {
   const allowed = ['general', 'automation', 'streamers', 'youtube', 'advanced'];
   const target = allowed.includes(name) ? name : 'general';
+  let activeTab = null;
   document.querySelectorAll('.settings-tab').forEach(tab => {
     const active = tab.dataset.settingsTab === target;
     tab.classList.toggle('active', active);
     tab.setAttribute('aria-selected', active ? 'true' : 'false');
     tab.setAttribute('tabindex', active ? '0' : '-1');
+    if (active) activeTab = tab;
   });
+  ensureActiveSettingsTabVisible(activeTab);
   document.querySelectorAll('.settings-panel').forEach(panel => {
     const active = panel.dataset.settingsPanel === target;
     panel.classList.toggle('active', active);
     panel.hidden = !active;
+    panel.setAttribute('aria-hidden', active ? 'false' : 'true');
   });
   try { localStorage.setItem('vodSettingsTab', target); } catch {}
   if (target === 'youtube') {
@@ -3805,8 +3831,31 @@ $('youtubeConnect').addEventListener('click', async () => {
 });
 $('youtubeLoadPlaylists').addEventListener('click', () => loadYoutubePlaylists().then(() => alert('Playlists loaded.')).catch(e => alert(e.message)));
 $('saveYoutubeSettings').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'youtube'));
-$('saveYoutubeSettingsBottom').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'youtube'));
+$('saveAdvancedSettings').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'advanced'));
 $('refreshLiveStatuses').addEventListener('click', () => refreshLiveStatuses().catch(() => {}));
+
+function markSettingsScopeDirty(scope) {
+  const statusId = scope === 'youtube'
+    ? 'youtubeSaveStatus'
+    : scope === 'advanced'
+      ? 'advancedSaveStatus'
+      : 'generalSaveStatus';
+  const status = $(statusId);
+  if (status) status.textContent = `Unsaved ${scope === 'youtube' ? 'YouTube' : scope === 'advanced' ? 'Advanced' : 'General'} changes.`;
+}
+
+document.querySelectorAll('#settingsPanelGeneral input, #settingsPanelGeneral select, #settingsPanelGeneral textarea').forEach(control => {
+  control.addEventListener('input', () => markSettingsScopeDirty('general'));
+  control.addEventListener('change', () => markSettingsScopeDirty('general'));
+});
+document.querySelectorAll('#settingsPanelYoutube input, #settingsPanelYoutube select, #settingsPanelYoutube textarea').forEach(control => {
+  control.addEventListener('input', () => markSettingsScopeDirty('youtube'));
+  control.addEventListener('change', () => markSettingsScopeDirty('youtube'));
+});
+document.querySelectorAll('#settingsPanelAdvanced input, #settingsPanelAdvanced select, #settingsPanelAdvanced textarea').forEach(control => {
+  control.addEventListener('input', () => markSettingsScopeDirty('advanced'));
+  control.addEventListener('change', () => markSettingsScopeDirty('advanced'));
+});
 
 setInterval(() => pollJobs().catch(() => {}), 5000);
 setInterval(() => refreshAutoRecorderStatus().catch(() => {}), AUTO_RECORDER_STATUS_REFRESH_MS);

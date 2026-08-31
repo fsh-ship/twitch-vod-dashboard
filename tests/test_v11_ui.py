@@ -1213,6 +1213,10 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("panel.hidden = !active", tab_switcher)
         self.assertIn("tab.setAttribute('aria-selected'", tab_switcher)
         self.assertIn("tab.setAttribute('tabindex', active ? '0' : '-1')", tab_switcher)
+        self.assertIn("ensureActiveSettingsTabVisible(activeTab);", tab_switcher)
+        visibility_helper = JAVASCRIPT.split("function ensureActiveSettingsTabVisible", 1)[1].split("function showSettingsTab", 1)[0]
+        self.assertIn("strip.scrollLeft", visibility_helper)
+        self.assertNotIn("scrollIntoView", visibility_helper)
         self.assertIn("['ArrowLeft', 'ArrowRight', 'Home', 'End']", JAVASCRIPT)
         self.assertIn(".settings-panel[hidden] { display:none !important; }", STYLESHEET)
 
@@ -2233,13 +2237,49 @@ process.stdout.write(JSON.stringify({empty, ready}));
         general = TEMPLATE.split('data-settings-panel="general"', 1)[1].split('data-settings-panel="automation"', 1)[0]
         advanced = TEMPLATE.split('data-settings-panel="advanced"', 1)[1]
         self.assertNotIn("Concurrent Fragments", general)
-        self.assertIn("Concurrent Fragments", advanced)
+        self.assertIn("Concurrent fragments", advanced)
         self.assertNotIn("After a Batch", TEMPLATE)
-        self.assertIn("When to Prepare or Upload", TEMPLATE)
-        self.assertIn("Archive the local VOD bundle after a successful dashboard upload", TEMPLATE)
+        self.assertIn("Post-processing timing", general)
+        self.assertNotIn("When to Prepare or Upload", TEMPLATE)
+        self.assertIn("move the local VOD bundle to the uploaded archive", TEMPLATE)
+        self.assertIn("Automatic uploads keep their per-streamer playlist ownership.", TEMPLATE)
+        self.assertIn("Available template variables", TEMPLATE)
+        self.assertIn('id="saveAdvancedSettings"', advanced)
+        self.assertNotIn("Save All Settings", TEMPLATE)
+        self.assertIn("settings-maintenance-actions", TEMPLATE)
         self.assertIn("YouTube is not connected. Connect your account to enable uploads.", JAVASCRIPT)
         self.assertNotIn("YouTubeNotConnectedError", TEMPLATE + JAVASCRIPT)
         self.assertIn("refreshButton.disabled = !data.connected", JAVASCRIPT)
+
+    def test_settings_tabs_keep_unique_aria_relationships_and_hidden_isolation(self) -> None:
+        tabs = re.findall(
+            r'<button[^>]+id="(settingsTab[^"]+)"[^>]+data-settings-tab="([^"]+)"[^>]+aria-controls="([^"]+)"',
+            TEMPLATE,
+        )
+        panels = re.findall(
+            r'<section[^>]+id="(settingsPanel[^"]+)"[^>]+data-settings-panel="([^"]+)"[^>]+aria-labelledby="([^"]+)"',
+            TEMPLATE,
+        )
+        self.assertEqual([name for _, name, _ in tabs], ["general", "automation", "streamers", "youtube", "advanced"])
+        self.assertEqual([name for _, name, _ in panels], ["general", "automation", "streamers", "youtube", "advanced"])
+        self.assertEqual(len({tab_id for tab_id, _, _ in tabs}), 5)
+        self.assertEqual(len({panel_id for panel_id, _, _ in panels}), 5)
+        self.assertEqual([controls for _, _, controls in tabs], [panel_id for panel_id, _, _ in panels])
+        self.assertEqual([labelled_by for _, _, labelled_by in panels], [tab_id for tab_id, _, _ in tabs])
+        self.assertIn("panel.hidden = !active;", JAVASCRIPT)
+        self.assertIn("panel.setAttribute('aria-hidden', active ? 'false' : 'true');", JAVASCRIPT)
+        self.assertIn(".settings-panel[hidden] { display:none !important; }", STYLESHEET)
+
+    def test_settings_tab_binding_survives_slice_nine_advanced_save_rename(self) -> None:
+        self.assertIn("$('saveAdvancedSettings').addEventListener", JAVASCRIPT)
+        self.assertNotIn("$('saveYoutubeSettingsBottom').addEventListener", JAVASCRIPT)
+        self.assertIn("const settingsTabs = [...document.querySelectorAll('.settings-tab')];", JAVASCRIPT)
+        binding = JAVASCRIPT.split("const settingsTabs = [...document.querySelectorAll('.settings-tab')];", 1)[1].split("let initialTab", 1)[0]
+        self.assertIn("tab.addEventListener('click', () => showSettingsTab", binding)
+        self.assertIn("ArrowLeft", binding)
+        self.assertIn("ArrowRight", binding)
+        self.assertIn("Home", binding)
+        self.assertIn("End", binding)
 
     def test_local_upload_playlist_request_semantics_match_for_each_job_size(self) -> None:
         result = _evaluate_playlist_ui()
