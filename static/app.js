@@ -1962,7 +1962,7 @@ Review the streamer list before starting.`);
   if (!ok) return;
   const data = await startDownload(selected.map(r => r.url), 'Date Range Selection');
   const batchModeLabel = ($('batchPostprocessMode') && $('batchPostprocessMode').value === 'after_all') ? 'Download all, then post-process' : 'Post-process after each VOD';
-  alert(`Download queue started: ${data.url_count || selected.length} VOD(s).\n\nMode: ${batchModeLabel}`);
+  showToast(`Download queue started: ${data.url_count || selected.length} VOD(s). Mode: ${batchModeLabel}`, {variant:'success'});
   showPage('queue');
 }
 
@@ -4091,7 +4091,7 @@ document.addEventListener('DOMContentLoaded', function() {
   if (manualBtn) manualBtn.onclick = function(ev) {
     ev.preventDefault();
     $('manualUploadFilenameTemplate').value = MANUAL_UPLOAD_DEFAULT_FILENAME_TEMPLATE;
-    alert('The final YouTube filename template was reset:\n\n' + MANUAL_UPLOAD_DEFAULT_FILENAME_TEMPLATE);
+    showToast('The final YouTube filename template was reset.', {variant:'info'});
     return false;
   };
 
@@ -4099,7 +4099,7 @@ document.addEventListener('DOMContentLoaded', function() {
   if (ytdlpBtn) ytdlpBtn.onclick = function(ev) {
     ev.preventDefault();
     $('outputTemplate').value = YTDLP_DEFAULT_OUTPUT_TEMPLATE;
-    alert('The technical yt-dlp output template was reset:\n\n' + YTDLP_DEFAULT_OUTPUT_TEMPLATE);
+    showToast('The technical yt-dlp output template was reset.', {variant:'info'});
     return false;
   };
 });

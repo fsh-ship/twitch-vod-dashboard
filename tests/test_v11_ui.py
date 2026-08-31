@@ -1535,7 +1535,19 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("@media (prefers-reduced-motion:reduce)", STYLESHEET)
         self.assertIn("showToast('Playlists loaded.', {variant:'success'})", JAVASCRIPT)
         self.assertNotIn("then(() => alert('Playlists loaded.'))", JAVASCRIPT)
-        self.assertGreaterEqual(JAVASCRIPT.count("alert("), 30)
+        self.assertEqual(JAVASCRIPT.count("alert("), 27)
+        self.assertEqual(JAVASCRIPT.count("confirm("), 4)
+
+    def test_slice_11b1_migrates_only_low_risk_success_and_info_alerts(self) -> None:
+        self.assertIn("showToast(`Download queue started: ${data.url_count || selected.length} VOD(s). Mode: ${batchModeLabel}`, {variant:'success'})", JAVASCRIPT)
+        self.assertIn("showToast('The final YouTube filename template was reset.', {variant:'info'})", JAVASCRIPT)
+        self.assertIn("showToast('The technical yt-dlp output template was reset.', {variant:'info'})", JAVASCRIPT)
+        self.assertNotIn("alert(`Download queue started:", JAVASCRIPT)
+        self.assertNotIn("alert('The final YouTube filename template was reset:", JAVASCRIPT)
+        self.assertNotIn("alert('The technical yt-dlp output template was reset:", JAVASCRIPT)
+        # Confirmation, validation, diagnostic, OAuth, and operational alerts remain guarded.
+        self.assertIn("confirm(`Download ${selected.length}", JAVASCRIPT)
+        self.assertIn("alert('YouTube connected", JAVASCRIPT)
         self.assertEqual(JAVASCRIPT.count("confirm("), 4)
 
     def test_mobile_toast_placement_is_bottom_anchored_and_stacks_upward(self) -> None:
