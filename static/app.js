@@ -3974,7 +3974,7 @@ $('youtubeConnect').addEventListener('click', async () => {
     alert('YouTube connection failed:\n\n' + friendlyYoutubeConnectError(e.message));
   }
 });
-$('youtubeLoadPlaylists').addEventListener('click', () => loadYoutubePlaylists().then(() => showToast('Playlists loaded.', {variant:'success'})).catch(e => alert(e.message)));
+$('youtubeLoadPlaylists').addEventListener('click', () => loadYoutubePlaylists().then(() => showToast('Playlists loaded.', {variant:'success'})).catch(e => showToast(e.message, {variant:'error'})));
 $('saveYoutubeSettings').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'youtube'));
 $('saveAdvancedSettings').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'advanced'));
 $('refreshLiveStatuses').addEventListener('click', () => refreshLiveStatuses().catch(() => {}));
@@ -4083,7 +4083,7 @@ try { window.refreshAutoRecorderStatus = refreshAutoRecorderStatus; } catch(e) {
 
 document.addEventListener('DOMContentLoaded', function(){ const b=document.getElementById('checkSettingsStatus'); if(b) b.onclick=function(e){ window.vodCheckSettingsStatus(e); return false; }; });
 
-document.addEventListener('DOMContentLoaded', function(){ const b=document.getElementById('checkStreamerFile'); if(b) b.onclick=function(e){ e.preventDefault(); checkStreamerFileStatus().catch(err => alert(err.message)); return false; }; });
+document.addEventListener('DOMContentLoaded', function(){ const b=document.getElementById('checkStreamerFile'); if(b) b.onclick=function(e){ e.preventDefault(); checkStreamerFileStatus().catch(err => showToast(err.message, {variant:'error'})); return false; }; });
 
 
 document.addEventListener('DOMContentLoaded', function() {

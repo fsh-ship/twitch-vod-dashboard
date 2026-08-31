@@ -1535,7 +1535,7 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("@media (prefers-reduced-motion:reduce)", STYLESHEET)
         self.assertIn("showToast('Playlists loaded.', {variant:'success'})", JAVASCRIPT)
         self.assertNotIn("then(() => alert('Playlists loaded.'))", JAVASCRIPT)
-        self.assertEqual(JAVASCRIPT.count("alert("), 27)
+        self.assertEqual(JAVASCRIPT.count("alert("), 25)
         self.assertEqual(JAVASCRIPT.count("confirm("), 4)
 
     def test_slice_11b1_migrates_only_low_risk_success_and_info_alerts(self) -> None:
@@ -1548,6 +1548,19 @@ class V11UiContractTests(unittest.TestCase):
         # Confirmation, validation, diagnostic, OAuth, and operational alerts remain guarded.
         self.assertIn("confirm(`Download ${selected.length}", JAVASCRIPT)
         self.assertIn("alert('YouTube connected", JAVASCRIPT)
+        self.assertEqual(JAVASCRIPT.count("confirm("), 4)
+
+    def test_slice_11b2_migrates_only_simple_nonblocking_error_alerts(self) -> None:
+        self.assertIn(".catch(e => showToast(e.message, {variant:'error'}))", JAVASCRIPT)
+        self.assertIn("checkStreamerFileStatus().catch(err => showToast(err.message, {variant:'error'}))", JAVASCRIPT)
+        self.assertNotIn("loadYoutubePlaylists().then(() => showToast('Playlists loaded.', {variant:'success'})).catch(e => alert(e.message))", JAVASCRIPT)
+        self.assertNotIn("checkStreamerFileStatus().catch(err => alert(err.message))", JAVASCRIPT)
+        # Inline search/local-media errors and operational/security alerts retain their destinations.
+        self.assertIn("$('searchErrors').innerHTML", JAVASCRIPT)
+        self.assertIn("if (errorBox) { errorBox.hidden = false;", JAVASCRIPT)
+        self.assertIn("uploadSelectedLocalVideos().catch(e => alert(e.message))", JAVASCRIPT)
+        self.assertIn("alert('YouTube connection failed:", JAVASCRIPT)
+        self.assertEqual(JAVASCRIPT.count("alert("), 25)
         self.assertEqual(JAVASCRIPT.count("confirm("), 4)
 
     def test_mobile_toast_placement_is_bottom_anchored_and_stacks_upward(self) -> None:
