@@ -131,8 +131,8 @@
               </div>
               <div id="searchErrors" aria-live="polite"></div>
             </section>
-            <section class="card search-results-card" aria-labelledby="searchResultsTitle">
-              <div class="section-heading"><div><p class="eyebrow">Results</p><h2 id="searchResultsTitle">Search results</h2><p id="searchResultSummary" class="muted" aria-live="polite">No search performed yet.</p></div><div class="button-row result-group-actions"><button id="selectNewResults" class="quiet-button" type="button">Select ready VODs</button><button id="clearResultsSelection" class="quiet-button" type="button">Clear selection</button></div></div>
+            <section class="card search-results-card is-empty" aria-labelledby="searchResultsTitle">
+              <div class="section-heading"><div><p class="eyebrow">Results</p><h2 id="searchResultsTitle">Search results</h2><p id="searchResultSummary" class="muted" aria-live="polite">No search performed yet.</p></div><div class="button-row result-group-actions"><button id="selectNewResults" class="quiet-button" type="button" disabled>Select ready VODs</button><button id="clearResultsSelection" class="quiet-button hidden" type="button">Clear selection</button></div></div>
               <div class="table-wrap search-results-wrap"><table class="search-results-table"><thead><tr><th><input type="checkbox" id="checkAll" aria-label="Select all eligible results"></th><th>Date</th><th>Streamer</th><th>Title</th><th>Status</th><th>Link</th></tr></thead><tbody id="resultsBody"><tr><td colspan="6" class="muted">Run a manual search to see matching VODs.</td></tr></tbody></table></div>
             </section>
           </section>

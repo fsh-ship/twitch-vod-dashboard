@@ -884,6 +884,7 @@ function selectedUrls() {
 
 function refreshSelectionState() {
   const count = selectedUrls().length;
+  const eligible = document.querySelectorAll('.rowcheck[data-already-downloaded="false"]');
   const btn = $('downloadSelected');
   if (btn) {
     btn.disabled = count === 0;
@@ -908,6 +909,8 @@ function refreshSelectionState() {
   if (stickyCount) stickyCount.textContent = `${count} VOD${count === 1 ? '' : 's'} selected`;
   const clear = $('clearResultsSelection');
   if (clear) clear.classList.toggle('hidden', count === 0);
+  const selectReady = $('selectNewResults');
+  if (selectReady) selectReady.disabled = eligible.length === 0;
 }
 
 function setStreamerSelection(streamer, checked) {
@@ -1471,7 +1474,9 @@ function renderDashboardLiveSummary() {
   const summary = $('dashboardLiveSummary');
   const names = $('dashboardLiveNames');
   if (!summary || !names) return;
+  const section = summary.closest?.('.dashboard-live-summary');
   if (!liveStreamers.length) {
+    section?.classList.add('is-empty');
     summary.textContent = 'No streamers configured.';
     names.innerHTML = '';
     return;
@@ -1481,6 +1486,7 @@ function renderDashboardLiveSummary() {
     return liveStreamStatuses.get(login)?.state === 'live';
   });
   const recordings = liveRecordingJobs.filter(job => ACTIVE_RECORDING_STATES.has(job?.state)).length;
+  section?.classList.toggle('is-empty', live.length === 0 && recordings === 0);
   summary.textContent = `${live.length} Live · ${recordings} Recording`;
   names.innerHTML = live.slice(0, 3).map(streamer => `<span><i aria-hidden="true"></i>${escapeHtml(streamer)}</span>`).join('') + (live.length > 3 ? `<span>+${live.length - 3} more</span>` : '');
 }
@@ -1908,7 +1914,8 @@ function renderStreamerEditor() {
     const editorValues = streamerEditorValues(login, policy);
     const editorMode = editorValues.vod_handling;
     const playlistId = policy?.youtube_playlist_id || '';
-    const validationLabel = policy ? (needsReview ? 'Needs Review' : 'Valid') : 'Not saved';
+    const validationLabel = policy ? (needsReview ? 'Needs Review' : '') : 'Not saved';
+    const validationBadge = validationLabel ? `<span class="streamer-validation is-${needsReview ? 'review' : 'pending'}">${validationLabel}</span>` : '';
     const feedback = streamerPolicyFeedback.get(login) || '';
     const editorId = `streamerPolicyEditor-${login || index}`;
     const reviewId = `streamerPolicyReview-${login || index}`;
@@ -1925,7 +1932,7 @@ function renderStreamerEditor() {
       ${editorMode === 'download_and_youtube' && state?.settings?.auto_youtube_enabled !== true ? '<p class="streamer-global-pause-note">Configured for Download + YouTube · Automatic YouTube Processing is currently paused globally.</p>' : ''}
       <div class="streamer-policy-editor-footer"><p class="streamer-policy-feedback muted" role="status" aria-live="polite">${escapeHtml(feedback || 'No unsaved changes.')}</p><div class="button-row"><button type="button" class="quiet-button streamer-policy-cancel">Cancel</button><button type="button" class="primary streamer-policy-save">Save changes</button></div></div>
     </div>` : '';
-    return `<article class="streamer-editor-row${expanded ? ' is-expanded' : ''}${needsReview ? ' needs-review' : ''}" data-streamer-index="${index}" data-streamer-login="${escapeHtml(login)}"><div class="streamer-row-summary"><span class="streamer-order" aria-label="Position ${index + 1}">${index + 1}</span><div class="streamer-row-identity">${streamerAvatarHtml(name, 'compact')}<strong>${escapeHtml(name)}</strong><span class="streamer-validation is-${needsReview ? 'review' : policy ? 'valid' : 'pending'}">${validationLabel}</span></div><dl class="streamer-policy-summary"><div><dt>VOD Handling</dt><dd>${escapeHtml(policy ? vodHandlingLabel(mode) : 'Manual after save')}</dd></div><div><dt>Playlist</dt><dd title="${escapeHtml(playlistId)}">${escapeHtml(policy ? playlistDisplayName(playlistId) : 'No playlist')}</dd></div><div><dt>Live Recording</dt><dd>${escapeHtml(policy ? liveRecordingLabel(policy.live_recording) : 'Manual after save')}</dd></div></dl><button type="button" class="quiet-button streamer-edit-button" aria-expanded="${expanded ? 'true' : 'false'}" aria-controls="${editorId}" ${policy ? '' : 'disabled'}>${expanded ? 'Close' : 'Edit'}</button><details class="streamer-secondary-actions"><summary aria-label="More actions for ${escapeHtml(name)}">More</summary><div><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Move up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Move down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></details></div>${editor}</article>`;
+    return `<article class="streamer-editor-row${expanded ? ' is-expanded' : ''}${needsReview ? ' needs-review' : ''}" data-streamer-index="${index}" data-streamer-login="${escapeHtml(login)}"><div class="streamer-row-summary"><span class="streamer-order" aria-label="Position ${index + 1}">${index + 1}</span><div class="streamer-row-identity">${streamerAvatarHtml(name, 'compact')}<strong>${escapeHtml(name)}</strong>${validationBadge}</div><dl class="streamer-policy-summary"><div><dt>VOD Handling</dt><dd>${escapeHtml(policy ? vodHandlingLabel(mode) : 'Manual after save')}</dd></div><div><dt>Playlist</dt><dd title="${escapeHtml(playlistId)}">${escapeHtml(policy ? playlistDisplayName(playlistId) : 'No playlist')}</dd></div><div><dt>Live Recording</dt><dd>${escapeHtml(policy ? liveRecordingLabel(policy.live_recording) : 'Manual after save')}</dd></div></dl><button type="button" class="quiet-button streamer-edit-button" aria-expanded="${expanded ? 'true' : 'false'}" aria-controls="${editorId}" ${policy ? '' : 'disabled'}>${expanded ? 'Close' : 'Edit'}</button><details class="streamer-secondary-actions"><summary aria-label="More actions for ${escapeHtml(name)}">More</summary><div><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Move up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Move down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></details></div>${editor}</article>`;
   }).join('');
   wireStreamerAvatarFallbacks(list);
   list.querySelectorAll('.streamer-edit-button').forEach(button => button.addEventListener('click', () => {
@@ -2136,12 +2143,15 @@ function renderResults(results, errors, debug) {
   if ($('searchDiagnostics')) $('searchDiagnostics').innerHTML = dbgHtml;
   if ($('searchResultSummary')) $('searchResultSummary').textContent = `${lastResults.length} VOD${lastResults.length === 1 ? '' : 's'} found`;
   const body = $('resultsBody');
+  const resultsCard = body?.closest?.('.search-results-card');
   if (!lastResults.length) {
+    resultsCard?.classList.add('is-empty');
     body.innerHTML = '<tr><td colspan="6" class="muted">No matching VODs found. Try expanding the date range.</td></tr>';
     refreshSelectionState();
     return;
   }
 
+  resultsCard?.classList.remove('is-empty');
   const groups = new Map();
   lastResults.forEach(r => {
     const key = r.streamer || 'unknown';
@@ -3276,19 +3286,19 @@ function renderQueueOperationalSummary(view) {
 
 function renderQueueOperationLanes(view) {
   const hasRunning = view.active.length > 0;
+  const hasWaiting = view.waiting.length > 0;
   $('queueRunningSection')?.classList.toggle('is-idle', !hasRunning);
   $('queueRunning')?.classList.toggle('is-idle', !hasRunning);
   const activeCount = $('queueActive');
   if (activeCount) activeCount.hidden = !hasRunning;
   setQueueWorkspaceVisibility('queueRunningDownloadsLane', view.download.active.length > 0);
   setQueueWorkspaceVisibility('queueRunningUploadsLane', view.upload.active.length > 0);
-  setQueueWorkspaceVisibility('queueRunningIdle', !hasRunning);
+  setQueueWorkspaceVisibility('queueRunningIdle', !hasRunning && hasWaiting);
   setQueueWorkspaceCount('queueRunningDownloadsCount', view.download.active.length);
   setQueueWorkspaceCount('queueRunningUploadsCount', view.upload.active.length);
   renderQueueGroup('queueRunningDownloads', view.download.active, '', false);
   renderQueueGroup('queueRunningUploads', view.upload.active, '', false);
 
-  const hasWaiting = view.waiting.length > 0;
   setQueueWorkspaceVisibility('queueWaitingSection', hasWaiting);
   setQueueWorkspaceVisibility('queueWaitingDownloadsLane', view.download.waiting.length > 0);
   setQueueWorkspaceVisibility('queueWaitingUploadsLane', view.upload.waiting.length > 0);
@@ -3305,6 +3315,7 @@ function renderVodQueue(jobs, queueControls={}, persistenceStatus={}) {
   const errors = distinguishQueueItems(queueHistoryNewest(operations.errors));
   const completed = distinguishQueueItems(queueHistoryNewest(items.filter(item => item.state === 'completed')));
   const cancelled = distinguishQueueItems(queueHistoryNewest(items.filter(item => item.state === 'cancelled')));
+  document.querySelector('#page-queue .completed-section')?.classList.toggle('is-empty', completed.length === 0);
   renderQueueOperationalSummary({...operations, errors});
   renderQueueOperationLanes({...operations, errors});
   renderQueueGroup('queueErrors', errors, 'No jobs need attention.', true);
@@ -3767,9 +3778,12 @@ async function loadLocalVideos() {
     if ($('workspacePending')) $('workspacePending').textContent = String(counts.pending || 0);
     if (info) {
       const automatic = videos.filter(video => video.auto_youtube_managed && !video.already_uploaded).length;
-      info.textContent = includeUploaded
-        ? `${counts.pending || 0} ready · ${automatic} automatic · ${counts.uploaded || 0} uploaded or archived`
-        : `${counts.pending || 0} ready · ${automatic} automatic`;
+      info.hidden = !visibleVideos.length;
+      info.textContent = visibleVideos.length
+        ? (includeUploaded
+          ? `${counts.pending || 0} ready · ${automatic} automatic · ${counts.uploaded || 0} uploaded or archived`
+          : `${counts.pending || 0} ready · ${automatic} automatic`)
+        : '';
       info.className = 'inline-status muted';
     }
 
@@ -3806,7 +3820,7 @@ async function loadLocalVideos() {
     updateLocalUploadButton();
   } catch (error) {
     localVideoCache = new Map();
-    if (info) info.textContent = 'Local media could not be loaded.';
+    if (info) { info.hidden = false; info.textContent = 'Local media could not be loaded.'; }
     if (errorBox) { errorBox.hidden = false; errorBox.textContent = error.message || 'Unable to load local media.'; }
     box.innerHTML = '<div class="empty-workspace muted">Local media could not be loaded. Refresh to try again.</div>';
     updateLocalBulkSelectionControl(false);

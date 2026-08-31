@@ -2088,7 +2088,7 @@ const controls = {download:{queue_paused:false}, youtube_upload:{queue_paused:fa
 renderQueueOperationLanes(queueOperationsView([], controls));
 const idle = {
   upNextHidden:elements.queueWaitingSection.hidden,
-  idleVisible:!elements.queueRunningIdle.hidden,
+  idleVisible:elements.queueRunningIdle.hidden === false,
   activeCountHidden:elements.queueActive.hidden,
   runningSectionCompact:elements.queueRunningSection.classList.contains('is-idle'),
   runningContainerCompact:elements.queueRunning.classList.contains('is-idle'),
@@ -2100,6 +2100,7 @@ renderQueueOperationLanes(queueOperationsView([
   {state:'waiting', job:{type:'youtube_upload', id:'upload-2'}}
 ], controls));
 const waiting = {
+  idleVisible:elements.queueRunningIdle.hidden === false,
   upNextHidden:elements.queueWaitingSection.hidden,
   downloadLaneHidden:elements.queueWaitingDownloadsLane.hidden,
   uploadLaneHidden:elements.queueWaitingUploadsLane.hidden,
@@ -2126,13 +2127,14 @@ process.stdout.write(JSON.stringify({idle, waiting, active}));
             self.fail(completed.stderr or completed.stdout)
         rendered = json.loads(completed.stdout)
         self.assertTrue(rendered["idle"]["upNextHidden"])
-        self.assertTrue(rendered["idle"]["idleVisible"])
+        self.assertFalse(rendered["idle"]["idleVisible"])
         self.assertTrue(rendered["idle"]["activeCountHidden"])
         self.assertTrue(rendered["idle"]["runningSectionCompact"])
         self.assertTrue(rendered["idle"]["runningContainerCompact"])
         self.assertTrue(rendered["idle"]["downloadLaneHidden"])
         self.assertTrue(rendered["idle"]["uploadLaneHidden"])
         self.assertFalse(rendered["waiting"]["upNextHidden"])
+        self.assertTrue(rendered["waiting"]["idleVisible"])
         self.assertFalse(rendered["waiting"]["downloadLaneHidden"])
         self.assertFalse(rendered["waiting"]["uploadLaneHidden"])
         self.assertEqual(rendered["waiting"]["downloadItems"], ["download-2"])
@@ -2186,6 +2188,27 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(states["idle"]["idle"])
         self.assertFalse(states["waiting"]["idle"])
         self.assertFalse(states["active"]["idle"])
+
+    def test_slice_12b_empty_state_cleanup_contracts(self) -> None:
+        queue_renderer = JAVASCRIPT.split("function renderVodQueue", 1)[1].split("async function pollJobs", 1)[0]
+        self.assertIn(".completed-section", queue_renderer)
+        self.assertIn("completed.length === 0", queue_renderer)
+        self.assertIn("classList.toggle('is-empty'", queue_renderer)
+
+        self.assertIn('id="selectNewResults"', TEMPLATE)
+        self.assertIn('id="selectNewResults" class="quiet-button" type="button" disabled', TEMPLATE)
+        self.assertIn("rowcheck[data-already-downloaded=\"false\"]", JAVASCRIPT)
+        self.assertIn("selectReady.disabled = eligible.length === 0", JAVASCRIPT)
+        self.assertIn("search-results-card is-empty", TEMPLATE)
+        self.assertIn("resultsCard?.classList.remove('is-empty')", JAVASCRIPT)
+
+        local_loader = JAVASCRIPT.split("async function loadLocalVideos", 1)[1].split("function handleLocalVideoAction", 1)[0]
+        self.assertIn("visibleVideos.length", local_loader)
+        self.assertIn("info.textContent = visibleVideos.length", local_loader)
+        streamer_renderer = JAVASCRIPT.split("function renderStreamerEditor", 1)[1].split("async function saveStreamerPolicy", 1)[0]
+        self.assertIn("Needs Review", streamer_renderer)
+        self.assertIn("validationBadge", streamer_renderer)
+        self.assertNotIn("'Valid'", streamer_renderer)
 
     def test_dashboard_activity_render_hides_idle_dom_and_restores_waiting_up_next(self) -> None:
         if not NODE:

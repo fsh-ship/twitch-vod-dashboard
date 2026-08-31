@@ -113,6 +113,10 @@ const elements = Object.fromEntries([
   'queueCompletedDetails'
 ].map(id => [id, element()]));
 function $(id) { return elements[id] || null; }
+const completedSection = {classList:{toggle(){}}};
+const document = {querySelector(selector) {
+  return selector === '#page-queue .completed-section' ? completedSection : null;
+}};
 function renderQueueGroup(id, items) { elements[id].items = items; }
 function renderQueueLaneControls() {}
 function renderOverallRunningEstimate() {}
