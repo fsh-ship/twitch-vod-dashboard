@@ -36,8 +36,9 @@ function escapeHtml(value) {
     '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;'
   })[character]);
 }
-function renderProgressBar() { return ''; }
-eval(source.slice(classifierStart, classifierEnd));
+    function renderProgressBar() { return ''; }
+    function streamerAvatarForKnownIdentity(value, size) { return value ? `<avatar data-size="${size}">${value}</avatar>` : ''; }
+    eval(source.slice(classifierStart, classifierEnd));
 eval(source.slice(historyStart, historyEnd));
 eval(source.slice(errorStart, errorEnd));
 const items = queueItemsFromJobs(input.jobs || [], Date.parse('2026-08-23T21:00:00Z'));

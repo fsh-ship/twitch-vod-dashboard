@@ -293,6 +293,7 @@ let streamerProfilesLoadPromise = null;
 let streamerProfilesLoaded = false;
 let searchStreamerLoadState = 'loading';
 let searchStreamerLoadError = '';
+let searchStreamerSelection = null;
 let lastResults = [];
 let jobOpenState = {};
 let queueDetailOpenState = {};
@@ -526,6 +527,7 @@ async function loadState() {
   stateLoadPromise = api('/api/state').then(nextState => {
     state = nextState;
     if (!Array.isArray(state.streamers)) throw new Error('Configured streamers could not be read.');
+    searchStreamerSelection = null;
     searchStreamerLoadState = 'ready';
     renderState();
     initializeLiveStatuses();
@@ -550,10 +552,11 @@ window.loadState = loadState;
 function storedSearchStreamerSelection() {
   try {
     const raw = localStorage.getItem('vodSearchStreamerSelection');
-    const data = raw ? JSON.parse(raw) : null;
-    return Array.isArray(data) ? data : [];
+    if (raw === null) return null;
+    const data = JSON.parse(raw);
+    return Array.isArray(data) ? data : null;
   } catch {
-    return [];
+    return null;
   }
 }
 
@@ -563,6 +566,24 @@ function saveSearchStreamerSelection(names) {
 
 function configuredSearchStreamers() {
   return Array.isArray(state?.streamers) ? [...new Set(state.streamers)] : [];
+}
+
+function selectedSearchStreamersFromState() {
+  const streamers = configuredSearchStreamers();
+  const valid = new Set(streamers);
+  if (searchStreamerSelection === null) {
+    const stored = storedSearchStreamerSelection();
+    searchStreamerSelection = new Set(stored === null ? streamers : stored.filter(name => valid.has(name)));
+  } else {
+    searchStreamerSelection = new Set([...searchStreamerSelection].filter(name => valid.has(name)));
+  }
+  return streamers.filter(name => searchStreamerSelection.has(name));
+}
+
+function saveSearchStreamerSelectionState() {
+  const selected = selectedSearchStreamersFromState();
+  saveSearchStreamerSelection(selected);
+  return selected;
 }
 
 function ensureSearchStreamerPickerStreamers() {
@@ -594,11 +615,7 @@ function renderSearchStreamerCheckboxes() {
 
   const streamers = configuredSearchStreamers();
 
-  const saved = storedSearchStreamerSelection();
-  const valid = new Set(streamers);
-  let selected = saved.filter(s => valid.has(s));
-  if (!saved.length) selected = [...streamers];
-  const selectedSet = new Set(selected);
+  const selectedSet = new Set(selectedSearchStreamersFromState());
 
   if (!streamers.length) {
     box.innerHTML = '<div class="muted">No configured streamers.</div>';
@@ -610,17 +627,20 @@ function renderSearchStreamerCheckboxes() {
   }
 
   const filter = String($('searchStreamerFilter')?.value || '').trim().toLowerCase();
-  box.innerHTML = streamers.map(s => `
-    <label class="streamer-toggle-pill"${filter && !s.toLowerCase().includes(filter) ? ' hidden' : ''}>
+  const visibleStreamers = streamers.filter(s => !filter || s.toLowerCase().includes(filter));
+  box.innerHTML = visibleStreamers.map(s => `
+    <label class="streamer-picker-option">
       <input type="checkbox" class="search-streamer-check" value="${escapeHtml(s)}" ${selectedSet.has(s) ? 'checked' : ''}>
-      <span>${escapeHtml(s)}</span>
+      <span class="streamer-picker-identity">${streamerAvatarHtml(s, 'picker')}<span>${escapeHtml(s)}</span></span>
     </label>
-  `).join('') || '<div class="muted">No streamers loaded.</div>';
+  `).join('') || '<div class="muted">No streamers match this filter.</div>';
 
+  wireStreamerAvatarFallbacks(box);
   document.querySelectorAll('.search-streamer-check').forEach(cb => {
     cb.addEventListener('change', () => {
-      const selectedNow = selectedSearchStreamersFromCheckboxes();
-      saveSearchStreamerSelection(selectedNow);
+      if (cb.checked) searchStreamerSelection.add(cb.value);
+      else searchStreamerSelection.delete(cb.value);
+      saveSearchStreamerSelectionState();
       updateSearchStreamerToggleInfo();
     });
   });
@@ -628,7 +648,7 @@ function renderSearchStreamerCheckboxes() {
 }
 
 function selectedSearchStreamersFromCheckboxes() {
-  return [...document.querySelectorAll('.search-streamer-check:checked')].map(cb => cb.value);
+  return selectedSearchStreamersFromState();
 }
 
 function updateSearchStreamerToggleInfo() {
@@ -642,8 +662,9 @@ function updateSearchStreamerToggleInfo() {
 }
 
 function setAllSearchStreamers(checked) {
-  document.querySelectorAll('.search-streamer-check').forEach(cb => cb.checked = checked);
-  saveSearchStreamerSelection(selectedSearchStreamersFromCheckboxes());
+  searchStreamerSelection = new Set(checked ? configuredSearchStreamers() : []);
+  saveSearchStreamerSelectionState();
+  renderSearchStreamerCheckboxes();
   updateSearchStreamerToggleInfo();
 }
 
@@ -823,6 +844,10 @@ function streamerAvatarHtml(streamer, size='default') {
     ? `<img class="streamer-avatar-image" src="${escapeHtml(avatarUrl)}" alt="" loading="lazy" decoding="async">`
     : '';
   return `<span class="streamer-avatar streamer-avatar-${escapeHtml(size)}" aria-hidden="true"><span class="streamer-avatar-fallback">${escapeHtml(initials)}</span>${image}</span>`;
+}
+
+function streamerAvatarForKnownIdentity(streamer, size='default') {
+  return canonicalStreamerLoginClient(streamer) ? streamerAvatarHtml(streamer, size) : '';
 }
 
 function wireStreamerAvatarFallbacks(root) {
@@ -1933,7 +1958,7 @@ function renderResults(results, errors, debug) {
   const rows = [];
   for (const [streamer, items] of groups.entries()) {
     const openCount = items.filter(r => !r.already_downloaded).length;
-    rows.push(`<tr class="streamer-group-row"><td colspan="6"><div class="streamer-group-head"><div><strong>${escapeHtml(streamer)}</strong><span>${items.length} VOD(s), ${openCount} ready to download</span></div><div><button type="button" class="group-select" data-streamer="${escapeHtml(streamer)}">Select All</button><button type="button" class="group-clear" data-streamer="${escapeHtml(streamer)}">Clear</button></div></div></td></tr>`);
+    rows.push(`<tr class="streamer-group-row"><td colspan="6"><div class="streamer-group-head"><div class="streamer-group-identity">${streamerAvatarForKnownIdentity(streamer, 'group')}<div><strong>${escapeHtml(streamer)}</strong><span>${items.length} VOD(s), ${openCount} ready to download</span></div></div><div><button type="button" class="group-select" data-streamer="${escapeHtml(streamer)}">Select All</button><button type="button" class="group-clear" data-streamer="${escapeHtml(streamer)}">Clear</button></div></div></td></tr>`);
     items.forEach(r => {
       rows.push(`
         <tr class="vod-result-row">
@@ -1947,6 +1972,7 @@ function renderResults(results, errors, debug) {
     });
   }
   body.innerHTML = rows.join('');
+  wireStreamerAvatarFallbacks(body);
   const all = $('checkAll');
   if (all) all.checked = false;
   document.querySelectorAll('.rowcheck').forEach(cb => cb.addEventListener('change', refreshSelectionState));
@@ -2829,7 +2855,7 @@ function renderQueueVodItem(item, compact=false) {
   const details = queueTechnicalDetailsHtml(item, itemId, detailId, detailOpen, error);
   if (compact) {
     return `<article class="queue-vod-item compact ${attention} ${presentation.reviewRequired ? 'is-uncertain' : ''}">
-      <div class="queue-row-identity"><strong>${escapeHtml(item.streamer || (item.job?.type === 'recording' ? 'Twitch recording' : 'Unknown streamer'))}</strong><span>${escapeHtml(item.date || queueJobTypeLabel(item))}</span></div>
+      <div class="queue-row-identity"><div class="queue-streamer-identity">${streamerAvatarForKnownIdentity(item.streamer, 'queue')}<strong>${escapeHtml(item.streamer || (item.job?.type === 'recording' ? 'Twitch recording' : 'Unknown streamer'))}</strong></div><span>${escapeHtml(item.date || queueJobTypeLabel(item))}</span></div>
       <div class="queue-row-title">${escapeHtml(item.title || item.job.label)}</div>
       ${item.distinguishingLabel ? `<div class="queue-row-disambiguator muted">${escapeHtml(item.distinguishingLabel)}</div>` : ''}
       <span class="pill ${pillClass}">${escapeHtml(status)}</span>
@@ -2837,7 +2863,7 @@ function renderQueueVodItem(item, compact=false) {
     </article>`;
   }
   return `<article class="queue-vod-item ${attention} ${presentation.reviewRequired ? 'is-uncertain' : ''}">
-    <div class="queue-vod-main"><div class="queue-vod-copy">${identity ? `<div class="queue-vod-identity">${escapeHtml(identity)}</div>` : ''}<strong>${escapeHtml(item.title || item.job.label)}</strong></div><span class="pill ${pillClass}">${escapeHtml(status)}</span></div>
+    <div class="queue-vod-main"><div class="queue-vod-copy">${identity ? `<div class="queue-vod-identity queue-streamer-identity">${streamerAvatarForKnownIdentity(item.streamer, 'queue')}<span>${escapeHtml(identity)}</span></div>` : ''}<strong>${escapeHtml(item.title || item.job.label)}</strong></div><span class="pill ${pillClass}">${escapeHtml(status)}</span></div>
     ${support}${error}${cleanupNote}${reviewRequired}${retryRelationship}${progress}${progressDetails}${actions}${details}
   </article>`;
 }
@@ -2847,6 +2873,7 @@ function renderQueueGroup(id, items, emptyMessage, compact=false) {
   if (!box) return;
   box.classList.toggle('muted', !items.length);
   box.innerHTML = items.length ? items.map(item => renderQueueVodItem(item, compact)).join('') : escapeHtml(emptyMessage);
+  wireStreamerAvatarFallbacks(box);
   wireQueueItemInteractions(box);
 }
 
@@ -3519,7 +3546,7 @@ function renderLocalVideoCard(v) {
     : 'Local copy removed');
   return `<article class="video-workspace-card ${uploaded ? 'is-uploaded' : ''} ${hasLocalFile ? '' : 'is-local-removed'}" data-video-path="${escapeHtml(v.path)}">
     ${uploadable ? `<label class="video-select"><input class="localvideocheck" type="checkbox" data-path="${escapeHtml(v.path)}" checked><span>Select</span></label>` : `<span class="video-select muted">${autoYouTubeManaged ? 'Automatic' : 'History'}</span>`}
-    <div class="video-person"><strong>${escapeHtml(v.streamer || 'Unknown streamer')}</strong><span>${escapeHtml(v.date_de || 'Unknown date')}</span></div>
+    <div class="video-person"><div class="video-streamer-identity">${streamerAvatarForKnownIdentity(v.streamer, 'local')}<strong>${escapeHtml(v.streamer || 'Unknown streamer')}</strong></div><span>${escapeHtml(v.date_de || 'Unknown date')}</span></div>
     <strong class="video-display-title">${escapeHtml(v.title || v.youtube_title || v.name)}</strong>
     <span class="video-size">${hasLocalFile ? `${escapeHtml(v.size_gb)} GB` : 'Size unavailable'}</span>
     <span class="video-workflow ${autoYouTubeManaged ? 'accent' : 'muted'}">${workflow}<small>${escapeHtml(workspaceStatusLabel(v))}</small></span>
@@ -3576,6 +3603,7 @@ async function loadLocalVideos() {
         ? `<button type="button" id="showMoreUploadedHistory" class="quiet-button show-more-upload-history">Show more · ${hiddenUploadedCount} older upload${hiddenUploadedCount === 1 ? '' : 's'}</button>`
         : ''
     );
+    wireStreamerAvatarFallbacks(box);
     box.querySelectorAll('.localvideocheck').forEach(cb => cb.addEventListener('change', updateLocalUploadButton));
     box.querySelectorAll('.video-action').forEach(btn => btn.addEventListener('click', () => handleLocalVideoAction(btn.dataset.action, btn.dataset.path)));
     const showMore = $('showMoreUploadedHistory');

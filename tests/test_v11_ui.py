@@ -261,12 +261,22 @@ const localStore = new Map([['vodSearchStreamerSelection', JSON.stringify(['beta
 const localStorage = {getItem: key => localStore.get(key) || null, setItem: (key, value) => localStore.set(key, value)};
 const document = {querySelectorAll: selector => selector === '.search-streamer-check:checked' ? [{value:'beta'}] : []};
 function escapeHtml(value) { return String(value); }
+function streamerAvatarHtml(value, size) { return `<avatar data-size="${size}">${value}</avatar>`; }
+function wireStreamerAvatarFallbacks() {}
 let state = {streamers:['alpha', 'beta', 'alpha']};
 let searchStreamerLoadState = 'ready';
 let searchStreamerLoadError = '';
+let searchStreamerSelection = null;
 eval(source.slice(start, end));
 renderSearchStreamerCheckboxes();
 const loaded = {html: elements.searchStreamerCheckboxes.innerHTML, info: elements.searchStreamerToggleInfo.textContent};
+elements.searchStreamerFilter.value = 'alpha';
+renderSearchStreamerCheckboxes();
+const filtered = {html: elements.searchStreamerCheckboxes.innerHTML, selected:selectedSearchStreamersFromCheckboxes()};
+setAllSearchStreamers(false);
+const cleared = {selected:selectedSearchStreamersFromCheckboxes(), stored:localStore.get('vodSearchStreamerSelection')};
+setAllSearchStreamers(true);
+const selectedAll = {selected:selectedSearchStreamersFromCheckboxes(), stored:localStore.get('vodSearchStreamerSelection')};
 searchStreamerLoadState = 'loading';
 renderSearchStreamerCheckboxes();
 const loading = {html: elements.searchStreamerCheckboxes.innerHTML, info: elements.searchStreamerToggleInfo.textContent};
@@ -278,7 +288,7 @@ searchStreamerLoadState = 'ready';
 state = {streamers:[]};
 renderSearchStreamerCheckboxes();
 const empty = {html: elements.searchStreamerCheckboxes.innerHTML, info: elements.searchStreamerToggleInfo.textContent};
-process.stdout.write(JSON.stringify({loaded, loading, failed, empty}));
+process.stdout.write(JSON.stringify({loaded, filtered, cleared, selectedAll, loading, failed, empty}));
 """
     completed = subprocess.run(
         [NODE, "-e", runner],
@@ -286,6 +296,39 @@ process.stdout.write(JSON.stringify({loaded, loading, failed, empty}));
         encoding="utf-8",
         capture_output=True,
         check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
+def _evaluate_search_streamer_picker_close() -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for streamer picker UI tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('function closeSearchStreamerPicker');
+const end = source.indexOf('function updateVodFilterCount', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Streamer picker close helpers not found');
+let focused = false;
+const attributes = {};
+const elements = {
+  searchStreamerPickerPanel: {hidden:false},
+  searchStreamerPickerToggle: {setAttribute:(name, value) => { attributes[name] = value; }, focus:() => { focused = true; }},
+  searchStreamerFilter: {focus:() => { focused = 'filter'; }}
+};
+function $(id) { return elements[id] || null; }
+eval(source.slice(start, end));
+closeSearchStreamerPicker({returnFocus:true});
+const closed = {hidden:elements.searchStreamerPickerPanel.hidden, expanded:attributes['aria-expanded'], focused};
+focused = false;
+toggleSearchStreamerPicker();
+const reopened = {hidden:elements.searchStreamerPickerPanel.hidden, expanded:attributes['aria-expanded'], focused};
+process.stdout.write(JSON.stringify({closed, reopened}));
+"""
+    completed = subprocess.run(
+        [NODE, "-e", runner], cwd=ROOT, encoding="utf-8", capture_output=True, check=False
     )
     if completed.returncode != 0:
         raise AssertionError(completed.stderr or completed.stdout)
@@ -496,6 +539,7 @@ function renderProgressBar() { return ''; }
 function formatProcessedDuration(value) { return `${value}s`; }
 function queueErrorSummary(value) { return String(value || ''); }
 function queueItemKey(value) { return `${value.job.type || 'download'}:${value.job.id}:${value.itemId || value.index}`; }
+function streamerAvatarForKnownIdentity(value, size) { return value ? `<avatar data-size="${size}">${value}</avatar>` : ''; }
 eval(source.slice(start, end));
 const item = JSON.parse(fs.readFileSync(0, 'utf8'));
 item.itemId = item.itemId || 'upload-1-item-1';
@@ -531,6 +575,7 @@ const UPLOADED_HISTORY_PAGE_SIZE = 20;
 const localVideoCache = new Map();
 function escapeHtml(value) { return String(value || ''); }
 function formatRemainingDuration(value) { return `${Math.ceil(Number(value) / 3600)} hr remaining`; }
+function streamerAvatarForKnownIdentity(value, size) { return value ? `<avatar data-size="${size}">${value}</avatar>` : ''; }
 eval(source.slice(start, end));
 const visible = visibleLocalVideoRows(input.videos || [], true, 20);
 process.stdout.write(JSON.stringify({
@@ -1398,19 +1443,50 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn(".streamer-avatar-image", STYLESHEET)
         self.assertIn("object-fit:cover", STYLESHEET)
 
-    def test_avatar_hooks_are_limited_to_streamers_and_live_identity_rows(self) -> None:
+    def test_avatar_hooks_reuse_the_shared_component_on_approved_identity_rows(self) -> None:
         streamer_renderer = JAVASCRIPT.split("function renderStreamerEditor", 1)[1].split("async function saveStreamerPolicy", 1)[0]
         live_renderer = JAVASCRIPT.split("function renderLiveStreamCard", 1)[1].split("function syncLiveStreamers", 1)[0]
+        picker_renderer = JAVASCRIPT.split("function renderSearchStreamerCheckboxes", 1)[1].split("function selectedSearchStreamersFromCheckboxes", 1)[0]
+        result_renderer = JAVASCRIPT.split("function renderResults", 1)[1].split("async function searchVods", 1)[0]
+        local_renderer = JAVASCRIPT.split("function renderLocalVideoCard", 1)[1].split("function visibleLocalVideoRows", 1)[0]
+        queue_renderer = JAVASCRIPT.split("function renderQueueVodItem", 1)[1].split("function renderQueueGroup", 1)[0]
         self.assertIn("streamerAvatarHtml(name, 'compact')", streamer_renderer)
         self.assertIn("streamerAvatarHtml(streamer, 'live')", live_renderer)
         self.assertIn("streamerAvatarHtml(streamer, 'small')", live_renderer)
+        self.assertIn("streamerAvatarHtml(s, 'picker')", picker_renderer)
+        self.assertIn("streamerAvatarForKnownIdentity(streamer, 'group')", result_renderer)
+        self.assertIn("streamerAvatarForKnownIdentity(v.streamer, 'local')", local_renderer)
+        self.assertIn("streamerAvatarForKnownIdentity(item.streamer, 'queue')", queue_renderer)
         self.assertIn("wireStreamerAvatarFallbacks(list)", streamer_renderer)
         self.assertIn("actionRoots.forEach(wireStreamerAvatarFallbacks)", live_renderer)
+        self.assertIn("wireStreamerAvatarFallbacks(box)", picker_renderer)
+        self.assertIn("wireStreamerAvatarFallbacks(body)", result_renderer)
         self.assertIn("data-streamer-action=\"up\"", streamer_renderer)
         self.assertIn("data-streamer-action=\"down\"", streamer_renderer)
         self.assertIn("data-streamer-action=\"remove\"", streamer_renderer)
         self.assertIn("live-recording-start", live_renderer)
         self.assertIn("live-recording-stop", live_renderer)
+        self.assertEqual(JAVASCRIPT.count("function loadStreamerProfiles()"), 1)
+        self.assertNotIn("https://api.twitch.tv", JAVASCRIPT)
+        self.assertIn(".streamer-avatar-picker", STYLESHEET)
+        self.assertIn(".streamer-avatar-queue", STYLESHEET)
+
+    def test_local_vod_avatar_requires_a_reliable_streamer_identity(self) -> None:
+        known = {
+            "path": "C:/media/cptmary/known.mp4", "name": "known.mp4",
+            "streamer": "cptmary", "local_file_exists": True,
+        }
+        unknown = {
+            "path": "C:/media/unknown.mp4", "name": "unknown.mp4",
+            "streamer": "", "local_file_exists": True,
+        }
+        known_html = _evaluate_local_history_ui(known, [known])["card"]
+        unknown_html = _evaluate_local_history_ui(unknown, [unknown])["card"]
+
+        self.assertIn('<avatar data-size="local">cptmary</avatar>', known_html)
+        self.assertNotIn('<avatar', unknown_html)
+        self.assertIn("localvideocheck", known_html)
+        self.assertIn("localvideocheck", unknown_html)
 
     def test_manual_download_workflow_keeps_both_legacy_gates_separate(self) -> None:
         general = TEMPLATE.split('data-settings-panel="general"', 1)[1].split('data-settings-panel="automation"', 1)[0]
@@ -1921,11 +1997,36 @@ process.stdout.write(JSON.stringify({local, find}));
         self.assertIn('value="beta" checked', picker["loaded"]["html"])
         self.assertNotIn("removed_streamer", picker["loaded"]["html"])
         self.assertEqual(picker["loaded"]["info"], "1 selected")
+        self.assertIn('value="alpha"', picker["filtered"]["html"])
+        self.assertNotIn('value="beta"', picker["filtered"]["html"])
+        self.assertEqual(picker["filtered"]["selected"], ["beta"])
+        self.assertEqual(picker["cleared"]["selected"], [])
+        self.assertEqual(picker["cleared"]["stored"], "[]")
+        self.assertEqual(picker["selectedAll"]["selected"], ["alpha", "beta"])
+        self.assertEqual(picker["selectedAll"]["stored"], '["alpha","beta"]')
         self.assertIn("Loading configured streamers", picker["loading"]["html"])
         self.assertIn("Unable to load configured streamers", picker["failed"]["html"])
         self.assertIn("No configured streamers", picker["empty"]["html"])
         self.assertIn("ensureSearchStreamerPickerStreamers", JAVASCRIPT)
         self.assertIn("if (name === 'search') ensureSearchStreamerPickerStreamers();", JAVASCRIPT)
+
+    def test_vod_picker_filter_uses_canonical_selection_and_compact_checkbox_rows(self) -> None:
+        picker_renderer = JAVASCRIPT.split("function selectedSearchStreamersFromState", 1)[1].split("function closeSearchStreamerPicker", 1)[0]
+        self.assertIn("visibleStreamers", picker_renderer)
+        self.assertIn("searchStreamerSelection", picker_renderer)
+        self.assertIn("configuredSearchStreamers()", picker_renderer)
+        self.assertNotIn("streamer-toggle-pill", picker_renderer)
+        self.assertIn(".streamer-picker-option", STYLESHEET)
+        self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", STYLESHEET)
+        self.assertIn(".streamer-picker-panel .streamer-checkbox-grid { grid-template-columns:1fr;", STYLESHEET)
+
+    def test_vod_picker_close_honors_hidden_state_and_returns_focus(self) -> None:
+        result = _evaluate_search_streamer_picker_close()
+
+        self.assertEqual(result["closed"], {"hidden": True, "expanded": "false", "focused": True})
+        self.assertEqual(result["reopened"], {"hidden": False, "expanded": "true", "focused": "filter"})
+        self.assertIn(".streamer-picker-panel[hidden] { display:none; }", STYLESHEET)
+        self.assertIn("closeSearchStreamerPicker({returnFocus:true})", JAVASCRIPT)
 
     def test_find_vods_mobile_polish_has_compact_rows_and_bounded_picker(self) -> None:
         self.assertIn('id="resolvedDateRange"', TEMPLATE)
@@ -2000,6 +2101,7 @@ if (start < 0 || end < 0 || end <= start) throw new Error('Local VOD renderer so
 const UPLOADED_HISTORY_PAGE_SIZE = 20;
 function escapeHtml(value) { return String(value || ''); }
 function formatRemainingDuration(value) { return `${value} sec remaining`; }
+function streamerAvatarForKnownIdentity(value, size) { return value ? `<avatar data-size="${size}">${value}</avatar>` : ''; }
 eval(source.slice(start, end));
 const manual = {path:'manual', local_file_exists:true, already_uploaded:false};
 const automatic = {path:'automatic', local_file_exists:true, auto_youtube_managed:true};
