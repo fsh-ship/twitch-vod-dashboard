@@ -3144,17 +3144,12 @@ function renderQueueLaneControls(queueControls={}) {
     const view = queueLaneControlView(control, known);
     return `<div class="queue-lane-control"><span><strong>${label}</strong><small>${escapeHtml(view.note)}</small></span><button type="button" class="quiet-button queue-lane-action" data-lane="${lane}" data-action="${view.action}"${known ? '' : ' disabled'}>${view.label}</button></div>`;
   }).join('');
-  box.querySelectorAll('.queue-lane-action').forEach(button => button.addEventListener('click', async () => {
-    button.disabled = true;
+  box.querySelectorAll('.queue-lane-action').forEach(button => button.addEventListener('click', () => {
     const action = button.dataset.action;
-    showToast(action === 'pause' ? 'Active work continues; no new item will start.' : 'Queue resumed.');
-    try {
+    return withButtonPending(button, {pendingLabel:action === 'pause' ? 'Pausing...' : 'Resuming...'}, async () => {
       await api(`/api/queue/${action}`, {method:'POST', body:JSON.stringify({lane:button.dataset.lane})});
       await pollJobs();
-    } catch (error) {
-      button.disabled = false;
-      showToast(error.message, 'bad');
-    }
+    }).catch(error => showToast(error.message, 'bad'));
   }));
 }
 
@@ -3757,7 +3752,16 @@ async function loadLocalVideos() {
     );
     wireStreamerAvatarFallbacks(box);
     box.querySelectorAll('.localvideocheck').forEach(cb => cb.addEventListener('change', updateLocalUploadButton));
-    box.querySelectorAll('.video-action').forEach(btn => btn.addEventListener('click', () => handleLocalVideoAction(btn.dataset.action, btn.dataset.path)));
+    box.querySelectorAll('.video-action').forEach(btn => btn.addEventListener('click', () => {
+      const action = btn.dataset.action;
+      const path = btn.dataset.path;
+      if (action === 'upload') {
+        withButtonPending(btn, {pendingLabel:'Adding...'}, () => handleLocalVideoAction(action, path))
+          .catch(error => showToast(error.message || 'The VOD could not be added to the upload queue.', 'bad'));
+        return;
+      }
+      handleLocalVideoAction(action, path);
+    }));
     const showMore = $('showMoreUploadedHistory');
     if (showMore) showMore.addEventListener('click', () => {
       uploadedHistoryVisibleCount += UPLOADED_HISTORY_PAGE_SIZE;
@@ -4177,7 +4181,11 @@ loadState().then(() => {
     const refreshBtn = document.getElementById('refreshLocalVideos');
     if (refreshBtn) refreshBtn.onclick = function(ev) { ev.preventDefault(); loadLocalVideos().catch(e => alert(e.message)); };
     const uploadBtn = document.getElementById('uploadSelectedLocalVideos');
-    if (uploadBtn) uploadBtn.onclick = function(ev) { ev.preventDefault(); uploadSelectedLocalVideos().catch(e => alert(e.message)); };
+    if (uploadBtn) uploadBtn.onclick = function(ev) {
+      ev.preventDefault();
+      withButtonPending(uploadBtn, {pendingLabel:'Adding to Queue...'}, uploadSelectedLocalVideos)
+        .catch(e => alert(e.message));
+    };
     const checkAll = document.getElementById('checkAllLocalVideos');
     if (checkAll) checkAll.onclick = function(ev) {
       ev.preventDefault();

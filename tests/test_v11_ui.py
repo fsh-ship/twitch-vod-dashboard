@@ -1660,7 +1660,8 @@ class V11UiContractTests(unittest.TestCase):
         # Inline search/local-media errors and operational/security alerts retain their destinations.
         self.assertIn("$('searchErrors').innerHTML", JAVASCRIPT)
         self.assertIn("if (errorBox) { errorBox.hidden = false;", JAVASCRIPT)
-        self.assertIn("uploadSelectedLocalVideos().catch(e => alert(e.message))", JAVASCRIPT)
+        self.assertIn("withButtonPending(uploadBtn, {pendingLabel:'Adding to Queue...'}, uploadSelectedLocalVideos)", JAVASCRIPT)
+        self.assertIn(".catch(e => alert(e.message));", JAVASCRIPT)
         self.assertIn("alert('YouTube connection failed:", JAVASCRIPT)
         self.assertEqual(JAVASCRIPT.count("alert("), 25)
         self.assertEqual(JAVASCRIPT.count("confirm("), 0)
@@ -1749,6 +1750,27 @@ class V11UiContractTests(unittest.TestCase):
         self.assertRegex(streamer_save, r"streamers\s*:\s*\$\('streamersText'\)\.value")
         self.assertRegex(streamer_save, r"streamer_profiles\s*:\s*streamerProfileDraft")
 
+    def test_slice_11d3_keeps_operational_lifecycle_feedback_in_its_workspace(self) -> None:
+        live_actions = JAVASCRIPT.split("async function startLiveRecording", 1)[1].split("const STREAMER_LIST_FILTERS", 1)[0]
+        self.assertIn("liveRecordingActions.set(login, {phase:'starting'})", live_actions)
+        self.assertIn("liveRecordingActions.set(login, {phase:'stopping'})", live_actions)
+        self.assertIn("pollJobs().catch(() => {})", live_actions)
+
+        queue_actions = JAVASCRIPT.split("function wireQueueItemInteractions", 1)[1].split("function friendlyQueueActionError", 1)[0]
+        self.assertIn("pendingAutoYoutubeReleases", queue_actions)
+        self.assertIn("pendingAutoYoutubePlaylistActions", queue_actions)
+        self.assertIn("if (!confirmed) return;", queue_actions)
+        self.assertIn("button.disabled = true;", queue_actions)
+
+        lane_controls = JAVASCRIPT.split("function renderQueueLaneControls", 1)[1].split("function queueHistoryTimestamp", 1)[0]
+        self.assertIn("withButtonPending(button, {pendingLabel:action === 'pause' ? 'Pausing...' : 'Resuming...'}", lane_controls)
+        self.assertIn("await pollJobs();", lane_controls)
+        self.assertNotIn("Active work continues; no new item will start.", lane_controls)
+
+        self.assertIn("withButtonPending(btn, {pendingLabel:'Adding...'}", JAVASCRIPT)
+        self.assertIn("withButtonPending(uploadBtn, {pendingLabel:'Adding to Queue...'}, uploadSelectedLocalVideos)", JAVASCRIPT)
+        self.assertIn("showPage('queue');", JAVASCRIPT)
+
     def test_mobile_toast_placement_is_bottom_anchored_and_stacks_upward(self) -> None:
         self.assertIn(".app-toast-container { top:auto; right:max(12px,env(safe-area-inset-right));", STYLESHEET)
         self.assertIn("bottom:calc(12px + env(safe-area-inset-bottom))", STYLESHEET)
@@ -1828,7 +1850,21 @@ class V11UiContractTests(unittest.TestCase):
             self.assertIn(label, JAVASCRIPT)
         self.assertNotIn("Move Up", JAVASCRIPT)
         self.assertNotIn("Move Down", JAVASCRIPT)
-        self.assertIn("Active work continues; no new item will start.", JAVASCRIPT)
+        lane_view = JAVASCRIPT.split("function queueLaneControlView", 1)[1].split("function renderQueueLaneControls", 1)[0]
+        lane_controls = JAVASCRIPT.split("function renderQueueLaneControls", 1)[1].split("function queueHistoryTimestamp", 1)[0]
+        self.assertIn("label:paused ? 'Resume Queue' : 'Pause Queue'", lane_view)
+        self.assertIn("Object.prototype.hasOwnProperty.call(queueControls, lane)", lane_controls)
+        self.assertIn("const view = queueLaneControlView(control, known)", lane_controls)
+        self.assertIn("${view.label}", lane_controls)
+        self.assertRegex(lane_controls, r"/api/queue/\$\{action\}")
+        self.assertIn("withButtonPending(button,", lane_controls)
+        self.assertIn("Pausing...", lane_controls)
+        self.assertIn("Resuming...", lane_controls)
+        api_call = lane_controls.index("await api(")
+        poll_call = lane_controls.index("await pollJobs()")
+        self.assertLess(api_call, poll_call)
+        self.assertIn("showToast(error.message, 'bad')", lane_controls)
+        self.assertNotIn("Active work continues; no new item will start.", lane_controls)
 
     def test_queue_operations_workspace_separates_lanes_and_is_media_free(self) -> None:
         queue_page = TEMPLATE.split('id="page-queue"', 1)[1].split('id="page-settings"', 1)[0]
