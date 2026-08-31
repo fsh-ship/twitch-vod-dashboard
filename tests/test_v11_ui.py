@@ -119,6 +119,80 @@ process.stdout.write(JSON.stringify({
     return json.loads(completed.stdout)
 
 
+def _evaluate_streamer_avatar_ui() -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for avatar UI tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const loaderStart = source.indexOf('function normalizeStreamerProfileMap');
+const loaderEnd = source.indexOf('function localCalendarDate');
+const avatarStart = source.indexOf('function streamerProfileFor');
+const avatarEnd = source.indexOf('function automationProductView');
+if ([loaderStart, loaderEnd, avatarStart, avatarEnd].some(index => index < 0)) throw new Error('Avatar helpers not found');
+let streamerProfilesByLogin = new Map();
+let streamerProfilesLoadPromise = null;
+let streamerProfilesLoaded = false;
+let calls = 0;
+let shouldFail = false;
+function canonicalStreamerLoginClient(value) {
+  const login = String(value || '').trim().replace(/^@+/, '').toLowerCase();
+  return /^[a-z0-9_]{1,25}$/.test(login) ? login : '';
+}
+function escapeHtml(value) {
+  return String(value || '').replace(/[&<>'"]/g, character => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;'
+  })[character]);
+}
+function api(path) {
+  calls += 1;
+  if (shouldFail) return Promise.reject(new Error('profiles unavailable'));
+  if (path !== '/api/streamer-profiles') throw new Error('unexpected path');
+  return Promise.resolve({profiles:{
+    NIKA_LIVETV:{login:'Nika_LiveTV', display_name:'Nika LiveTV', avatar_url:'/api/streamer-avatar/nika_livetv'},
+    no_image:{login:'No_Image', display_name:'No Image'}
+  }});
+}
+eval(source.slice(loaderStart, loaderEnd));
+eval(source.slice(avatarStart, avatarEnd));
+(async () => {
+  const first = loadStreamerProfiles();
+  const second = loadStreamerProfiles();
+  await Promise.all([first, second]);
+  const imageHtml = streamerAvatarHtml('NIKA_LIVETV', 'compact');
+  const missingHtml = streamerAvatarHtml('digitalgirluli');
+  const noImageHtml = streamerAvatarHtml('no_image');
+  let errorHandler = null;
+  let removed = false;
+  const image = { addEventListener:(name, handler) => { if (name === 'error') errorHandler = handler; }, remove:() => { removed = true; } };
+  wireStreamerAvatarFallbacks({querySelectorAll:() => [image]});
+  errorHandler();
+  const callsAfterRender = calls;
+  streamerProfilesByLogin = new Map();
+  streamerProfilesLoadPromise = null;
+  streamerProfilesLoaded = false;
+  shouldFail = true;
+  await loadStreamerProfiles();
+  const failureHtml = streamerAvatarHtml('nika_livetv');
+  process.stdout.write(JSON.stringify({
+    callsAfterLoad:callsAfterRender,
+    imageHtml, missingHtml, noImageHtml, failureHtml, removed,
+    profileKeys:[...streamerProfilesByLogin.keys()]
+  }));
+})().catch(error => { process.stderr.write(String(error.stack || error)); process.exitCode = 1; });
+"""
+    completed = subprocess.run(
+        [NODE, "-e", runner],
+        cwd=ROOT,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
 def _search_result_status(result: dict) -> str:
     if not NODE:
         raise unittest.SkipTest("Node.js is required for search UI tests")
@@ -500,6 +574,7 @@ let liveRecordingJobs = [];
 let liveRecordingActions = new Map();
 let autoRecorderStatusSnapshot = null;
 let state = {settings:{auto_recorder_enabled:false, streamer_profiles:{}}};
+let streamerProfilesByLogin = new Map();
 const elements = {
   liveStreamsList: {
     innerHTML:'',
@@ -1301,6 +1376,41 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("overflow-x:auto", STYLESHEET)
         self.assertIn(".streamer-discovery-controls { grid-template-columns:1fr;", STYLESHEET)
         self.assertIn("event.key !== 'Escape'", JAVASCRIPT)
+
+    def test_streamer_avatar_loader_and_renderer_are_shared_and_safe(self) -> None:
+        result = _evaluate_streamer_avatar_ui()
+
+        self.assertEqual(result["callsAfterLoad"], 1)
+        self.assertEqual(result["profileKeys"], [])
+        self.assertIn('src="/api/streamer-avatar/nika_livetv"', result["imageHtml"])
+        self.assertIn('alt=""', result["imageHtml"])
+        self.assertIn('aria-hidden="true"', result["imageHtml"])
+        self.assertIn("NL", result["imageHtml"])
+        self.assertNotIn("streamer-avatar-image", result["missingHtml"])
+        self.assertIn(">D<", result["missingHtml"])
+        self.assertNotIn("streamer-avatar-image", result["noImageHtml"])
+        self.assertIn(">NI<", result["noImageHtml"])
+        self.assertNotIn("streamer-avatar-image", result["failureHtml"])
+        self.assertTrue(result["removed"])
+        self.assertIn("function loadStreamerProfiles()", JAVASCRIPT)
+        self.assertIn("function streamerAvatarHtml", JAVASCRIPT)
+        self.assertIn("function wireStreamerAvatarFallbacks", JAVASCRIPT)
+        self.assertIn(".streamer-avatar-image", STYLESHEET)
+        self.assertIn("object-fit:cover", STYLESHEET)
+
+    def test_avatar_hooks_are_limited_to_streamers_and_live_identity_rows(self) -> None:
+        streamer_renderer = JAVASCRIPT.split("function renderStreamerEditor", 1)[1].split("async function saveStreamerPolicy", 1)[0]
+        live_renderer = JAVASCRIPT.split("function renderLiveStreamCard", 1)[1].split("function syncLiveStreamers", 1)[0]
+        self.assertIn("streamerAvatarHtml(name, 'compact')", streamer_renderer)
+        self.assertIn("streamerAvatarHtml(streamer, 'live')", live_renderer)
+        self.assertIn("streamerAvatarHtml(streamer, 'small')", live_renderer)
+        self.assertIn("wireStreamerAvatarFallbacks(list)", streamer_renderer)
+        self.assertIn("actionRoots.forEach(wireStreamerAvatarFallbacks)", live_renderer)
+        self.assertIn("data-streamer-action=\"up\"", streamer_renderer)
+        self.assertIn("data-streamer-action=\"down\"", streamer_renderer)
+        self.assertIn("data-streamer-action=\"remove\"", streamer_renderer)
+        self.assertIn("live-recording-start", live_renderer)
+        self.assertIn("live-recording-stop", live_renderer)
 
     def test_manual_download_workflow_keeps_both_legacy_gates_separate(self) -> None:
         general = TEMPLATE.split('data-settings-panel="general"', 1)[1].split('data-settings-panel="automation"', 1)[0]

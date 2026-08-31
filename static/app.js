@@ -288,6 +288,9 @@ const pageMetaEarly = {
 
 let state = null;
 let stateLoadPromise = null;
+let streamerProfilesByLogin = new Map();
+let streamerProfilesLoadPromise = null;
+let streamerProfilesLoaded = false;
 let searchStreamerLoadState = 'loading';
 let searchStreamerLoadError = '';
 let lastResults = [];
@@ -368,6 +371,41 @@ async function api(path, options = {}) {
     throw error;
   }
   return data;
+}
+
+function normalizeStreamerProfileMap(payload) {
+  const profiles = payload?.profiles;
+  const normalized = new Map();
+  if (!profiles || typeof profiles !== 'object') return normalized;
+  Object.entries(profiles).forEach(([rawLogin, rawProfile]) => {
+    const login = canonicalStreamerLoginClient(rawProfile?.login || rawLogin);
+    if (!login || !rawProfile || typeof rawProfile !== 'object' || normalized.has(login)) return;
+    normalized.set(login, {
+      login,
+      display_name: String(rawProfile.display_name || '').trim(),
+      avatar_url: String(rawProfile.avatar_url || '').trim()
+    });
+  });
+  return normalized;
+}
+
+function loadStreamerProfiles() {
+  if (streamerProfilesLoaded) return Promise.resolve(streamerProfilesByLogin);
+  if (streamerProfilesLoadPromise) return streamerProfilesLoadPromise;
+  streamerProfilesLoadPromise = api('/api/streamer-profiles')
+    .then(payload => {
+      streamerProfilesByLogin = normalizeStreamerProfileMap(payload);
+      return streamerProfilesByLogin;
+    })
+    .catch(() => {
+      streamerProfilesByLogin = new Map();
+      return streamerProfilesByLogin;
+    })
+    .finally(() => {
+      streamerProfilesLoaded = true;
+      streamerProfilesLoadPromise = null;
+    });
+  return streamerProfilesLoadPromise;
 }
 
 function localCalendarDate(date) {
@@ -491,6 +529,11 @@ async function loadState() {
     searchStreamerLoadState = 'ready';
     renderState();
     initializeLiveStatuses();
+    loadStreamerProfiles().then(() => {
+      if (!state) return;
+      if (!streamerPolicyEditorDirty) renderStreamerEditor();
+      renderLiveStreams();
+    });
   }).catch(error => {
     searchStreamerLoadState = 'error';
     searchStreamerLoadError = error.message || 'Unable to load configured streamers.';
@@ -755,6 +798,37 @@ function cloneStreamerProfiles(profiles) {
 function streamerProfileAutoRecordEnabled(profiles, streamer) {
   const login = canonicalStreamerLoginClient(streamer);
   return !!login && profiles?.[login]?.auto_record === true;
+}
+
+function streamerProfileFor(streamer) {
+  return streamerProfilesByLogin.get(canonicalStreamerLoginClient(streamer)) || null;
+}
+
+function streamerAvatarInitials(streamer, profile=streamerProfileFor(streamer)) {
+  const source = String(profile?.display_name || streamer || '').trim();
+  if (!source) return '?';
+  const parts = source.replace(/[_-]+/g, ' ').split(/\s+/).filter(Boolean);
+  if (!parts.length) return '?';
+  if (profile?.display_name && parts.length > 1) {
+    return (parts[0][0] + parts[1][0]).toUpperCase();
+  }
+  return parts[0][0].toUpperCase();
+}
+
+function streamerAvatarHtml(streamer, size='default') {
+  const profile = streamerProfileFor(streamer);
+  const avatarUrl = String(profile?.avatar_url || '').trim();
+  const initials = streamerAvatarInitials(streamer, profile);
+  const image = avatarUrl
+    ? `<img class="streamer-avatar-image" src="${escapeHtml(avatarUrl)}" alt="" loading="lazy" decoding="async">`
+    : '';
+  return `<span class="streamer-avatar streamer-avatar-${escapeHtml(size)}" aria-hidden="true"><span class="streamer-avatar-fallback">${escapeHtml(initials)}</span>${image}</span>`;
+}
+
+function wireStreamerAvatarFallbacks(root) {
+  root?.querySelectorAll?.('.streamer-avatar-image').forEach(image => {
+    image.addEventListener('error', () => image.remove(), {once:true});
+  });
 }
 
 function buildYoutubeUploadRequest(paths, mode, playlistId='') {
@@ -1267,7 +1341,7 @@ function renderLiveStreamCard(streamer) {
   return `<article class="live-stream-card is-${stateClass}" data-live-streamer="${escapeHtml(login)}">
     <div class="live-stream-indicator" aria-hidden="true"></div>
     <div class="live-stream-copy">
-      <div class="live-stream-primary"><span class="live-stream-state">${escapeHtml(statusLabel)}</span><strong class="live-stream-name">${escapeHtml(streamer)}</strong></div>
+      <div class="live-stream-primary"><span class="live-stream-state">${escapeHtml(statusLabel)}</span><span class="live-stream-identity">${streamerAvatarHtml(streamer, 'live')}<strong class="live-stream-name">${escapeHtml(streamer)}</strong></span></div>
       <div class="live-stream-details">${titleHtml}<div class="live-stream-footer"><div class="live-stream-metadata">${metadata}</div><div class="live-stream-actions">${actionHtml}</div></div></div>
     </div>
   </article>`;
@@ -1281,6 +1355,7 @@ function renderOfflineStreamer(streamer) {
     : (liveStatusRequests.has(login) ? 'Offline · updating…' : 'Offline');
   return `<div class="offline-stream-item" data-live-streamer="${escapeHtml(login)}">
     <span class="offline-stream-indicator" aria-hidden="true"></span>
+    ${streamerAvatarHtml(streamer, 'small')}
     <strong>${escapeHtml(streamer)}</strong>
     <span>${escapeHtml(refreshLabel)}</span>
   </div>`;
@@ -1366,6 +1441,7 @@ function renderLiveStreams() {
   actionRoots.forEach(root => root.querySelectorAll('.live-recording-stop').forEach(button => button.addEventListener('click', () => {
     stopLiveRecording(button.dataset.jobId, button.dataset.streamer).catch(() => {});
   })));
+  actionRoots.forEach(wireStreamerAvatarFallbacks);
   box.querySelector('.offline-streams-toggle')?.addEventListener('click', toggleOfflineStreamers);
 }
 
@@ -1637,8 +1713,9 @@ function renderStreamerEditor() {
       ${editorMode === 'download_and_youtube' && state?.settings?.auto_youtube_enabled !== true ? '<p class="streamer-global-pause-note">Configured for Download + YouTube · Automatic YouTube Processing is currently paused globally.</p>' : ''}
       <div class="streamer-policy-editor-footer"><p class="streamer-policy-feedback muted" role="status" aria-live="polite">${escapeHtml(feedback || 'No unsaved policy changes.')}</p><div class="button-row"><button type="button" class="quiet-button streamer-policy-cancel">Cancel</button><button type="button" class="primary streamer-policy-save">Save changes</button></div></div>
     </div>` : '';
-    return `<article class="streamer-editor-row${expanded ? ' is-expanded' : ''}${needsReview ? ' needs-review' : ''}" data-streamer-index="${index}" data-streamer-login="${escapeHtml(login)}"><div class="streamer-row-summary"><span class="streamer-order" aria-label="Position ${index + 1}">${index + 1}</span><div class="streamer-row-identity"><strong>${escapeHtml(name)}</strong><span class="streamer-validation is-${needsReview ? 'review' : policy ? 'valid' : 'pending'}">${validationLabel}</span></div><dl class="streamer-policy-summary"><div><dt>VOD Handling</dt><dd>${escapeHtml(policy ? vodHandlingLabel(mode) : 'Manual after save')}</dd></div><div><dt>Playlist</dt><dd title="${escapeHtml(playlistId)}">${escapeHtml(policy ? playlistDisplayName(playlistId) : 'No playlist')}</dd></div><div><dt>Live Recording</dt><dd>${escapeHtml(policy ? liveRecordingLabel(policy.live_recording) : 'Manual after save')}</dd></div></dl><button type="button" class="quiet-button streamer-edit-button" aria-expanded="${expanded ? 'true' : 'false'}" aria-controls="${editorId}" ${policy ? '' : 'disabled'}>${expanded ? 'Close' : 'Edit'}</button><details class="streamer-secondary-actions"><summary aria-label="More actions for ${escapeHtml(name)}">More</summary><div><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Move up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Move down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></details></div>${editor}</article>`;
+    return `<article class="streamer-editor-row${expanded ? ' is-expanded' : ''}${needsReview ? ' needs-review' : ''}" data-streamer-index="${index}" data-streamer-login="${escapeHtml(login)}"><div class="streamer-row-summary"><span class="streamer-order" aria-label="Position ${index + 1}">${index + 1}</span><div class="streamer-row-identity">${streamerAvatarHtml(name, 'compact')}<strong>${escapeHtml(name)}</strong><span class="streamer-validation is-${needsReview ? 'review' : policy ? 'valid' : 'pending'}">${validationLabel}</span></div><dl class="streamer-policy-summary"><div><dt>VOD Handling</dt><dd>${escapeHtml(policy ? vodHandlingLabel(mode) : 'Manual after save')}</dd></div><div><dt>Playlist</dt><dd title="${escapeHtml(playlistId)}">${escapeHtml(policy ? playlistDisplayName(playlistId) : 'No playlist')}</dd></div><div><dt>Live Recording</dt><dd>${escapeHtml(policy ? liveRecordingLabel(policy.live_recording) : 'Manual after save')}</dd></div></dl><button type="button" class="quiet-button streamer-edit-button" aria-expanded="${expanded ? 'true' : 'false'}" aria-controls="${editorId}" ${policy ? '' : 'disabled'}>${expanded ? 'Close' : 'Edit'}</button><details class="streamer-secondary-actions"><summary aria-label="More actions for ${escapeHtml(name)}">More</summary><div><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Move up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Move down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></details></div>${editor}</article>`;
   }).join('');
+  wireStreamerAvatarFallbacks(list);
   list.querySelectorAll('.streamer-edit-button').forEach(button => button.addEventListener('click', () => {
     const login = button.closest('[data-streamer-login]')?.dataset.streamerLogin || '';
     if (streamerPolicyEditorDirty && login !== expandedStreamerLogin) {
