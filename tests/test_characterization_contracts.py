@@ -235,6 +235,12 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
             ("/api/auth/status", "GET", "api_auth_status"),
             ("/api/dashboard", "GET", "api_dashboard"),
             ("/api/state", "GET", "state"),
+            ("/api/streamer-profiles", "GET", "api_streamer_profiles"),
+            (
+                "/api/streamer-avatar/<path:login>",
+                "GET",
+                "api_streamer_avatar",
+            ),
             ("/api/settings/status", "GET", "api_settings_status"),
             (
                 "/api/auto-recorder/status",

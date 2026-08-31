@@ -16,7 +16,16 @@ from html import escape
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
-from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    session,
+    url_for,
+)
 
 from vod_dashboard import dashboard_state
 from vod_dashboard import auto_recorder as dashboard_auto_recorder
@@ -47,6 +56,7 @@ from vod_dashboard import media as dashboard_media
 from vod_dashboard import runtime as dashboard_runtime
 from vod_dashboard import security as dashboard_security
 from vod_dashboard import settings as dashboard_settings
+from vod_dashboard import streamer_profiles as dashboard_streamer_profiles
 from vod_dashboard import twitch as dashboard_twitch
 from vod_dashboard import vod_search as dashboard_vod_search
 from vod_dashboard import youtube as dashboard_youtube
@@ -106,6 +116,10 @@ LOCAL_SETTINGS_FILE = RUNTIME_PATHS.local_settings_file
 SETTINGS_FILE = RUNTIME_PATHS.settings_file
 LOG_FILE = RUNTIME_PATHS.log_file
 LOG_MAX_BYTES = dashboard_runtime.LOG_MAX_BYTES
+STREAMER_AVATAR_DIR = SETTINGS_FILE.parent / "streamer-avatars"
+STREAMER_PROFILE_CACHE = dashboard_streamer_profiles.StreamerProfileCache(
+    STREAMER_AVATAR_DIR
+)
 
 DEFAULT_SETTINGS = dashboard_settings.DEFAULT_SETTINGS
 
@@ -2293,6 +2307,37 @@ def state():
         )
     )
     return jsonify(payload)
+
+
+@app.get("/api/streamer-profiles")
+def api_streamer_profiles():
+    settings = load_settings()
+    configured_streamers = read_streamers(settings)
+    client_id = str(
+        os.environ.get("TWITCH_CLIENT_ID")
+        or os.environ.get("VOD_DASHBOARD_TWITCH_CLIENT_ID")
+        or ""
+    )
+    access_token = str(
+        os.environ.get("TWITCH_ACCESS_TOKEN")
+        or os.environ.get("VOD_DASHBOARD_TWITCH_ACCESS_TOKEN")
+        or ""
+    )
+    profiles = STREAMER_PROFILE_CACHE.public_profiles(
+        configured_streamers,
+        client_id=client_id,
+        access_token=access_token,
+    )
+    return jsonify({"profiles": profiles})
+
+
+@app.get("/api/streamer-avatar/<path:login>")
+def api_streamer_avatar(login: str):
+    cached = STREAMER_PROFILE_CACHE.resolve_avatar(login)
+    if cached is None:
+        return "", 404
+    path, content_type = cached
+    return send_file(path, mimetype=content_type, conditional=True)
 
 
 @app.get("/api/settings/status")
