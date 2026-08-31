@@ -470,6 +470,7 @@ let liveStatusRequests = new Map();
 let liveStatusRefreshPromise = null;
 let liveStatusInitialRefreshStarted = false;
 let liveOfflineExpanded = false;
+let liveStatusUnavailableExpanded = false;
 let liveStatusLastUpdatedAt = null;
 let liveRecordingJobs = [];
 let liveRecordingActions = new Map();
@@ -1431,7 +1432,13 @@ function liveStreamerIsFeatured(streamer) {
   const login = canonicalStreamerLoginClient(streamer);
   const status = liveStreamStatuses.get(login) || {state:'unknown'};
   const job = recordingJobForStreamer(login);
-  return !!job || status.state === 'live' || status.state === 'error';
+  return !!job || status.state === 'live';
+}
+
+function liveStreamerHasUnavailableStatus(streamer) {
+  const login = canonicalStreamerLoginClient(streamer);
+  const status = liveStreamStatuses.get(login) || {state:'unknown'};
+  return status.state === 'error' && !recordingJobForStreamer(login);
 }
 
 function liveStreamerDisplayPriority(streamer) {
@@ -1447,7 +1454,7 @@ function liveStreamerDisplayPriority(streamer) {
   return 6;
 }
 
-function liveStreamSummaryText(featured, offline) {
+function liveStreamSummaryText(featured, offline, unavailable=[]) {
   const liveCount = featured.filter(streamer => {
     const login = canonicalStreamerLoginClient(streamer);
     return liveStreamStatuses.get(login)?.state === 'live';
@@ -1456,7 +1463,8 @@ function liveStreamSummaryText(featured, offline) {
     const job = recordingJobForStreamer(streamer);
     return !!job && ACTIVE_RECORDING_STATES.has(job.state);
   }).length;
-  return `${liveCount} Live · ${recordingCount} Recording · ${offline.length} Offline`;
+  const summary = `${liveCount} Live · ${recordingCount} Recording · ${offline.length} Offline`;
+  return unavailable.length ? `${summary} · ${unavailable.length} Unavailable` : summary;
 }
 
 function renderDashboardLiveSummary() {
@@ -1541,8 +1549,23 @@ function renderOfflineStreamer(streamer) {
   </div>`;
 }
 
+function renderUnavailableStreamer(streamer) {
+  const login = canonicalStreamerLoginClient(streamer);
+  return `<div class="offline-stream-item status-unavailable-item" data-live-streamer="${escapeHtml(login)}">
+    <span class="offline-stream-indicator" aria-hidden="true"></span>
+    ${streamerAvatarHtml(streamer, 'small')}
+    <strong>${escapeHtml(streamer)}</strong>
+    <span>Status could not be loaded</span>
+  </div>`;
+}
+
 function toggleOfflineStreamers() {
   liveOfflineExpanded = !liveOfflineExpanded;
+  renderLiveStreams();
+}
+
+function toggleUnavailableLiveStreamers() {
+  liveStatusUnavailableExpanded = !liveStatusUnavailableExpanded;
   renderLiveStreams();
 }
 
@@ -1576,9 +1599,12 @@ function renderLiveStreams() {
         && !liveStreamerIsFeatured(item.streamer);
     })
     .map(item => item.streamer);
-  const summaryText = liveStreamSummaryText(featured, offline);
+  const unavailable = indexed
+    .filter(item => liveStreamerHasUnavailableStatus(item.streamer))
+    .map(item => item.streamer);
+  const summaryText = liveStreamSummaryText(featured, offline, unavailable);
   if (summary) summary.textContent = summaryText;
-  if (dashboardSummary) dashboardSummary.textContent = summaryText.replace(/ · \d+ Offline$/, '');
+  if (dashboardSummary) dashboardSummary.textContent = liveStreamSummaryText(featured, offline).replace(/ · \d+ Offline$/, '');
   renderDashboardLiveSummary();
   const initialCheckPending = liveStatusLastUpdatedAt === null && (
     liveStatusRefreshPromise !== null
@@ -1613,7 +1639,15 @@ function renderLiveStreams() {
         <div id="offlineStreamersList" class="offline-stream-grid"${liveOfflineExpanded ? '' : ' hidden'}>${offline.map(streamer => renderOfflineStreamer(streamer)).join('')}</div>
       </section>`
     : '';
-  box.innerHTML = liveContent + offlineContent;
+  const unavailableContent = unavailable.length
+    ? `<section class="offline-streams live-status-unavailable">
+        <button type="button" class="offline-streams-toggle status-unavailable-toggle" aria-expanded="${liveStatusUnavailableExpanded ? 'true' : 'false'}" aria-controls="unavailableLiveStreamersList" aria-label="${liveStatusUnavailableExpanded ? 'Hide' : 'Show'} ${unavailable.length} streamers with unavailable live status">
+          <span>Status unavailable · ${unavailable.length}</span><span>${liveStatusUnavailableExpanded ? 'Hide' : 'Show'}</span>
+        </button>
+        <div id="unavailableLiveStreamersList" class="offline-stream-grid"${liveStatusUnavailableExpanded ? '' : ' hidden'}>${unavailable.map(streamer => renderUnavailableStreamer(streamer)).join('')}</div>
+      </section>`
+    : '';
+  box.innerHTML = liveContent + unavailableContent + offlineContent;
   const actionRoots = [box, activeBox].filter(Boolean);
   actionRoots.forEach(root => root.querySelectorAll('.live-recording-start').forEach(button => button.addEventListener('click', () => {
     startLiveRecording(button.dataset.streamer).catch(() => {});
@@ -1622,7 +1656,8 @@ function renderLiveStreams() {
     stopLiveRecording(button.dataset.jobId, button.dataset.streamer).catch(() => {});
   })));
   actionRoots.forEach(wireStreamerAvatarFallbacks);
-  box.querySelector('.offline-streams-toggle')?.addEventListener('click', toggleOfflineStreamers);
+  box.querySelector('.status-unavailable-toggle')?.addEventListener('click', toggleUnavailableLiveStreamers);
+  box.querySelector('.offline-streams:not(.live-status-unavailable) .offline-streams-toggle')?.addEventListener('click', toggleOfflineStreamers);
 }
 
 function syncLiveStreamers(streamers) {

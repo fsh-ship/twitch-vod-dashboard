@@ -762,6 +762,7 @@ let liveStatusRequests = new Map();
 let liveStatusRefreshPromise = null;
 let liveStatusInitialRefreshStarted = false;
 let liveOfflineExpanded = false;
+let liveStatusUnavailableExpanded = false;
 let liveStatusLastUpdatedAt = null;
 let liveRecordingJobs = [];
 let liveRecordingActions = new Map();
@@ -1011,6 +1012,29 @@ eval(source.slice(start, end));
     recordingVisibility[state] = elements.liveStreamsList.innerHTML;
   }
 
+  liveStreamers = ['PureStatusError', 'FailedRecording', 'CompletedRecording', 'ConfirmedOffline', 'ConfirmedLive'];
+  liveStreamStatuses = new Map([
+    ['purestatuserror', {state:'error', streamer:'purestatuserror'}],
+    ['failedrecording', {state:'error', streamer:'failedrecording'}],
+    ['completedrecording', {state:'error', streamer:'completedrecording'}],
+    ['confirmedoffline', {state:'offline', streamer:'confirmedoffline', refreshError:true}],
+    ['confirmedlive', {state:'live', streamer:'confirmedlive', refreshError:true, title:'Still confirmed live'}]
+  ]);
+  liveRecordingJobs = [
+    {id:'recording-failed-visible', type:'recording', streamer:'failedrecording', state:'failed', completion_reason:'process_error'},
+    {id:'recording-completed-visible', type:'recording', streamer:'completedrecording', state:'completed', completion_reason:'natural_end', output_complete:true}
+  ];
+  liveStatusUnavailableExpanded = false;
+  renderLiveStreams();
+  const unavailableCollapsedHtml = elements.liveStreamsList.innerHTML;
+  const unavailableCollapsedSummary = elements.liveStreamsSummary.textContent;
+  toggleUnavailableLiveStreamers();
+  const unavailableExpandedHtml = elements.liveStreamsList.innerHTML;
+  liveStreamStatuses.set('purestatuserror', {state:'offline', streamer:'purestatuserror'});
+  renderLiveStreams();
+  const unavailableAbsentHtml = elements.liveStreamsList.innerHTML;
+  const unavailableAbsentSummary = elements.liveStreamsSummary.textContent;
+
   calls = [];
   liveRecordingJobs = [];
   liveStreamers = ['One', 'Two', 'Three', 'Four', 'Five'];
@@ -1083,6 +1107,8 @@ eval(source.slice(start, end));
     initialFailureHtml, initialFailureState,
     manualFailureHtml, manualFailureState,
     recordingVisibility, maximumActiveRequests,
+    unavailableCollapsedHtml, unavailableCollapsedSummary,
+    unavailableExpandedHtml, unavailableAbsentHtml, unavailableAbsentSummary,
     refreshMessage:elements.liveStreamsRefreshStatus.textContent,
     startPath:startCall.path,
     startBody:JSON.parse(startCall.options.body),
@@ -1398,6 +1424,39 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn('class="offline-stream-item"', result["expandedHtml"])
         self.assertNotIn("Start Recording", result["expandedHtml"].split("Offline Streamers", 1)[1])
         self.assertIn(".offline-stream-grid[hidden] { display:none; }", STYLESHEET)
+
+    def test_live_status_unavailable_is_compact_and_preserves_recording_lifecycle(self) -> None:
+        result = _evaluate_live_stream_ui()
+
+        self.assertEqual(
+            result["unavailableCollapsedSummary"],
+            "1 Live · 0 Recording · 1 Offline · 1 Unavailable",
+        )
+        self.assertIn("Status unavailable · 1", result["unavailableCollapsedHtml"])
+        self.assertIn('aria-expanded="false"', result["unavailableCollapsedHtml"])
+        self.assertIn('aria-controls="unavailableLiveStreamersList"', result["unavailableCollapsedHtml"])
+        self.assertIn('id="unavailableLiveStreamersList" class="offline-stream-grid" hidden', result["unavailableCollapsedHtml"])
+        self.assertNotIn("PureStatusError", result["unavailableCollapsedHtml"].split("Status unavailable", 1)[0])
+        self.assertNotIn('live-stream-card is-error" data-live-streamer="purestatuserror"', result["unavailableCollapsedHtml"])
+        self.assertIn("FailedRecording", result["unavailableCollapsedHtml"])
+        self.assertIn("CompletedRecording", result["unavailableCollapsedHtml"])
+        self.assertIn("RECORDING ERROR", result["unavailableCollapsedHtml"])
+        self.assertIn("RECORDING COMPLETE", result["unavailableCollapsedHtml"])
+        self.assertIn("ConfirmedOffline", result["unavailableCollapsedHtml"])
+        self.assertIn("Still confirmed live", result["unavailableCollapsedHtml"])
+        self.assertIn("Status refresh failed; showing the last confirmed status.", result["unavailableCollapsedHtml"])
+
+        self.assertIn('aria-expanded="true"', result["unavailableExpandedHtml"])
+        self.assertIn("PureStatusError", result["unavailableExpandedHtml"].split("Status unavailable", 1)[1])
+        self.assertIn("Status could not be loaded", result["unavailableExpandedHtml"])
+        self.assertIn("Offline Streamers · 1", result["unavailableExpandedHtml"])
+
+        self.assertEqual(result["unavailableAbsentSummary"], "1 Live · 0 Recording · 2 Offline")
+        self.assertNotIn("Status unavailable", result["unavailableAbsentHtml"])
+        self.assertIn("Offline Streamers · 2", result["unavailableAbsentHtml"])
+        self.assertIn("function liveStreamerHasUnavailableStatus", JAVASCRIPT)
+        self.assertIn("status.state === 'error' && !recordingJobForStreamer(login)", JAVASCRIPT)
+        self.assertIn("let liveStatusUnavailableExpanded = false", JAVASCRIPT)
 
     def test_primary_navigation_is_task_oriented(self) -> None:
         buttons = re.findall(r'class="nav-btn(?: active)?" data-page="([^"]+)"[^>]*>.*?<span>([^<]+)</span></button>', TEMPLATE)
