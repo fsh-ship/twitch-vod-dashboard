@@ -265,6 +265,11 @@ async function startSingleVodDownload() {
         ? 'advancedSaveStatus'
         : 'generalSaveStatus';
     setText(statusId, text);
+    const status = byId(statusId);
+    if (status) {
+      const value = String(text || '');
+      status.className = 'field-message ' + (value.startsWith('Saved.') ? 'good' : value.startsWith('Save failed:') ? 'bad' : 'muted');
+    }
     if (scope === 'advanced') setText('settingsSaveStatus', text);
   }
   function collectSettingsFallback() {
@@ -334,16 +339,12 @@ async function startSingleVodDownload() {
       ev.stopPropagation();
     }
     const btn = ev && ev.target ? ev.target.closest('button') : null;
-    const oldText = btn ? btn.textContent : '';
-    try {
-      if (btn) {
-        btn.disabled = true;
-        btn.textContent = 'Saving...';
-      }
-      setScopeStatus(scope, 'Saving...');
-      const saved = await postJson('/api/settings', collectSettingsFallback());
-      if (saved._settings_file) setText('settingsFilePath', saved._settings_file);
-      setScopeStatus(scope, 'Saved ' + (saved._saved_at || new Date().toLocaleTimeString()) + '.');
+    return withButtonPending(btn, {pendingLabel:'Saving...'}, async () => {
+      try {
+        setScopeStatus(scope, 'Saving...');
+        const saved = await postJson('/api/settings', collectSettingsFallback());
+        if (saved._settings_file) setText('settingsFilePath', saved._settings_file);
+        setScopeStatus(scope, 'Saved.');
       if (typeof window.loadState === 'function') {
         try { await window.loadState(); } catch(e) {}
       }
@@ -355,23 +356,14 @@ async function startSingleVodDownload() {
       }
       const label = scope === 'youtube' ? 'YouTube settings' : scope === 'advanced' ? 'Advanced settings' : 'General settings';
       alert(label + ' saved.\n\nFile: ' + (saved._settings_file || 'unknown'));
-      return saved;
-    } catch (e) {
-      console.error(e);
-      const autoRecorder = byId('autoRecorderEnabled');
-      if (autoRecorder && typeof state !== 'undefined' && state?.settings) {
-        autoRecorder.checked = state.settings.auto_recorder_enabled === true;
-        if (typeof updateAutoRecorderSettingCopy === 'function') updateAutoRecorderSettingCopy();
+        return saved;
+      } catch (e) {
+        console.error(e);
+        setScopeStatus(scope, 'Save failed: ' + (e.message || 'Unable to save settings.'));
+        alert('Save failed:\n\n' + e.message);
+        throw e;
       }
-      setScopeStatus(scope, 'Save failed: ' + e.message);
-      alert('Save failed:\n\n' + e.message);
-      throw e;
-    } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = oldText || 'Save';
-      }
-    }
+    });
   };
 
   window.vodCheckSettingsStatus = async function(ev) {
@@ -1138,9 +1130,10 @@ function updateStreamerListSaveState() {
   const button = $('saveStreamers');
   const status = $('streamerListSaveStatus');
   if (button) button.disabled = !streamerListDirty;
-  if (status) status.textContent = streamerListDirty
-    ? 'Streamer order or membership has unsaved changes.'
-    : 'Streamer order and membership are saved.';
+  if (status) {
+    status.textContent = streamerListDirty ? 'Unsaved changes.' : 'No unsaved changes.';
+    status.className = 'field-message muted';
+  }
 }
 
 function renderGlobalPlaylistSelect() {
@@ -1895,7 +1888,7 @@ function renderStreamerEditor() {
         <label>Live Recording<select class="streamer-live-recording-select"><option value="manual" ${editorValues.live_recording === 'manual' ? 'selected' : ''}>Manual</option><option value="automatic" ${editorValues.live_recording === 'automatic' ? 'selected' : ''}>Automatic</option></select></label>
       </div>
       ${editorMode === 'download_and_youtube' && state?.settings?.auto_youtube_enabled !== true ? '<p class="streamer-global-pause-note">Configured for Download + YouTube · Automatic YouTube Processing is currently paused globally.</p>' : ''}
-      <div class="streamer-policy-editor-footer"><p class="streamer-policy-feedback muted" role="status" aria-live="polite">${escapeHtml(feedback || 'No unsaved policy changes.')}</p><div class="button-row"><button type="button" class="quiet-button streamer-policy-cancel">Cancel</button><button type="button" class="primary streamer-policy-save">Save changes</button></div></div>
+      <div class="streamer-policy-editor-footer"><p class="streamer-policy-feedback muted" role="status" aria-live="polite">${escapeHtml(feedback || 'No unsaved changes.')}</p><div class="button-row"><button type="button" class="quiet-button streamer-policy-cancel">Cancel</button><button type="button" class="primary streamer-policy-save">Save changes</button></div></div>
     </div>` : '';
     return `<article class="streamer-editor-row${expanded ? ' is-expanded' : ''}${needsReview ? ' needs-review' : ''}" data-streamer-index="${index}" data-streamer-login="${escapeHtml(login)}"><div class="streamer-row-summary"><span class="streamer-order" aria-label="Position ${index + 1}">${index + 1}</span><div class="streamer-row-identity">${streamerAvatarHtml(name, 'compact')}<strong>${escapeHtml(name)}</strong><span class="streamer-validation is-${needsReview ? 'review' : policy ? 'valid' : 'pending'}">${validationLabel}</span></div><dl class="streamer-policy-summary"><div><dt>VOD Handling</dt><dd>${escapeHtml(policy ? vodHandlingLabel(mode) : 'Manual after save')}</dd></div><div><dt>Playlist</dt><dd title="${escapeHtml(playlistId)}">${escapeHtml(policy ? playlistDisplayName(playlistId) : 'No playlist')}</dd></div><div><dt>Live Recording</dt><dd>${escapeHtml(policy ? liveRecordingLabel(policy.live_recording) : 'Manual after save')}</dd></div></dl><button type="button" class="quiet-button streamer-edit-button" aria-expanded="${expanded ? 'true' : 'false'}" aria-controls="${editorId}" ${policy ? '' : 'disabled'}>${expanded ? 'Close' : 'Edit'}</button><details class="streamer-secondary-actions"><summary aria-label="More actions for ${escapeHtml(name)}">More</summary><div><button type="button" data-streamer-action="up" aria-label="Move ${escapeHtml(name)} up" ${index === 0 ? 'disabled' : ''}>Move up</button><button type="button" data-streamer-action="down" aria-label="Move ${escapeHtml(name)} down" ${index === names.length - 1 ? 'disabled' : ''}>Move down</button><button type="button" class="danger-outline" data-streamer-action="remove" aria-label="Remove ${escapeHtml(name)}">Remove</button></div></details></div>${editor}</article>`;
   }).join('');
@@ -1961,8 +1954,10 @@ async function saveStreamerPolicy(row, button) {
     return;
   }
   const originalText = button?.textContent || 'Save changes';
-  if (button) { button.disabled = true; button.textContent = 'Saving…'; }
-  if (feedback) { feedback.textContent = 'Saving…'; feedback.className = 'streamer-policy-feedback muted'; }
+  const hadBusy = button?.hasAttribute('aria-busy');
+  const originalBusy = button?.getAttribute('aria-busy');
+  if (button) { button.disabled = true; button.textContent = 'Saving...'; button.setAttribute('aria-busy', 'true'); }
+  if (feedback) { feedback.textContent = 'Saving...'; feedback.className = 'streamer-policy-feedback muted'; }
   try {
     const saved = await api('/api/streamers/policy', {
       method:'POST',
@@ -1979,11 +1974,16 @@ async function saveStreamerPolicy(row, button) {
     renderDashboardVodAutomation();
     refreshAutoRecorderStatus().catch(() => {});
     refreshAutoVodStatus().catch(() => {});
-    showToast(`${name} policy saved.`);
   } catch (error) {
-    if (button) { button.disabled = false; button.textContent = originalText; }
-    if (feedback) { feedback.textContent = error.message || 'Streamer policy could not be saved.'; feedback.className = 'streamer-policy-feedback bad'; }
+    if (feedback) { feedback.textContent = 'Save failed: ' + (error.message || 'Streamer policy could not be saved.'); feedback.className = 'streamer-policy-feedback bad'; }
     throw error;
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+      if (hadBusy) button.setAttribute('aria-busy', originalBusy);
+      else button.removeAttribute('aria-busy');
+    }
   }
 }
 
@@ -2260,17 +2260,16 @@ function collectOpenStates() {
 
 function markAutomationSettingsDirty() {
   const status = $('automationSaveStatus');
-  if (status) status.textContent = 'Automation changes are not saved yet.';
+  if (status) { status.textContent = 'Unsaved changes.'; status.className = 'field-message muted'; }
 }
 
 async function saveAutomationSettings() {
   const button = $('saveAutomationSettings');
   const status = $('automationSaveStatus');
-  const originalText = button?.textContent || 'Save Automation';
-  if (button) { button.disabled = true; button.textContent = 'Saving…'; }
-  if (status) { status.textContent = 'Saving…'; status.className = 'field-message muted'; }
-  try {
-    const saved = await api('/api/settings', {
+  return withButtonPending(button, {pendingLabel:'Saving...'}, async () => {
+    if (status) { status.textContent = 'Saving...'; status.className = 'field-message muted'; }
+    try {
+      const saved = await api('/api/settings', {
       method:'POST',
       body:JSON.stringify({
         auto_vod_enabled:$('autoVodEnabled').checked,
@@ -2279,32 +2278,21 @@ async function saveAutomationSettings() {
         auto_recorder_enabled:$('autoRecorderEnabled').checked,
         auto_youtube_cleanup_delay_hours:Number($('autoYoutubeCleanupDelayHours').value || 0)
       })
-    });
-    state.settings = {...state.settings, ...saved};
-    updateAutoVodSettingCopy();
-    updateAutoYoutubeSettingCopy();
-    updateAutoRecorderSettingCopy();
-    if (status) { status.textContent = `Saved ${saved._saved_at || 'now'}. Streamer policies were not changed.`; status.className = 'field-message good'; }
-    await Promise.all([
+      });
+      state.settings = {...state.settings, ...saved};
+      updateAutoVodSettingCopy();
+      updateAutoYoutubeSettingCopy();
+      updateAutoRecorderSettingCopy();
+      if (status) { status.textContent = 'Saved. Streamer policies were not changed.'; status.className = 'field-message good'; }
+      await Promise.all([
       refreshAutoVodStatus().catch(() => null),
       refreshAutoRecorderStatus().catch(() => null),
       refreshDashboard().catch(() => null)
-    ]);
-    showToast('Automation settings saved.');
-  } catch (error) {
-    $('autoVodEnabled').checked = state?.settings?.auto_vod_enabled === true;
-    $('autoYoutubeEnabled').checked = state?.settings?.auto_youtube_enabled === true;
-    $('autoRecorderEnabled').checked = state?.settings?.auto_recorder_enabled === true;
-    $('autoVodPollMinutes').value = String(state?.settings?.auto_vod_poll_minutes || 60);
-    $('autoYoutubeCleanupDelayHours').value = String(state?.settings?.auto_youtube_cleanup_delay_hours || 0);
-    updateAutoVodSettingCopy();
-    updateAutoYoutubeSettingCopy();
-    updateAutoRecorderSettingCopy();
-    if (status) { status.textContent = error.message || 'Automation settings could not be saved.'; status.className = 'field-message bad'; }
-    showToast(error.message || 'Automation settings could not be saved.', 'bad');
-  } finally {
-    if (button) { button.disabled = false; button.textContent = originalText; }
-  }
+      ]);
+    } catch (error) {
+      if (status) { status.textContent = 'Save failed: ' + (error.message || 'Automation settings could not be saved.'); status.className = 'field-message bad'; }
+    }
+  });
 }
 
 function parseProgress(logs) {
@@ -4049,30 +4037,27 @@ document.querySelectorAll('[data-streamer-filter]').forEach(button => {
     setStreamerListDiscovery({filter:button.dataset.streamerFilter});
   });
 });
-$('saveStreamers').addEventListener('click', async () => {
+$('saveStreamers').addEventListener('click', () => {
   const button = $('saveStreamers');
   const status = $('streamerListSaveStatus');
-  const oldText = button.textContent;
-  button.disabled = true;
-  button.textContent = 'Saving…';
-  if (status) status.textContent = 'Saving streamer order and membership…';
-  try {
-    const saved = await api('/api/streamers', { method:'POST', body: JSON.stringify({ streamers: $('streamersText').value, streamer_profiles:streamerProfileDraft }) });
-    streamerListDirty = false;
-    await loadState();
-    if ($('streamerFileInfo')) $('streamerFileInfo').textContent = saved.streamer_file || state.streamer_file_resolved || 'unknown';
-    if ($('streamerFileStatus')) $('streamerFileStatus').textContent = `${saved.count || 0} streamers saved`;
-    refreshAutoRecorderStatus().catch(() => {});
-    refreshAutoVodStatus().catch(() => {});
-    showToast(`${saved.count || 0} streamer${saved.count === 1 ? '' : 's'} saved.`);
-  } catch (error) {
-    streamerListDirty = true;
-    if (status) { status.textContent = error.message || 'Streamer list could not be saved.'; status.className = 'field-message bad'; }
-    showToast(error.message || 'Streamer list could not be saved.', 'bad');
-  } finally {
-    button.textContent = oldText;
-    updateStreamerListSaveState();
-  }
+  return withButtonPending(button, {pendingLabel:'Saving...'}, async () => {
+    if (status) { status.textContent = 'Saving...'; status.className = 'field-message muted'; }
+    try {
+      const saved = await api('/api/streamers', { method:'POST', body: JSON.stringify({ streamers: $('streamersText').value, streamer_profiles:streamerProfileDraft }) });
+      streamerListDirty = false;
+      await loadState();
+      if ($('streamerFileInfo')) $('streamerFileInfo').textContent = saved.streamer_file || state.streamer_file_resolved || 'unknown';
+      if ($('streamerFileStatus')) $('streamerFileStatus').textContent = `${saved.count || 0} streamers saved`;
+      refreshAutoRecorderStatus().catch(() => {});
+      refreshAutoVodStatus().catch(() => {});
+      if (status) { status.textContent = 'Saved.'; status.className = 'field-message good'; }
+    } catch (error) {
+      streamerListDirty = true;
+      if (status) { status.textContent = 'Save failed: ' + (error.message || 'Streamer list could not be saved.'); status.className = 'field-message bad'; }
+    }
+  }).finally(() => {
+    if (button) button.disabled = !streamerListDirty;
+  });
 });
 $('autoRecorderEnabled').addEventListener('change', () => { updateAutoRecorderSettingCopy(); markAutomationSettingsDirty(); });
 $('autoVodEnabled').addEventListener('change', () => { updateAutoVodSettingCopy(); markAutomationSettingsDirty(); });
@@ -4118,7 +4103,7 @@ function markSettingsScopeDirty(scope) {
       ? 'advancedSaveStatus'
       : 'generalSaveStatus';
   const status = $(statusId);
-  if (status) status.textContent = `Unsaved ${scope === 'youtube' ? 'YouTube' : scope === 'advanced' ? 'Advanced' : 'General'} changes.`;
+  if (status) { status.textContent = 'Unsaved changes.'; status.className = 'field-message muted'; }
 }
 
 document.querySelectorAll('#settingsPanelGeneral input, #settingsPanelGeneral select, #settingsPanelGeneral textarea').forEach(control => {

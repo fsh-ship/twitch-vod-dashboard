@@ -4,7 +4,7 @@ This inventory records the current frontend behavior, not a change in product se
 
 | Existing pattern and representative location | Category | Future treatment | Target |
 | --- | --- | --- | --- |
-| Settings save/status text (`markSettingsSaved`, `markSettingsScopeDirty`) | C, G | Keep inline: it describes unsaved/saving state for that form. | 11d |
+| Settings save/status text (`markSettingsSaved`, `markSettingsScopeDirty`) | C, G | Keep inline: each Settings workspace now uses consistent unsaved/saving/saved/failed copy and pending button state. | 11d2 |
 | Search result errors, single-VOD status, Local VOD error (`renderResults`, `setSingleVodStatus`, `loadLocalVideos`) | C | Keep contextual inline validation/error surfaces. | 11b review |
 | Dashboard/Live/Queue health and persistence warnings (`renderDashboard*`, `renderQueuePersistenceStatus`) | D | Keep persistent operational warnings in their workspaces. | No toast migration |
 | Existing `showToast` Queue, Local VOD, Streamer actions | A, B | Shared toast foundation now supports these transient outcomes. Harmonize wording/variants later. | 11b |

@@ -1721,6 +1721,34 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("$('saveAutomationSettings').addEventListener('click', saveAutomationSettings);", JAVASCRIPT)
         self.assertIn("queue-lane-action", JAVASCRIPT)
 
+    def test_slice_11d2_settings_save_feedback_is_inline_and_consistent(self) -> None:
+        for status_id in ("generalSaveStatus", "automationSaveStatus", "youtubeSaveStatus", "advancedSaveStatus"):
+            status_markup = TEMPLATE.split(f'id="{status_id}"', 1)[1].split('</p>', 1)[0]
+            self.assertIn('No unsaved changes.', status_markup)
+        self.assertIn("setScopeStatus(scope, 'Saving...')", JAVASCRIPT)
+        self.assertIn("setScopeStatus(scope, 'Saved.')", JAVASCRIPT)
+        self.assertIn("setScopeStatus(scope, 'Save failed: ' + (e.message || 'Unable to save settings.'))", JAVASCRIPT)
+        self.assertIn("return withButtonPending(btn, {pendingLabel:'Saving...'}", JAVASCRIPT)
+        self.assertIn("return withButtonPending(button, {pendingLabel:'Saving...'}", JAVASCRIPT)
+        self.assertIn("status.textContent = 'Unsaved changes.'", JAVASCRIPT)
+        self.assertIn("status.textContent = streamerListDirty ? 'Unsaved changes.' : 'No unsaved changes.'", JAVASCRIPT)
+        self.assertIn("status.textContent = 'Saved.'", JAVASCRIPT)
+        self.assertIn("status.textContent = 'Save failed: ' + (error.message", JAVASCRIPT)
+        self.assertNotIn("showToast('Automation settings saved.')", JAVASCRIPT)
+        self.assertNotIn("showToast(`${saved.count || 0} streamer", JAVASCRIPT)
+        self.assertNotIn("showToast(`${name} policy saved.`)", JAVASCRIPT)
+        self.assertIn("button.setAttribute('aria-busy', 'true')", JAVASCRIPT)
+        self.assertIn("Save failed: ' + (error.message || 'Automation settings could not be saved.')", JAVASCRIPT)
+
+    def test_slice_11d2_preserves_settings_save_and_confirm_boundaries(self) -> None:
+        self.assertEqual(JAVASCRIPT.count("confirm("), 0)
+        self.assertIn("alert(label + ' saved.", JAVASCRIPT)
+        self.assertIn("alert('Save failed:\\n\\n' + e.message)", JAVASCRIPT)
+        streamer_save = JAVASCRIPT.split("$('saveStreamers').addEventListener('click'", 1)[1].split("$('autoRecorderEnabled')", 1)[0]
+        self.assertIn("api('/api/streamers'", streamer_save)
+        self.assertRegex(streamer_save, r"streamers\s*:\s*\$\('streamersText'\)\.value")
+        self.assertRegex(streamer_save, r"streamer_profiles\s*:\s*streamerProfileDraft")
+
     def test_mobile_toast_placement_is_bottom_anchored_and_stacks_upward(self) -> None:
         self.assertIn(".app-toast-container { top:auto; right:max(12px,env(safe-area-inset-right));", STYLESHEET)
         self.assertIn("bottom:calc(12px + env(safe-area-inset-bottom))", STYLESHEET)
