@@ -298,6 +298,49 @@ eval(source.slice(start, end));
     return json.loads(completed.stdout)
 
 
+def _evaluate_button_pending_ui() -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for button pending UI tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('const pendingButtonActions');
+const end = source.indexOf('async function copyTextToClipboard', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Button pending helper not found');
+class Button {
+  constructor(label, disabled=false) { this.textContent = label; this.disabled = disabled; this.attributes = {}; }
+  hasAttribute(name) { return Object.hasOwn(this.attributes, name); }
+  getAttribute(name) { return this.attributes[name] ?? null; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  removeAttribute(name) { delete this.attributes[name]; }
+}
+eval(source.slice(start, end));
+(async () => {
+  const button = new Button('Refresh status');
+  let calls = 0;
+  let release;
+  const action = () => { calls += 1; return new Promise(resolve => { release = resolve; }); };
+  const first = withButtonPending(button, {pendingLabel:'Refreshing...'}, action);
+  const duplicate = withButtonPending(button, {pendingLabel:'Refreshing...'}, action);
+  const during = {label:button.textContent, disabled:button.disabled, busy:button.getAttribute('aria-busy'), samePromise:first === duplicate, calls};
+  release('done');
+  const result = await first;
+  const afterSuccess = {result, label:button.textContent, disabled:button.disabled, busy:button.getAttribute('aria-busy'), calls};
+  const failing = new Button('Check settings file');
+  const failure = await withButtonPending(failing, {pendingLabel:'Checking...'}, () => Promise.reject(new Error('status unavailable'))).catch(error => error.message);
+  const afterFailure = {failure, label:failing.textContent, disabled:failing.disabled, busy:failing.getAttribute('aria-busy')};
+  const unavailable = new Button('Refresh Playlists', true);
+  let unavailableCalls = 0;
+  await withButtonPending(unavailable, {pendingLabel:'Refreshing...'}, () => { unavailableCalls += 1; });
+  process.stdout.write(JSON.stringify({during, afterSuccess, afterFailure, unavailable:{label:unavailable.textContent, disabled:unavailable.disabled, calls:unavailableCalls}}));
+})().catch(error => { process.stderr.write(String(error.stack || error)); process.exitCode = 1; });
+"""
+    completed = subprocess.run([NODE, "-e", runner], cwd=ROOT, encoding="utf-8", capture_output=True, check=False)
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
 def _search_result_status(result: dict) -> str:
     if not NODE:
         raise unittest.SkipTest("Node.js is required for search UI tests")
@@ -1147,7 +1190,8 @@ class V11UiContractTests(unittest.TestCase):
         self.assertEqual(result["duplicateCount"], 1)
         self.assertEqual(result["updatingMessage"], "Updating 0 / 2")
         self.assertEqual(result["oneResultMessage"], "Updating 1 / 2")
-        self.assertTrue(result["updatingDisabled"])
+        # The explicit-click wrapper now owns button state; automatic refreshes do not.
+        self.assertFalse(result["updatingDisabled"])
         self.assertFalse(result["refreshedDisabled"])
         self.assertRegex(result["refreshMessage"], r"^Updated \d{2}:\d{2}$")
         self.assertTrue(result["updatedBeforeFirstResult"])
@@ -1651,6 +1695,31 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("variant:'danger'", JAVASCRIPT)
         self.assertIn("if (!confirmed) return;", JAVASCRIPT)
         self.assertIn("await api('/api/local-video/delete'", JAVASCRIPT)
+
+    def test_shared_button_pending_feedback_preserves_state_and_prevents_duplicates(self) -> None:
+        result = _evaluate_button_pending_ui()
+
+        self.assertEqual(result["during"], {
+            "label": "Refreshing...", "disabled": True, "busy": "true", "samePromise": True, "calls": 1,
+        })
+        self.assertEqual(result["afterSuccess"], {
+            "result": "done", "label": "Refresh status", "disabled": False, "busy": None, "calls": 1,
+        })
+        self.assertEqual(result["afterFailure"], {
+            "failure": "status unavailable", "label": "Check settings file", "disabled": False, "busy": None,
+        })
+        self.assertEqual(result["unavailable"], {"label": "Refresh Playlists", "disabled": True, "calls": 0})
+
+    def test_slice_11d1_uses_pending_feedback_only_for_short_refresh_and_check_actions(self) -> None:
+        self.assertIn("withButtonPending($('refreshLiveStatuses'), {pendingLabel:'Refreshing...'}", JAVASCRIPT)
+        self.assertIn("withButtonPending($('youtubeLoadPlaylists'), {pendingLabel:'Refreshing...'}", JAVASCRIPT)
+        self.assertIn("withButtonPending(button, {pendingLabel:'Checking...'}", JAVASCRIPT)
+        self.assertIn("showToast('Playlists loaded.', {variant:'success'})", JAVASCRIPT)
+        self.assertIn("showToast(e.message, {variant:'error'})", JAVASCRIPT)
+        self.assertIn("fetch('/api/settings/status')", JAVASCRIPT)
+        self.assertIn("if (liveStatusRefreshPromise) return liveStatusRefreshPromise;", JAVASCRIPT)
+        self.assertIn("$('saveAutomationSettings').addEventListener('click', saveAutomationSettings);", JAVASCRIPT)
+        self.assertIn("queue-lane-action", JAVASCRIPT)
 
     def test_mobile_toast_placement_is_bottom_anchored_and_stacks_upward(self) -> None:
         self.assertIn(".app-toast-container { top:auto; right:max(12px,env(safe-area-inset-right));", STYLESHEET)

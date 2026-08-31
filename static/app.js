@@ -139,6 +139,37 @@ function confirmAction(options={}) {
   });
 }
 
+const pendingButtonActions = new WeakMap();
+
+function withButtonPending(button, options={}, action) {
+  if (!button || typeof action !== 'function') return Promise.resolve();
+  const active = pendingButtonActions.get(button);
+  if (active) return active;
+  if (button.disabled) return Promise.resolve();
+
+  const originalLabel = button.textContent;
+  const wasDisabled = button.disabled;
+  const hadBusy = button.hasAttribute('aria-busy');
+  const originalBusy = button.getAttribute('aria-busy');
+  const pendingLabel = String(options.pendingLabel || originalLabel);
+  const task = (async () => {
+    button.disabled = true;
+    button.textContent = pendingLabel;
+    button.setAttribute('aria-busy', 'true');
+    try {
+      return await action();
+    } finally {
+      button.disabled = wasDisabled;
+      button.textContent = originalLabel;
+      if (hadBusy) button.setAttribute('aria-busy', originalBusy);
+      else button.removeAttribute('aria-busy');
+      pendingButtonActions.delete(button);
+    }
+  })();
+  pendingButtonActions.set(button, task);
+  return task;
+}
+
 async function copyTextToClipboard(text, label='Text') {
   const value = String(text || '');
   if (!value) throw new Error(`${label} is empty.`);
@@ -348,20 +379,23 @@ async function startSingleVodDownload() {
       ev.preventDefault();
       ev.stopPropagation();
     }
-    try {
-      const res = await fetch('/api/settings/status');
-      const data = await res.json();
-      setText('settingsFilePath', data.settings_file || 'unknown');
-      setText('settingsSaveStatus', data.can_write_settings_folder ? 'Settings folder is writable' : ('Not writable: ' + (data.write_error || 'unknown')));
-      alert(
-        'Settings file:\n' + (data.settings_file || 'unknown') +
-        '\n\nWritable: ' + (data.can_write_settings_folder ? 'yes' : 'no') +
-        '\n\nDownload path:\n' + (data.download_path || '')
-      );
-    } catch (e) {
-      setText('settingsSaveStatus', 'Status error: ' + e.message);
-      alert('Status check failed:\n\n' + e.message);
-    }
+    const button = ev?.currentTarget || byId('checkSettingsStatus');
+    return withButtonPending(button, {pendingLabel:'Checking...'}, async () => {
+      try {
+        const res = await fetch('/api/settings/status');
+        const data = await res.json();
+        setText('settingsFilePath', data.settings_file || 'unknown');
+        setText('settingsSaveStatus', data.can_write_settings_folder ? 'Settings folder is writable' : ('Not writable: ' + (data.write_error || 'unknown')));
+        alert(
+          'Settings file:\n' + (data.settings_file || 'unknown') +
+          '\n\nWritable: ' + (data.can_write_settings_folder ? 'yes' : 'no') +
+          '\n\nDownload path:\n' + (data.download_path || '')
+        );
+      } catch (e) {
+        setText('settingsSaveStatus', 'Status error: ' + e.message);
+        alert('Status check failed:\n\n' + e.message);
+      }
+    });
   };
 
   document.addEventListener('click', function(ev) {
@@ -1662,9 +1696,7 @@ async function requestLiveStatus(streamer) {
 
 async function refreshLiveStatuses() {
   if (liveStatusRefreshPromise) return liveStatusRefreshPromise;
-  const button = $('refreshLiveStatuses');
   const message = $('liveStreamsRefreshStatus');
-  if (button) button.disabled = true;
   const queue = [...liveStreamers];
   let completed = 0;
   if (message) message.textContent = queue.length ? `Updating ${completed} / ${queue.length}` : 'No configured streamers to check.';
@@ -1685,7 +1717,6 @@ async function refreshLiveStatuses() {
     await liveStatusRefreshPromise;
   } finally {
     liveStatusRefreshPromise = null;
-    if (button) button.disabled = false;
     if (queue.length) {
       liveStatusLastUpdatedAt = new Date();
       if (message) message.textContent = `Updated ${formatLiveStartedAt(liveStatusLastUpdatedAt)}`;
@@ -4069,10 +4100,16 @@ $('youtubeConnect').addEventListener('click', async () => {
     alert('YouTube connection failed:\n\n' + friendlyYoutubeConnectError(e.message));
   }
 });
-$('youtubeLoadPlaylists').addEventListener('click', () => loadYoutubePlaylists().then(() => showToast('Playlists loaded.', {variant:'success'})).catch(e => showToast(e.message, {variant:'error'})));
+$('youtubeLoadPlaylists').addEventListener('click', () => {
+  withButtonPending($('youtubeLoadPlaylists'), {pendingLabel:'Refreshing...'}, () => loadYoutubePlaylists())
+    .then(() => showToast('Playlists loaded.', {variant:'success'}))
+    .catch(e => showToast(e.message, {variant:'error'}));
+});
 $('saveYoutubeSettings').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'youtube'));
 $('saveAdvancedSettings').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'advanced'));
-$('refreshLiveStatuses').addEventListener('click', () => refreshLiveStatuses().catch(() => {}));
+$('refreshLiveStatuses').addEventListener('click', () => {
+  withButtonPending($('refreshLiveStatuses'), {pendingLabel:'Refreshing...'}, () => refreshLiveStatuses()).catch(() => {});
+});
 
 function markSettingsScopeDirty(scope) {
   const statusId = scope === 'youtube'
