@@ -261,6 +261,13 @@
       <div class="button-row dialog-actions"><button type="submit" value="cancel">Keep history</button><button id="confirmClearCompletedJobs" class="danger-outline" type="button">Clear completed history</button></div>
     </form>
   </dialog>
+  <dialog id="appConfirmDialog" class="confirmation-dialog app-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="appConfirmDialogTitle" aria-describedby="appConfirmDialogDescription">
+    <div class="app-confirm-dialog-content">
+      <h2 id="appConfirmDialogTitle"></h2>
+      <p id="appConfirmDialogDescription" class="app-confirm-dialog-message"></p>
+      <div class="button-row dialog-actions"><button id="appConfirmDialogCancel" type="button">Cancel</button><button id="appConfirmDialogAccept" class="primary" type="button">Confirm</button></div>
+    </div>
+  </dialog>
   <div id="appToastContainer" class="app-toast-container" aria-live="polite" aria-relevant="additions"></div>
   <script src="/static/app.js"></script>
 </body>

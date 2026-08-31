@@ -51,6 +51,94 @@ function showToast(message, options={}) {
   return toast;
 }
 
+let activeConfirmation = null;
+
+function confirmationFocusableElements(dialog) {
+  return [...dialog.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+    .filter(element => !element.hidden);
+}
+
+function restoreConfirmationFocus(trigger) {
+  if (!trigger || typeof trigger.focus !== 'function' || !document.contains(trigger)) return;
+  try { trigger.focus({preventScroll:true}); } catch { trigger.focus(); }
+}
+
+function confirmAction(options={}) {
+  const dialog = document.getElementById('appConfirmDialog');
+  if (!dialog || activeConfirmation) return Promise.resolve(false);
+  const title = document.getElementById('appConfirmDialogTitle');
+  const message = document.getElementById('appConfirmDialogDescription');
+  const cancelButton = document.getElementById('appConfirmDialogCancel');
+  const confirmButton = document.getElementById('appConfirmDialogAccept');
+  if (!title || !message || !cancelButton || !confirmButton) return Promise.resolve(false);
+
+  const variant = options.variant === 'danger' ? 'danger' : 'default';
+  const trigger = options.trigger || document.activeElement;
+  title.textContent = String(options.title || 'Confirm action');
+  message.textContent = String(options.message || '');
+  cancelButton.textContent = String(options.cancelLabel || 'Cancel');
+  confirmButton.textContent = String(options.confirmLabel || 'Confirm');
+  confirmButton.className = variant === 'danger' ? 'danger-outline' : 'primary';
+  dialog.classList.toggle('is-danger', variant === 'danger');
+
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      dialog.removeEventListener('cancel', onCancel);
+      dialog.removeEventListener('close', onNativeClose);
+      dialog.removeEventListener('click', onBackdropClick);
+      dialog.removeEventListener('keydown', onKeydown);
+      cancelButton.removeEventListener('click', onCancelClick);
+      confirmButton.removeEventListener('click', onConfirmClick);
+      activeConfirmation = null;
+      if (dialog.open) {
+        if (typeof dialog.close === 'function') dialog.close();
+        else dialog.removeAttribute('open');
+      }
+      restoreConfirmationFocus(trigger);
+      resolve(Boolean(result));
+    };
+    const onCancel = event => { event.preventDefault(); finish(false); };
+    const onNativeClose = () => finish(false);
+    const onCancelClick = () => finish(false);
+    const onConfirmClick = () => finish(true);
+    const onBackdropClick = event => { if (event.target === dialog) finish(false); };
+    const onKeydown = event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        finish(false);
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const focusable = confirmationFocusableElements(dialog);
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    activeConfirmation = {dialog, resolve:finish};
+    dialog.addEventListener('cancel', onCancel);
+    dialog.addEventListener('close', onNativeClose);
+    dialog.addEventListener('click', onBackdropClick);
+    dialog.addEventListener('keydown', onKeydown);
+    cancelButton.addEventListener('click', onCancelClick);
+    confirmButton.addEventListener('click', onConfirmClick);
+    if (typeof dialog.showModal === 'function') dialog.showModal();
+    else dialog.setAttribute('open', '');
+    // Cancellation is the safe default; especially important for destructive actions.
+    cancelButton.focus();
+  });
+}
+
 async function copyTextToClipboard(text, label='Text') {
   const value = String(text || '');
   if (!value) throw new Error(`${label} is empty.`);
@@ -1954,12 +2042,12 @@ async function downloadSelectedWithConfirm() {
   const groups = {};
   selected.forEach(r => { groups[r.streamer] = (groups[r.streamer] || 0) + 1; });
   const groupLines = Object.entries(groups).map(([name, count]) => `${name}: ${count} VOD(s)`).join('\n');
-  const ok = confirm(`Download ${selected.length} VOD(s)?
-
-${groupLines}
-
-Review the streamer list before starting.`);
-  if (!ok) return;
+  const confirmed = await confirmAction({
+    title:'Start selected downloads',
+    message:`Download ${selected.length} VOD(s)?\n\n${groupLines}\n\nReview the streamer list before starting.`,
+    confirmLabel:'Start downloads'
+  });
+  if (!confirmed) return;
   const data = await startDownload(selected.map(r => r.url), 'Date Range Selection');
   const batchModeLabel = ($('batchPostprocessMode') && $('batchPostprocessMode').value === 'after_all') ? 'Download all, then post-process' : 'Post-process after each VOD';
   showToast(`Download queue started: ${data.url_count || selected.length} VOD(s). Mode: ${batchModeLabel}`, {variant:'success'});
@@ -2955,7 +3043,12 @@ function wireQueueItemInteractions(box) {
       const question = action === 'add-auto-youtube-playlist'
         ? `Add this uploaded video to its YouTube playlist now?${partNote}`
         : `Start this YouTube upload now?${partNote}`;
-      if (!confirm(question)) return;
+      const confirmed = await confirmAction({
+        title:action === 'add-auto-youtube-playlist' ? 'Add to YouTube playlist' : 'Start YouTube upload',
+        message:question,
+        confirmLabel:action === 'add-auto-youtube-playlist' ? 'Add to playlist' : 'Start upload'
+      });
+      if (!confirmed) return;
       pendingActions.add(pendingKey);
     }
     button.disabled = true;
@@ -3696,11 +3789,12 @@ async function handleLocalVideoAction(action, path) {
   }
 
   if (action === 'mark') {
-    if (!confirm(`Has the YouTube upload completed?
-
-${video.name}
-
-The VOD will be marked as manually uploaded.`)) return;
+    const confirmed = await confirmAction({
+      title:'Mark upload complete',
+      message:`Has the YouTube upload completed?\n\n${video.name}\n\nThe VOD will be marked as manually uploaded.`,
+      confirmLabel:'Mark as uploaded'
+    });
+    if (!confirmed) return;
     await api('/api/local-video/mark-uploaded', { method:'POST', body: JSON.stringify({ path }) });
     showToast('Marked as manually uploaded.');
     await loadLocalVideos();
@@ -3724,12 +3818,13 @@ The VOD will be marked as manually uploaded.`)) return;
   }
 
   if (action === 'delete') {
-    const ok = confirm(`Permanently delete this VOD and its matching TXT/JSON files?
-
-${video.name}
-
-The files will not be moved to the recycle bin or trash.`);
-    if (!ok) return;
+    const confirmed = await confirmAction({
+      title:'Delete local VOD',
+      message:`Permanently delete this VOD and its matching TXT/JSON files?\n\n${video.name}\n\nThe files will not be moved to the recycle bin or trash.`,
+      confirmLabel:'Delete VOD',
+      variant:'danger'
+    });
+    if (!confirmed) return;
     const result = await api('/api/local-video/delete', {
       method:'POST',
       body: JSON.stringify({ path, confirm_name: video.name })

@@ -832,8 +832,10 @@ main { width:100%; max-width:1320px; }
 .confirmation-dialog { width:min(520px,calc(100vw - 28px)); padding:0; border:1px solid var(--line); border-radius:18px; background:#131a26; color:var(--text); box-shadow:0 24px 80px rgba(0,0,0,.58); }
 .confirmation-dialog::backdrop { background:rgba(3,7,13,.74); }
 .confirmation-dialog form { display:grid; gap:15px; padding:22px; }
+.app-confirm-dialog-content { display:grid; gap:15px; padding:22px; }
 .confirmation-dialog h2 { margin:0; }
 .confirmation-dialog p { line-height:1.55; }
+.app-confirm-dialog-message { margin:0; white-space:pre-line; overflow-wrap:anywhere; }
 .dialog-actions { justify-content:flex-end; }
 
 .settings-tabs { display:flex; gap:8px; padding:6px; border:1px solid var(--line); border-radius:16px; background:rgba(13,19,32,.9); overflow-x:auto; scrollbar-width:thin; }

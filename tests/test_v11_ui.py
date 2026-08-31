@@ -240,6 +240,64 @@ process.stdout.write(JSON.stringify({
     return json.loads(completed.stdout)
 
 
+def _evaluate_confirmation_dialog_ui() -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for confirmation dialog UI tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('let activeConfirmation');
+const end = source.indexOf('async function copyTextToClipboard', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Confirmation dialog helpers not found');
+class Element {
+  constructor(id) { this.id = id; this.listeners = {}; this.className = ''; this.textContent = ''; this.hidden = false; this.open = false; this.focused = false; this.classList = {toggle:(name, active) => { this.className = active ? name : ''; }}; }
+  addEventListener(name, handler) { (this.listeners[name] ||= []).push(handler); }
+  removeEventListener(name, handler) { this.listeners[name] = (this.listeners[name] || []).filter(item => item !== handler); }
+  dispatch(name, event={}) { (this.listeners[name] || []).slice().forEach(handler => handler({target:this, preventDefault:() => { event.prevented = true; }, ...event})); return event; }
+  focus() { this.focused = true; document.activeElement = this; }
+  querySelectorAll() { return [cancelButton, confirmButton]; }
+  showModal() { this.open = true; }
+  close() { this.open = false; this.dispatch('close'); }
+  setAttribute() {}
+  removeAttribute() { this.open = false; }
+}
+const dialog = new Element('appConfirmDialog');
+const title = new Element('appConfirmDialogTitle');
+const message = new Element('appConfirmDialogDescription');
+const cancelButton = new Element('appConfirmDialogCancel');
+const confirmButton = new Element('appConfirmDialogAccept');
+const trigger = new Element('trigger');
+const elements = Object.fromEntries([dialog, title, message, cancelButton, confirmButton, trigger].map(item => [item.id, item]));
+const document = {activeElement:trigger, getElementById:id => elements[id] || null, contains:element => element === trigger};
+eval(source.slice(start, end));
+(async () => {
+  const confirmedPromise = confirmAction({title:'Delete local VOD', message:'<b>Unsafe</b>', confirmLabel:'Delete VOD', variant:'danger'});
+  const duplicateResult = await confirmAction({title:'Second action'});
+  const opened = {open:dialog.open, focused:document.activeElement.id, title:title.textContent, message:message.textContent, confirm:confirmButton.textContent, className:confirmButton.className};
+  confirmButton.dispatch('click');
+  const confirmed = await confirmedPromise;
+  const afterConfirm = {open:dialog.open, focusReturned:document.activeElement === trigger};
+  const cancelledPromise = confirmAction({title:'Cancel action'});
+  cancelButton.dispatch('click');
+  const cancelled = await cancelledPromise;
+  const escapedPromise = confirmAction({title:'Escape action'});
+  dialog.dispatch('keydown', {key:'Escape'});
+  const escaped = await escapedPromise;
+  const trappedPromise = confirmAction({title:'Trap focus'});
+  document.activeElement = confirmButton;
+  const tabEvent = dialog.dispatch('keydown', {key:'Tab', shiftKey:false});
+  const tabFocus = document.activeElement.id;
+  cancelButton.dispatch('click');
+  await trappedPromise;
+  process.stdout.write(JSON.stringify({opened, duplicateResult, confirmed, afterConfirm, cancelled, escaped, tabFocus, tabPrevented:!!tabEvent.prevented}));
+})().catch(error => { process.stderr.write(String(error.stack || error)); process.exitCode = 1; });
+"""
+    completed = subprocess.run([NODE, "-e", runner], cwd=ROOT, encoding="utf-8", capture_output=True, check=False)
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
 def _search_result_status(result: dict) -> str:
     if not NODE:
         raise unittest.SkipTest("Node.js is required for search UI tests")
@@ -1536,7 +1594,7 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("showToast('Playlists loaded.', {variant:'success'})", JAVASCRIPT)
         self.assertNotIn("then(() => alert('Playlists loaded.'))", JAVASCRIPT)
         self.assertEqual(JAVASCRIPT.count("alert("), 25)
-        self.assertEqual(JAVASCRIPT.count("confirm("), 4)
+        self.assertEqual(JAVASCRIPT.count("confirm("), 0)
 
     def test_slice_11b1_migrates_only_low_risk_success_and_info_alerts(self) -> None:
         self.assertIn("showToast(`Download queue started: ${data.url_count || selected.length} VOD(s). Mode: ${batchModeLabel}`, {variant:'success'})", JAVASCRIPT)
@@ -1546,9 +1604,9 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn("alert('The final YouTube filename template was reset:", JAVASCRIPT)
         self.assertNotIn("alert('The technical yt-dlp output template was reset:", JAVASCRIPT)
         # Confirmation, validation, diagnostic, OAuth, and operational alerts remain guarded.
-        self.assertIn("confirm(`Download ${selected.length}", JAVASCRIPT)
+        self.assertIn("title:'Start selected downloads'", JAVASCRIPT)
         self.assertIn("alert('YouTube connected", JAVASCRIPT)
-        self.assertEqual(JAVASCRIPT.count("confirm("), 4)
+        self.assertEqual(JAVASCRIPT.count("confirm("), 0)
 
     def test_slice_11b2_migrates_only_simple_nonblocking_error_alerts(self) -> None:
         self.assertIn(".catch(e => showToast(e.message, {variant:'error'}))", JAVASCRIPT)
@@ -1561,7 +1619,38 @@ class V11UiContractTests(unittest.TestCase):
         self.assertIn("uploadSelectedLocalVideos().catch(e => alert(e.message))", JAVASCRIPT)
         self.assertIn("alert('YouTube connection failed:", JAVASCRIPT)
         self.assertEqual(JAVASCRIPT.count("alert("), 25)
-        self.assertEqual(JAVASCRIPT.count("confirm("), 4)
+        self.assertEqual(JAVASCRIPT.count("confirm("), 0)
+
+    def test_shared_confirmation_dialog_is_accessible_safe_and_reentrant(self) -> None:
+        result = _evaluate_confirmation_dialog_ui()
+
+        self.assertEqual(result["opened"], {
+            "open": True, "focused": "appConfirmDialogCancel", "title": "Delete local VOD",
+            "message": "<b>Unsafe</b>", "confirm": "Delete VOD", "className": "danger-outline",
+        })
+        self.assertFalse(result["duplicateResult"])
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["afterConfirm"], {"open": False, "focusReturned": True})
+        self.assertFalse(result["cancelled"])
+        self.assertFalse(result["escaped"])
+        self.assertEqual(result["tabFocus"], "appConfirmDialogCancel")
+        self.assertTrue(result["tabPrevented"])
+        self.assertIn('id="appConfirmDialog"', TEMPLATE)
+        self.assertIn('role="dialog"', TEMPLATE)
+        self.assertIn('aria-modal="true"', TEMPLATE)
+        self.assertIn('aria-labelledby="appConfirmDialogTitle"', TEMPLATE)
+        self.assertIn('aria-describedby="appConfirmDialogDescription"', TEMPLATE)
+
+    def test_slice_11c_migrates_all_native_confirmation_guards(self) -> None:
+        self.assertEqual(JAVASCRIPT.count("confirm("), 0)
+        self.assertIn("title:'Start selected downloads'", JAVASCRIPT)
+        self.assertIn("title:action === 'add-auto-youtube-playlist' ? 'Add to YouTube playlist' : 'Start YouTube upload'", JAVASCRIPT)
+        self.assertIn("title:'Mark upload complete'", JAVASCRIPT)
+        self.assertIn("title:'Delete local VOD'", JAVASCRIPT)
+        self.assertIn("confirmLabel:'Delete VOD'", JAVASCRIPT)
+        self.assertIn("variant:'danger'", JAVASCRIPT)
+        self.assertIn("if (!confirmed) return;", JAVASCRIPT)
+        self.assertIn("await api('/api/local-video/delete'", JAVASCRIPT)
 
     def test_mobile_toast_placement_is_bottom_anchored_and_stacks_upward(self) -> None:
         self.assertIn(".app-toast-container { top:auto; right:max(12px,env(safe-area-inset-right));", STYLESHEET)
