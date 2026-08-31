@@ -193,6 +193,53 @@ eval(source.slice(avatarStart, avatarEnd));
     return json.loads(completed.stdout)
 
 
+def _evaluate_toast_ui() -> dict:
+    if not NODE:
+        raise unittest.SkipTest("Node.js is required for toast UI tests")
+    runner = r"""
+const fs = require('fs');
+const source = fs.readFileSync('static/app.js', 'utf8');
+const start = source.indexOf('const TOAST_VARIANTS');
+const end = source.indexOf('async function copyTextToClipboard', start);
+if (start < 0 || end < 0 || end <= start) throw new Error('Toast helpers not found');
+let timerId = 0;
+const timers = new Map();
+function setTimeout(callback, delay) { const id = ++timerId; timers.set(id, {callback, delay}); return id; }
+function clearTimeout(id) { timers.delete(id); }
+class Element {
+  constructor(tag) { this.tag = tag; this.children = []; this.dataset = {}; this.attributes = {}; this.listeners = {}; this.className = ''; this.textContent = ''; }
+  append(...children) { this.children.push(...children); children.forEach(child => child.parent = this); }
+  appendChild(child) { this.append(child); }
+  remove() { this.parent.children = this.parent.children.filter(child => child !== this); }
+  setAttribute(name, value) { this.attributes[name] = value; }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  querySelectorAll(selector) { return selector === '.app-toast' ? this.children.filter(child => child.className.includes('app-toast')) : []; }
+}
+const container = new Element('div');
+const document = {getElementById:id => id === 'appToastContainer' ? container : null, createElement:tag => new Element(tag)};
+eval(source.slice(start, end));
+const success = showToast('<b>safe text</b>', {variant:'success'});
+const warning = showToast('Check this', {variant:'warning', duration:10});
+const error = showToast('Failed', {variant:'error'});
+const info = showToast('Heads up', {variant:'info'});
+const beforeDismiss = container.children.length;
+warning.children[1].listeners.click();
+const afterDismiss = container.children.length;
+const successTimer = timers.get(Number(success.dataset.toastTimer));
+successTimer.callback();
+process.stdout.write(JSON.stringify({
+  beforeDismiss, afterDismiss, afterTimeout:container.children.length,
+  success:{role:success.attributes.role, live:success.attributes['aria-live'], text:success.children[0].textContent, close:success.children[1].attributes['aria-label']},
+  variants:container.children.map(toast => toast.className),
+  error:{role:error.attributes.role, live:error.attributes['aria-live']}
+}));
+"""
+    completed = subprocess.run([NODE, "-e", runner], cwd=ROOT, encoding="utf-8", capture_output=True, check=False)
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+    return json.loads(completed.stdout)
+
+
 def _search_result_status(result: dict) -> str:
     if not NODE:
         raise unittest.SkipTest("Node.js is required for search UI tests")
@@ -1470,6 +1517,35 @@ class V11UiContractTests(unittest.TestCase):
         self.assertNotIn("https://api.twitch.tv", JAVASCRIPT)
         self.assertIn(".streamer-avatar-picker", STYLESHEET)
         self.assertIn(".streamer-avatar-queue", STYLESHEET)
+
+    def test_shared_toast_foundation_is_safe_accessible_and_migrates_playlist_success(self) -> None:
+        result = _evaluate_toast_ui()
+
+        self.assertEqual(result["beforeDismiss"], 4)
+        self.assertEqual(result["afterDismiss"], 3)
+        self.assertEqual(result["afterTimeout"], 2)
+        self.assertEqual(result["success"], {"role":"status", "live":"polite", "text":"<b>safe text</b>", "close":"Dismiss notification"})
+        self.assertEqual(result["error"], {"role":"alert", "live":"assertive"})
+        self.assertTrue(any("is-info" in value for value in result["variants"]))
+        self.assertTrue(any("is-error" in value for value in result["variants"]))
+        self.assertIn('id="appToastContainer"', TEMPLATE)
+        self.assertIn("textContent = text", JAVASCRIPT)
+        self.assertIn("TOAST_TIMEOUTS", JAVASCRIPT)
+        self.assertIn(".app-toast-container", STYLESHEET)
+        self.assertIn("@media (prefers-reduced-motion:reduce)", STYLESHEET)
+        self.assertIn("showToast('Playlists loaded.', {variant:'success'})", JAVASCRIPT)
+        self.assertNotIn("then(() => alert('Playlists loaded.'))", JAVASCRIPT)
+        self.assertGreaterEqual(JAVASCRIPT.count("alert("), 30)
+        self.assertEqual(JAVASCRIPT.count("confirm("), 4)
+
+    def test_mobile_toast_placement_is_bottom_anchored_and_stacks_upward(self) -> None:
+        self.assertIn(".app-toast-container { top:auto; right:max(12px,env(safe-area-inset-right));", STYLESHEET)
+        self.assertIn("bottom:calc(12px + env(safe-area-inset-bottom))", STYLESHEET)
+        self.assertIn("left:max(12px,env(safe-area-inset-left))", STYLESHEET)
+        self.assertIn("flex-direction:column-reverse", STYLESHEET)
+        self.assertIn("max-height:calc(100dvh - 24px", STYLESHEET)
+        self.assertIn("overflow-y:auto", STYLESHEET)
+        self.assertIn("@media (max-width:430px)", STYLESHEET)
 
     def test_local_vod_avatar_requires_a_reliable_streamer_identity(self) -> None:
         known = {

@@ -1,14 +1,54 @@
 const VOD_CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.content || '';
 
-function showToast(message, kind='good') {
-  const toast = document.getElementById('appToast');
+const TOAST_VARIANTS = new Set(['success', 'info', 'warning', 'error']);
+const LEGACY_TOAST_VARIANTS = {good:'success', warn:'warning', bad:'error'};
+const TOAST_TIMEOUTS = {success:3200, info:3600, warning:5000, error:6500};
+
+function toastOptions(options) {
+  const raw = typeof options === 'string' ? {variant:options} : (options || {});
+  const variant = LEGACY_TOAST_VARIANTS[raw.variant || raw.kind] || raw.variant || raw.kind || 'success';
+  return {
+    variant: TOAST_VARIANTS.has(variant) ? variant : 'success',
+    duration: Number.isFinite(Number(raw.duration)) ? Math.max(0, Number(raw.duration)) : null,
+  };
+}
+
+function dismissToast(toast) {
   if (!toast) return;
-  toast.textContent = message;
-  toast.className = 'app-toast ' + kind;
-  clearTimeout(window.__vodToastTimer);
-  window.__vodToastTimer = setTimeout(() => {
-    toast.className = 'app-toast hidden';
-  }, 3200);
+  const timer = Number(toast.dataset.toastTimer);
+  if (timer) clearTimeout(timer);
+  toast.remove();
+}
+
+function showToast(message, options={}) {
+  const container = document.getElementById('appToastContainer');
+  if (!container) return null;
+  const {variant, duration} = toastOptions(options);
+  const text = String(message ?? '');
+  const key = `${variant}:${text}`;
+  const existing = [...container.querySelectorAll('.app-toast')].find(toast => toast.dataset.toastKey === key);
+  if (existing) {
+    dismissToast(existing);
+  }
+  const toast = document.createElement('div');
+  toast.className = `app-toast is-${variant}`;
+  toast.dataset.toastKey = key;
+  toast.setAttribute('role', variant === 'error' || variant === 'warning' ? 'alert' : 'status');
+  toast.setAttribute('aria-live', variant === 'error' || variant === 'warning' ? 'assertive' : 'polite');
+  const copy = document.createElement('span');
+  copy.className = 'app-toast-message';
+  copy.textContent = text;
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'app-toast-dismiss';
+  close.setAttribute('aria-label', 'Dismiss notification');
+  close.textContent = '×';
+  close.addEventListener('click', () => dismissToast(toast));
+  toast.append(copy, close);
+  container.appendChild(toast);
+  const timeout = duration === null ? TOAST_TIMEOUTS[variant] : duration;
+  if (timeout > 0) toast.dataset.toastTimer = String(setTimeout(() => dismissToast(toast), timeout));
+  return toast;
 }
 
 async function copyTextToClipboard(text, label='Text') {
@@ -3934,7 +3974,7 @@ $('youtubeConnect').addEventListener('click', async () => {
     alert('YouTube connection failed:\n\n' + friendlyYoutubeConnectError(e.message));
   }
 });
-$('youtubeLoadPlaylists').addEventListener('click', () => loadYoutubePlaylists().then(() => alert('Playlists loaded.')).catch(e => alert(e.message)));
+$('youtubeLoadPlaylists').addEventListener('click', () => loadYoutubePlaylists().then(() => showToast('Playlists loaded.', {variant:'success'})).catch(e => alert(e.message)));
 $('saveYoutubeSettings').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'youtube'));
 $('saveAdvancedSettings').addEventListener('click', (e) => window.vodRobustSaveSettings(e, 'advanced'));
 $('refreshLiveStatuses').addEventListener('click', () => refreshLiveStatuses().catch(() => {}));
