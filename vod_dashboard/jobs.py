@@ -1722,6 +1722,64 @@ class JobManager:
             self._condition.notify_all()
             return True
 
+    def stage_uncertain_auto_youtube_item_recovery(
+        self, job_id: str, item_id: str
+    ) -> bool:
+        """Durably queue one reviewed uncertain item while retaining its gate."""
+        with self._condition:
+            job = self.jobs.get(str(job_id))
+            if job is None or not self._is_deferred_auto_youtube(job):
+                return False
+            index = self._item_index_locked(job, str(item_id))
+            if index is None:
+                return False
+            reason = str(
+                job["item_recovery_reasons"][index]
+                or job["item_completion_reasons"][index]
+                or ""
+            )
+            if (
+                job["item_states"][index] != "failed"
+                or job["item_failure_kinds"][index] != "uncertain"
+                or reason != "upload_outcome_uncertain"
+                or job["item_retry_job_ids"][index]
+                or self._lane_active.get("youtube_upload")
+                == (str(job_id), str(item_id))
+            ):
+                return False
+            previous = deepcopy(job)
+            self._set_item_state_locked(job, index, "queued")
+            for key in (
+                "item_progress",
+                "item_bytes_uploaded",
+                "item_total_bytes",
+                "item_bytes_per_second",
+                "item_eta_seconds",
+                "item_updated_at",
+            ):
+                values = job.get(key)
+                if isinstance(values, list) and index < len(values):
+                    values[index] = None
+            errors = job.get("item_errors")
+            if isinstance(errors, list) and index < len(errors):
+                errors[index] = ""
+            job["execution_deferred"] = True
+            job["completion_reason"] = ""
+            job["recovery_reason"] = ""
+            job["finished_at"] = None
+            job["returncode"] = None
+            self._recompute_job_state_locked(job)
+            self._mark_dirty_locked(job)
+            snapshot = self._snapshot_for_persistence_locked()
+            try:
+                self._persist_required(snapshot)
+            except JobPersistenceRequiredError:
+                self.jobs[str(job_id)] = previous
+                self._condition.notify_all()
+                raise
+            self._condition.notify_all()
+            return True
+
     def append_job_log(
         self,
         job_id: str,

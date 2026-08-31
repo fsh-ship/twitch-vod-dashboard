@@ -26,7 +26,10 @@ from vod_dashboard.youtube import (
     create_resumable_video_upload_request,
     send_resumable_video_upload_request,
 )
-from vod_dashboard.youtube_upload_state import YouTubeUploadStateStore
+from vod_dashboard.youtube_upload_state import (
+    YouTubeUploadStatePersistenceError,
+    YouTubeUploadStateStore,
+)
 
 
 VOD_ID = "2855270041"
@@ -155,6 +158,29 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
             probe=self.probe,
             playlist_chainer=playlist_chainer,
         )
+
+    def make_uncertain(self, job_id, *, part_index=1):
+        executor = self.executor()
+        if self.manager.get_job(job_id)["execution_deferred"]:
+            executor.release_auto_youtube_job_for_execution(job_id)
+        claim = self.manager.claim_next_item(job_id)
+        self.assertEqual(claim["index"], part_index - 1)
+        self.store.begin_part_transfer(
+            "bearlychen", VOD_ID,
+            upload_job_id=job_id, upload_item_id=claim["item_id"],
+            part_index=part_index,
+        )
+        self.store.mark_part_attention(
+            "bearlychen", VOD_ID,
+            upload_job_id=job_id, upload_item_id=claim["item_id"],
+            part_index=part_index, reason="upload_outcome_uncertain",
+            uncertain=True,
+        )
+        self.manager.block_auto_youtube_item(
+            job_id, claim["item_id"], uncertain=True,
+            reason="upload_outcome_uncertain",
+        )
+        return claim["item_id"]
 
     def test_deferred_production_style_job_remains_inert_through_reconcile_and_worker_opportunity(self):
         job_id = self.create_bundle()
@@ -665,6 +691,152 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         self.assertTrue(self.manager.get_job(job_id)["execution_deferred"])
         self.request_sender.assert_not_called()
 
+    def test_reviewed_uncertain_part_is_eligible_and_reuses_normal_execution(self):
+        job_id = self.create_bundle(playlist_id="FROZEN_PLAYLIST")
+        item_id = self.make_uncertain(job_id)
+        executor = self.executor()
+
+        status = executor.recovery_status_for_jobs(
+            self.manager.snapshot_jobs()
+        )
+        self.assertEqual(
+            status[job_id]["eligible_item_ids"], [item_id]
+        )
+        result = executor.recover_uncertain_part_for_execution(
+            job_id, item_id
+        )
+
+        self.assertEqual(result["part_index"], 1)
+        record = self.store.get("bearlychen", VOD_ID)
+        self.assertEqual(record["state"], "upload_queued")
+        self.assertEqual(record["playlist_id"], "FROZEN_PLAYLIST")
+        self.assertEqual(record["parts"][0]["upload_state"], "queued")
+        self.assertIsNone(record["parts"][0]["youtube_video_id"])
+        job = self.manager.get_job(job_id)
+        self.assertFalse(job["execution_deferred"])
+        self.assertEqual(job["item_states"], ["queued"])
+
+        executor.run_job(job_id)
+
+        self.assertEqual(self.request_sender.call_count, 1)
+        self.assertEqual(
+            self.manager.get_job(job_id)["item_states"], ["completed"]
+        )
+        self.assertEqual(
+            self.store.get("bearlychen", VOD_ID)["parts"][0][
+                "youtube_video_id"
+            ],
+            "YT_VIDEO_1",
+        )
+
+    def test_uncertain_recovery_preserves_confirmed_multipart_prefix(self):
+        job_id = self.create_bundle(2, playlist_id="FROZEN_PLAYLIST")
+        executor = self.executor()
+        executor.release_auto_youtube_job_for_execution(job_id)
+        first = self.manager.claim_next_item(job_id)
+        self.store.begin_part_transfer(
+            "bearlychen", VOD_ID, upload_job_id=job_id,
+            upload_item_id=first["item_id"], part_index=1,
+        )
+        self.store.confirm_part_video(
+            "bearlychen", VOD_ID, upload_job_id=job_id,
+            upload_item_id=first["item_id"], part_index=1,
+            youtube_video_id="CONFIRMED_PART_1",
+        )
+        self.manager.complete_auto_youtube_item(job_id, first["item_id"])
+        second_id = self.make_uncertain(job_id, part_index=2)
+
+        executor.recover_uncertain_part_for_execution(job_id, second_id)
+        executor.run_job(job_id)
+
+        record = self.store.get("bearlychen", VOD_ID)
+        self.assertEqual(
+            [part["youtube_video_id"] for part in record["parts"]],
+            ["CONFIRMED_PART_1", "YT_VIDEO_1"],
+        )
+        self.assertEqual(self.request_sender.call_count, 1)
+        uploaded_path = self.request_builder.call_args.args[1]
+        self.assertEqual(uploaded_path.name, "part-002.mkv")
+        self.assertEqual(record["playlist_id"], "FROZEN_PLAYLIST")
+
+    def test_uncertain_recovery_rejects_wrong_state_identity_and_known_video_id(self):
+        job_id = self.create_bundle()
+        item_id = self.make_uncertain(job_id)
+        executor = self.executor()
+
+        with self.assertRaisesRegex(
+            AutoYouTubeExecutionError, "ownership_mismatch"
+        ):
+            executor.recover_uncertain_part_for_execution(
+                job_id, f"{job_id}-item-999"
+            )
+
+        with self.manager.lock:
+            self.manager.jobs[job_id]["item_failure_kinds"][0] = "known"
+        with self.assertRaisesRegex(
+            AutoYouTubeExecutionError, "recovery_not_allowed"
+        ):
+            executor.recover_uncertain_part_for_execution(job_id, item_id)
+        with self.manager.lock:
+            self.manager.jobs[job_id]["item_failure_kinds"][0] = "uncertain"
+
+        document = self.store.load()
+        key = f"bearlychen:{VOD_ID}"
+        document["uploads"][key]["parts"][0]["youtube_video_id"] = (
+            "KNOWN_REMOTE_ID"
+        )
+        self.store.replace_state(document)
+        with self.assertRaisesRegex(
+            AutoYouTubeExecutionError, "video_already_confirmed"
+        ):
+            executor.recover_uncertain_part_for_execution(job_id, item_id)
+        self.request_sender.assert_not_called()
+
+    def test_uncertain_recovery_is_single_use_and_persistence_failures_are_closed(self):
+        job_id = self.create_bundle()
+        item_id = self.make_uncertain(job_id)
+        executor = self.executor()
+        with mock.patch.object(
+            self.manager, "_persist_required",
+            side_effect=JobPersistenceRequiredError(
+                "persistence_unavailable"
+            ),
+        ):
+            with self.assertRaises(JobPersistenceRequiredError):
+                executor.recover_uncertain_part_for_execution(job_id, item_id)
+        self.assertEqual(
+            self.manager.get_job(job_id)["item_states"], ["failed"]
+        )
+        self.assertEqual(
+            self.store.get("bearlychen", VOD_ID)["parts"][0][
+                "upload_state"
+            ],
+            "uncertain",
+        )
+
+        with mock.patch.object(
+            self.store, "recover_uncertain_part",
+            side_effect=YouTubeUploadStatePersistenceError("disk full"),
+        ):
+            with self.assertRaisesRegex(
+                AutoYouTubeExecutionError, "recovery_persistence_failed"
+            ):
+                executor.recover_uncertain_part_for_execution(job_id, item_id)
+        self.assertEqual(
+            self.manager.get_job(job_id)["item_states"], ["failed"]
+        )
+        self.assertTrue(
+            self.manager.get_job(job_id)["execution_deferred"]
+        )
+        self.request_sender.assert_not_called()
+
+        executor.recover_uncertain_part_for_execution(job_id, item_id)
+        with self.assertRaisesRegex(
+            AutoYouTubeExecutionError, "recovery_not_allowed"
+        ):
+            executor.recover_uncertain_part_for_execution(job_id, item_id)
+        self.request_sender.assert_not_called()
+
     def test_transfer_boundary_and_frozen_single_part_body_ordering(self):
         job_id = self.create_bundle()
         executor = self.executor()
@@ -955,6 +1127,10 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
             (
                 "auto_youtube_execute.py",
                 "release_automatic_jobs_for_execution",
+            ),
+            (
+                "auto_youtube_execute.py",
+                "recover_uncertain_part_for_execution",
             ),
         ])
 

@@ -2851,6 +2851,18 @@ def api_jobs():
     jobs_snapshot = manager.snapshot_jobs(reverse=True)
     if any(job.get("origin") == "auto_youtube" for job in jobs_snapshot):
         try:
+            recovery_statuses = _auto_youtube_execution_service(
+                manager
+            ).recovery_status_for_jobs(jobs_snapshot)
+            for job in jobs_snapshot:
+                status = recovery_statuses.get(str(job.get("id") or ""))
+                if status is not None:
+                    job["auto_youtube_recovery"] = status
+        except Exception:
+            app.logger.warning(
+                "Auto YouTube recovery status was unavailable."
+            )
+        try:
             playlist_statuses = _auto_youtube_playlist_service(
                 manager
             ).status_for_jobs(jobs_snapshot)
@@ -2974,6 +2986,121 @@ def api_release_auto_youtube_job():
             "reason": "release_worker_start_failed",
         }), 503
     return jsonify({"ok": True, "job_id": job_id, "status": "released"})
+
+
+@app.post("/api/jobs/auto-youtube/recover-uncertain")
+def api_recover_uncertain_auto_youtube_item():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or set(data) != {
+        "job_id", "item_id", "reviewed"
+    }:
+        return jsonify({
+            "error": "An exact reviewed Auto YouTube item is required.",
+            "reason": "invalid_request",
+        }), 400
+    raw_job_id = data.get("job_id")
+    raw_item_id = data.get("item_id")
+    if (
+        not isinstance(raw_job_id, str)
+        or not isinstance(raw_item_id, str)
+        or data.get("reviewed") is not True
+    ):
+        return jsonify({
+            "error": "Confirm the YouTube Studio review for one exact item.",
+            "reason": "review_confirmation_required",
+        }), 400
+    job_id = raw_job_id.strip()
+    item_id = raw_item_id.strip()
+    if (
+        not re.fullmatch(r"[1-9][0-9]{0,19}", job_id)
+        or not re.fullmatch(
+            rf"{re.escape(job_id)}-item-[1-9][0-9]{{0,5}}", item_id
+        )
+    ):
+        return jsonify({
+            "error": "An exact reviewed Auto YouTube item is required.",
+            "reason": "invalid_request",
+        }), 400
+
+    manager = _job_manager_for_compatibility()
+    try:
+        result = _auto_youtube_execution_service(
+            manager
+        ).recover_uncertain_part_for_execution(job_id, item_id)
+    except dashboard_jobs.JobPersistenceRequiredError as exc:
+        return jsonify({
+            "error": (
+                "The upload could not be requeued because job history "
+                "persistence is unavailable."
+            ),
+            "reason": exc.code,
+        }), 503
+    except dashboard_auto_youtube_execute.AutoYouTubeExecutionError as exc:
+        responses = {
+            "invalid_auto_youtube_job": (
+                "The Auto YouTube job was not found.", 404
+            ),
+            "ownership_mismatch": (
+                "This Auto YouTube item has inconsistent ownership state.",
+                409,
+            ),
+            "conflicting_ownership": (
+                "This Auto YouTube item has conflicting ownership state.",
+                409,
+            ),
+            "video_already_confirmed": (
+                "This part already has a confirmed YouTube video.", 409
+            ),
+            "recovery_not_allowed": (
+                "This item is no longer eligible for uncertain-upload recovery.",
+                409,
+            ),
+            "recovery_media_invalid": (
+                "The prepared upload media is no longer valid.", 409
+            ),
+            "recovery_persistence_failed": (
+                "The reviewed recovery could not be saved safely.", 503
+            ),
+            "job_store_unavailable": (
+                "Job history persistence is unavailable.", 503
+            ),
+            "ownership_store_unavailable": (
+                "Auto YouTube upload state is unavailable.", 503
+            ),
+        }
+        message, status = responses.get(
+            exc.code,
+            ("The uncertain Auto YouTube upload could not be recovered.", 409),
+        )
+        return jsonify({"error": message, "reason": exc.code}), status
+    except Exception:
+        app.logger.error(
+            "Auto YouTube uncertain-upload recovery failed."
+        )
+        return jsonify({
+            "error": "The uncertain Auto YouTube upload could not be recovered.",
+            "reason": "recovery_request_failed",
+        }), 503
+
+    try:
+        manager.start_worker(run_upload_job, job_id)
+    except Exception:
+        try:
+            manager.defer_auto_youtube_job(job_id)
+        except Exception:
+            app.logger.error(
+                "Auto YouTube recovery rollback failed "
+                "(recovery_worker_start_failed)."
+            )
+        return jsonify({
+            "error": "The upload worker could not be started.",
+            "reason": "recovery_worker_start_failed",
+        }), 503
+    return jsonify({
+        "ok": True,
+        **result,
+        "status": "retry_started",
+    })
 
 
 @app.post("/api/jobs/auto-youtube/playlist")

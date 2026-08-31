@@ -480,6 +480,64 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertIn("86", result["completedOrder"])
         self.assertNotIn("86", result["activeOrder"])
 
+    def test_uncertain_auto_youtube_recovery_action_is_ledger_eligible_only(self):
+        eligible = _upload_job(
+            "91", states=["failed"], failure_kinds=["uncertain"]
+        )
+        eligible["item_completion_reasons"] = [
+            "upload_outcome_uncertain"
+        ]
+        eligible["item_recovery_reasons"] = [
+            "upload_outcome_uncertain"
+        ]
+        eligible["auto_youtube_recovery"] = {
+            "reason": "upload_outcome_uncertain",
+            "eligible_item_ids": ["91-item-1"],
+        }
+        known = _upload_job(
+            "92", states=["failed"], failure_kinds=["known"]
+        )
+        manual = _upload_job(
+            "93", origin="manual", states=["failed"],
+            failure_kinds=["uncertain"],
+        )
+        manual["auto_youtube_recovery"] = {
+            "reason": "upload_outcome_uncertain",
+            "eligible_item_ids": ["93-item-1"],
+        }
+
+        result = _evaluate_history_ui([eligible, known, manual])
+        cards = {item["jobId"]: item["html"] for item in result["rendered"]}
+
+        self.assertIn("Upload status uncertain", cards["91"])
+        self.assertIn("Check YouTube Studio", cards["91"])
+        self.assertIn('data-queue-action="recover-auto-youtube"', cards["91"])
+        self.assertIn(">Retry upload<", cards["91"])
+        self.assertNotIn('data-queue-action="retry"', cards["91"])
+        self.assertNotIn(
+            'data-queue-action="recover-auto-youtube"', cards["92"]
+        )
+        self.assertNotIn(
+            'data-queue-action="recover-auto-youtube"', cards["93"]
+        )
+
+    def test_uncertain_auto_youtube_recovery_requires_explicit_confirmation(self):
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn(
+            "Only retry after checking YouTube Studio. If the video exists there, retrying may create a duplicate.",
+            source,
+        )
+        self.assertIn("I checked — retry upload", source)
+        self.assertIn("const pendingAutoYoutubeRecoveries = new Set();", source)
+        self.assertIn(
+            "'/api/jobs/auto-youtube/recover-uncertain'", source
+        )
+        self.assertIn(
+            "{job_id:button.dataset.jobId, item_id:button.dataset.itemId, reviewed:true}",
+            source,
+        )
+        self.assertIn("Reviewed upload requeued.", source)
+
     def test_automatic_policy_never_shows_manual_start_and_explains_queue_state(self):
         result = _evaluate_history_ui([
             _upload_job("87", execution_policy="automatic"),

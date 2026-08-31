@@ -1748,7 +1748,9 @@ class V11UiContractTests(unittest.TestCase):
     def test_slice_11c_migrates_all_native_confirmation_guards(self) -> None:
         self.assertEqual(JAVASCRIPT.count("confirm("), 0)
         self.assertIn("title:'Start selected downloads'", JAVASCRIPT)
-        self.assertIn("title:action === 'add-auto-youtube-playlist' ? 'Add to YouTube playlist' : 'Start YouTube upload'", JAVASCRIPT)
+        self.assertIn("? 'Add to YouTube playlist'", JAVASCRIPT)
+        self.assertIn("? 'Retry uncertain upload?'", JAVASCRIPT)
+        self.assertIn(": 'Start YouTube upload'", JAVASCRIPT)
         self.assertIn("title:'Mark upload complete'", JAVASCRIPT)
         self.assertIn("title:'Delete local VOD'", JAVASCRIPT)
         self.assertIn("confirmLabel:'Delete VOD'", JAVASCRIPT)

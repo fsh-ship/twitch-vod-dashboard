@@ -662,6 +662,76 @@ class YouTubeUploadStateStore:
             current.update({"upload_state": "uncertain" if uncertain else "failed_known", "reason": safe_reason})
             new = deepcopy(old); new.update({"state": "needs_attention", "parts": parts, "reason": safe_reason, "updated_at": _now(self._clock)})
             normalized = _record_v5(new, key); doc["uploads"][key] = normalized; self._write_locked(doc); return deepcopy(normalized)
+
+    def recover_uncertain_part(
+        self,
+        streamer: Any,
+        twitch_vod_id: Any,
+        *,
+        upload_job_id: Any,
+        upload_item_id: Any,
+        part_index: Any,
+    ) -> UploadRecord:
+        """Reset one explicitly reviewed uncertain transfer without changing ownership."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        job_id = _identifier(upload_job_id, "invalid_part_recovery")
+        item_id = _identifier(upload_item_id, "invalid_part_recovery")
+        if (
+            isinstance(part_index, bool)
+            or not isinstance(part_index, int)
+            or part_index < 1
+        ):
+            raise YouTubeUploadStateValidationError("invalid_part_recovery")
+        with self._lock:
+            doc = self._load_locked()
+            old = doc["uploads"].get(key)
+            if old is None:
+                raise YouTubeUploadStateValidationError("upload_not_found")
+            if (
+                old["state"] != "needs_attention"
+                or old["reason"] != "upload_outcome_uncertain"
+                or old["upload_job_id"] != job_id
+                or part_index > len(old["parts"])
+            ):
+                raise YouTubeUploadStateValidationError(
+                    "invalid_part_recovery"
+                )
+            parts = deepcopy(old["parts"])
+            current = parts[part_index - 1]
+            if (
+                current["upload_item_id"] != item_id
+                or current["upload_state"] != "uncertain"
+                or current["reason"] != "upload_outcome_uncertain"
+                or current["youtube_video_id"] is not None
+            ):
+                raise YouTubeUploadStateValidationError(
+                    "invalid_part_recovery"
+                )
+            if any(
+                part["upload_state"] not in {"video_confirmed", "completed"}
+                or part["youtube_video_id"] is None
+                for part in parts[: part_index - 1]
+            ) or any(
+                part["upload_state"] != "queued"
+                or part["youtube_video_id"] is not None
+                for part in parts[part_index:]
+            ):
+                raise YouTubeUploadStateValidationError(
+                    "invalid_part_recovery"
+                )
+            current.update({"upload_state": "queued", "reason": None})
+            new = deepcopy(old)
+            new.update({
+                "state": "upload_queued",
+                "parts": parts,
+                "reason": None,
+                "updated_at": _now(self._clock),
+            })
+            normalized = _record_v5(new, key)
+            doc["uploads"][key] = normalized
+            self._write_locked(doc)
+            return deepcopy(normalized)
+
     def replace_split_for_replan(self, streamer: Any, twitch_vod_id: Any, *, expected_generation_id: Any, split: Any) -> UploadRecord:
         """Atomically replace exactly one proven-invalid multipart generation plan."""
         key = canonical_upload_key(streamer, twitch_vod_id)

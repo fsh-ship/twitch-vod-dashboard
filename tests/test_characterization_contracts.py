@@ -280,6 +280,11 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
                 "api_release_auto_youtube_job",
             ),
             (
+                "/api/jobs/auto-youtube/recover-uncertain",
+                "POST",
+                "api_recover_uncertain_auto_youtube_item",
+            ),
+            (
                 "/api/jobs/auto-youtube/playlist",
                 "POST",
                 "api_add_auto_youtube_playlist",
@@ -693,6 +698,228 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
         )
         service.status_for_jobs.assert_called_once_with([auto_job])
         service.add_to_playlist.assert_not_called()
+        manager.start_worker.assert_not_called()
+
+    def test_queue_snapshot_reads_uncertain_recovery_status_without_mutation(self):
+        manager = mock.Mock()
+        auto_job = {
+            "id": "79",
+            "type": "youtube_upload",
+            "origin": "auto_youtube",
+        }
+        manager.snapshot_jobs.return_value = [auto_job]
+        manager.persistence_status.return_value = {
+            "enabled": True,
+            "healthy": True,
+            "load_degraded": False,
+        }
+        manager.queue_controls_snapshot.return_value = {}
+        execution = mock.Mock()
+        execution.recovery_status_for_jobs.return_value = {
+            "79": {
+                "reason": "upload_outcome_uncertain",
+                "eligible_item_ids": ["79-item-1"],
+            }
+        }
+        playlist = mock.Mock()
+        playlist.status_for_jobs.return_value = {}
+        cleanup = mock.Mock()
+        cleanup.status_for_jobs.return_value = {}
+        with mock.patch.object(
+            dashboard, "_job_manager_for_compatibility", return_value=manager
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_execution_service",
+            return_value=execution,
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_playlist_service",
+            return_value=playlist,
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_cleanup_service",
+            return_value=cleanup,
+        ):
+            response = self.client.get("/api/jobs")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["jobs"][0]["auto_youtube_recovery"]
+            ["eligible_item_ids"],
+            ["79-item-1"],
+        )
+        execution.recovery_status_for_jobs.assert_called_once_with([auto_job])
+        execution.recover_uncertain_part_for_execution.assert_not_called()
+        manager.start_worker.assert_not_called()
+
+    def test_uncertain_auto_youtube_recovery_requires_exact_reviewed_item(self):
+        service = mock.Mock()
+        with mock.patch.object(
+            dashboard, "_auto_youtube_execution_service",
+            return_value=service,
+        ):
+            cases = [
+                None,
+                {},
+                {"job_id": "79", "item_id": "79-item-1"},
+                {
+                    "job_id": "79", "item_id": "79-item-1",
+                    "reviewed": False,
+                },
+                {
+                    "job_id": "79", "item_id": "80-item-1",
+                    "reviewed": True,
+                },
+                {
+                    "job_id": "all", "item_id": "all-item-1",
+                    "reviewed": True,
+                },
+            ]
+            for payload in cases:
+                with self.subTest(payload=payload):
+                    kwargs = (
+                        {"data": "not-json", "content_type": "application/json"}
+                        if payload is None
+                        else {"json": payload}
+                    )
+                    response = self.client.post(
+                        "/api/jobs/auto-youtube/recover-uncertain",
+                        headers=self.csrf_headers,
+                        **kwargs,
+                    )
+                    self.assertEqual(response.status_code, 400)
+            csrf_response = self.client.post(
+                "/api/jobs/auto-youtube/recover-uncertain",
+                json={
+                    "job_id": "79", "item_id": "79-item-1",
+                    "reviewed": True,
+                },
+            )
+            self.assertEqual(csrf_response.status_code, 403)
+        service.recover_uncertain_part_for_execution.assert_not_called()
+
+    def test_uncertain_auto_youtube_recovery_starts_only_after_durable_service_transition(self):
+        manager = mock.Mock()
+        service = mock.Mock()
+        service.recover_uncertain_part_for_execution.return_value = {
+            "job_id": "79", "item_id": "79-item-1", "part_index": 1,
+        }
+        with mock.patch.object(
+            dashboard, "_job_manager_for_compatibility", return_value=manager
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_execution_service",
+            return_value=service,
+        ):
+            response = self.client.post(
+                "/api/jobs/auto-youtube/recover-uncertain",
+                json={
+                    "job_id": "79", "item_id": "79-item-1",
+                    "reviewed": True,
+                },
+                headers=self.csrf_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["status"], "retry_started")
+        service.recover_uncertain_part_for_execution.assert_called_once_with(
+            "79", "79-item-1"
+        )
+        manager.start_worker.assert_called_once_with(
+            dashboard.run_upload_job, "79"
+        )
+
+    def test_repeated_uncertain_recovery_request_never_starts_two_workers(self):
+        manager = mock.Mock()
+        service = mock.Mock()
+        service.recover_uncertain_part_for_execution.side_effect = [
+            {"job_id": "79", "item_id": "79-item-1", "part_index": 1},
+            dashboard.dashboard_auto_youtube_execute.AutoYouTubeExecutionError(
+                "recovery_not_allowed"
+            ),
+        ]
+        payload = {
+            "job_id": "79", "item_id": "79-item-1", "reviewed": True,
+        }
+        with mock.patch.object(
+            dashboard, "_job_manager_for_compatibility", return_value=manager
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_execution_service",
+            return_value=service,
+        ):
+            first = self.client.post(
+                "/api/jobs/auto-youtube/recover-uncertain",
+                json=payload, headers=self.csrf_headers,
+            )
+            second = self.client.post(
+                "/api/jobs/auto-youtube/recover-uncertain",
+                json=payload, headers=self.csrf_headers,
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 409)
+        manager.start_worker.assert_called_once_with(
+            dashboard.run_upload_job, "79"
+        )
+
+    def test_uncertain_auto_youtube_recovery_failures_never_start_worker(self):
+        manager = mock.Mock()
+        cases = [
+            ("invalid_auto_youtube_job", 404),
+            ("ownership_mismatch", 409),
+            ("conflicting_ownership", 409),
+            ("video_already_confirmed", 409),
+            ("recovery_not_allowed", 409),
+            ("recovery_media_invalid", 409),
+            ("recovery_persistence_failed", 503),
+            ("job_store_unavailable", 503),
+            ("ownership_store_unavailable", 503),
+        ]
+        for reason, expected_status in cases:
+            with self.subTest(reason=reason):
+                service = mock.Mock()
+                service.recover_uncertain_part_for_execution.side_effect = (
+                    dashboard.dashboard_auto_youtube_execute.AutoYouTubeExecutionError(
+                        reason
+                    )
+                )
+                with mock.patch.object(
+                    dashboard, "_job_manager_for_compatibility",
+                    return_value=manager,
+                ), mock.patch.object(
+                    dashboard, "_auto_youtube_execution_service",
+                    return_value=service,
+                ):
+                    response = self.client.post(
+                        "/api/jobs/auto-youtube/recover-uncertain",
+                        json={
+                            "job_id": "79", "item_id": "79-item-1",
+                            "reviewed": True,
+                        },
+                        headers=self.csrf_headers,
+                    )
+                self.assertEqual(response.status_code, expected_status)
+                self.assertEqual(response.get_json()["reason"], reason)
+        persistence_service = mock.Mock()
+        persistence_service.recover_uncertain_part_for_execution.side_effect = (
+            dashboard.dashboard_jobs.JobPersistenceRequiredError(
+                "persistence_unavailable"
+            )
+        )
+        with mock.patch.object(
+            dashboard, "_job_manager_for_compatibility", return_value=manager
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_execution_service",
+            return_value=persistence_service,
+        ):
+            response = self.client.post(
+                "/api/jobs/auto-youtube/recover-uncertain",
+                json={
+                    "job_id": "79", "item_id": "79-item-1",
+                    "reviewed": True,
+                },
+                headers=self.csrf_headers,
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.get_json()["reason"], "persistence_unavailable"
+        )
         manager.start_worker.assert_not_called()
 
     def test_auto_youtube_release_returns_safe_service_failures_without_worker(self):
