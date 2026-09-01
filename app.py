@@ -1727,6 +1727,7 @@ def run_recording_job(job_id: str) -> None:
         resolve_completed_output=resolve_completed_recording_output,
         output_marker=dashboard_twitch.LIVE_RECORDING_OUTPUT_MARKER,
         popen=subprocess.Popen,
+        prepare_manual_upload=prepare_file_for_manual_youtube_upload,
     )
     dashboard_jobs.run_recording_job(
         job_id, _job_manager_for_compatibility(), dependencies

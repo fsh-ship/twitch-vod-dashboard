@@ -864,6 +864,32 @@ def _is_live_recording_info(info: Dict[str, Any]) -> bool:
     return info.get("is_live") is True or live_status == "is_live"
 
 
+DEFAULT_YOUTUBE_TITLE_TEMPLATE = "{streamer} VOD - {date_de} - {title}"
+DEFAULT_YOUTUBE_DESCRIPTION_TEMPLATE = (
+    "Automatically archived Twitch VOD.\n\n"
+    "Streamer: {streamer}\n"
+    "Date: {date_de}\n"
+    "Original: {url}\n"
+    "VOD ID: {vod_id}\n"
+    "Duration: {duration}\n\n"
+    "Private archive."
+)
+DEFAULT_MANUAL_UPLOAD_FILENAME_TEMPLATE = "{date_de} - {streamer} - {title}"
+LIVE_YOUTUBE_TITLE_TEMPLATE = "{streamer} LIVE vom {date_de} - {title}"
+LIVE_YOUTUBE_DESCRIPTION_TEMPLATE = (
+    "Twitch-Livestream-Aufnahme von {streamer} vom {date_de}\n\n"
+    "Originaltitel: {title}\n\n"
+    "Streamer: {streamer}\n"
+    "Datum: {date_de}\n"
+    "Dauer: {duration}\n"
+    "Twitch-Kanal: {source_url}\n\n"
+    "Privates Twitch-Livestream-Archiv."
+)
+LIVE_MANUAL_UPLOAD_FILENAME_TEMPLATE = (
+    "{date_de} - {streamer} - LIVE - {title}"
+)
+
+
 def metadata_from_path(
     path: Path,
     settings: Dict[str, Any],
@@ -940,6 +966,14 @@ def metadata_from_path(
         "duration": duration,
         "filename": path.name,
         "filepath": str(path),
+        "is_live_recording": "true" if is_live_recording else "false",
+        "media_kind": "live_recording" if is_live_recording else "twitch_vod",
+        "source_label": (
+            "Twitch-Livestream-Aufnahme"
+            if is_live_recording else "Twitch VOD"
+        ),
+        "source_url": url,
+        "live_label": "LIVE" if is_live_recording else "",
     }
 
 
@@ -1035,15 +1069,23 @@ def build_youtube_metadata(
             log_callback=log_callback,
         )
     )
-    title_template = str(
-        settings.get("youtube_title_template")
-        or "{streamer} VOD - {date_de} - {title}"
+    configured_title_template = str(
+        settings.get("youtube_title_template") or ""
     )
-    description_template = str(
-        settings.get("youtube_description_template")
-        or settings.get("youtube_description")
-        or ""
+    configured_description_template = str(
+        settings.get("youtube_description_template") or ""
     )
+    is_live_recording = meta.get("is_live_recording") == "true"
+    title_template = configured_title_template or DEFAULT_YOUTUBE_TITLE_TEMPLATE
+    description_template = (
+        configured_description_template
+        or str(settings.get("youtube_description") or "")
+    )
+    if is_live_recording:
+        if title_template == DEFAULT_YOUTUBE_TITLE_TEMPLATE:
+            title_template = LIVE_YOUTUBE_TITLE_TEMPLATE
+        if description_template == DEFAULT_YOUTUBE_DESCRIPTION_TEMPLATE:
+            description_template = LIVE_YOUTUBE_DESCRIPTION_TEMPLATE
     expanded_title = template_renderer(
         title_template, meta, title_builder(path)
     )
@@ -1117,8 +1159,13 @@ def manual_upload_filename(
     meta = dict(metadata.get("meta") or {})
     template = str(
         settings.get("manual_upload_filename_template")
-        or "{date_de} - {streamer} - {title}"
+        or DEFAULT_MANUAL_UPLOAD_FILENAME_TEMPLATE
     )
+    if (
+        meta.get("is_live_recording") == "true"
+        and template == DEFAULT_MANUAL_UPLOAD_FILENAME_TEMPLATE
+    ):
+        template = LIVE_MANUAL_UPLOAD_FILENAME_TEMPLATE
     raw = template_renderer(
         template,
         meta,

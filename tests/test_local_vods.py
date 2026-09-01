@@ -264,11 +264,34 @@ class LocalVodServiceTests(unittest.TestCase):
         self.assertEqual(payload["vod_id"], "")
         self.assertEqual(
             payload["youtube_title"],
-            "nika_livetv VOD - 23.08.2026 - The actual broadcast title",
+            "nika_livetv LIVE vom 23.08.2026 - The actual broadcast title",
         )
         self.assertIn(
             info_path.resolve(), self.policy.local_video_sidecars(video)
         )
+
+    def test_prepared_live_recording_is_reported_as_metadata_ready(self):
+        video = self.make_video(
+            "nika_livetv/20260823 - Nika - LIVE - Nika (live) "
+            "[9876543210].mp4"
+        )
+        video.with_suffix(".info.json").write_text(
+            json.dumps(self.live_info_payload(), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        prepared = youtube.prepare_file_for_manual_youtube_upload(
+            video,
+            self.settings,
+            media_policy=self.policy,
+            metadata_builder=self.youtube_metadata_builder,
+        )
+
+        payload = self.payload(prepared)
+
+        self.assertTrue(payload["prepared"])
+        self.assertEqual(payload["status"], "Prepared for YouTube")
+        self.assertTrue(payload["metadata_file_exists"])
+        self.assertIn("LIVE", payload["youtube_title"])
 
     def test_queue_keeps_original_title_and_displays_sanitized_youtube_title(self):
         video = self.make_video(

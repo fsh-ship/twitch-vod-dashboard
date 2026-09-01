@@ -2626,6 +2626,27 @@ class TwitchContractTests(IsolatedDashboardTestCase):
                 outside, self.settings()
             )
 
+    def test_recording_worker_uses_existing_manual_prepare_wrapper(self):
+        dependency_instance = mock.Mock()
+        with mock.patch.object(
+            dashboard.dashboard_jobs,
+            "RecordingWorkerDependencies",
+            return_value=dependency_instance,
+        ) as dependencies, mock.patch.object(
+            dashboard.dashboard_jobs, "run_recording_job"
+        ) as worker:
+            dashboard.run_recording_job("recording-prepare-1")
+
+        self.assertIs(
+            dependencies.call_args.kwargs["prepare_manual_upload"],
+            dashboard.prepare_file_for_manual_youtube_upload,
+        )
+        worker.assert_called_once_with(
+            "recording-prepare-1",
+            dashboard._job_manager_for_compatibility(),
+            dependency_instance,
+        )
+
     def test_start_recording_api_checks_live_once_and_forwards_safe_metadata(self):
         (self.runtime_dir / "streamer.txt").write_text(
             "Nika_LiveTV\n", encoding="utf-8"
@@ -4008,6 +4029,11 @@ class YouTubeContractTests(IsolatedDashboardTestCase):
                 "duration": "01:02:03",
                 "filename": "original.mp4",
                 "filepath": str(video.resolve()),
+                "is_live_recording": "false",
+                "media_kind": "twitch_vod",
+                "source_label": "Twitch VOD",
+                "source_url": "https://www.twitch.tv/videos/1234567890",
+                "live_label": "",
             },
         )
 

@@ -389,7 +389,13 @@ class LocalYouTubeHelperTests(unittest.TestCase):
             "live_status": "is_live",
         }
         self.write_info(video, live_info)
-        settings = {**self.settings, "manual_upload_rename_video": False}
+        settings = {
+            **self.settings,
+            "youtube_description_template": (
+                youtube.DEFAULT_YOUTUBE_DESCRIPTION_TEMPLATE
+            ),
+            "manual_upload_rename_video": False,
+        }
 
         prepared = self.prepare(video, settings)
         persisted = json.loads(
@@ -399,11 +405,98 @@ class LocalYouTubeHelperTests(unittest.TestCase):
         self.assertEqual(prepared, video)
         self.assertEqual(
             persisted["title"],
-            "nika_livetv VOD - 23.08.2026 - The actual broadcast title",
+            "nika_livetv LIVE vom 23.08.2026 - The actual broadcast title",
         )
         self.assertEqual(persisted["meta"]["vod_id"], "")
+        self.assertEqual(persisted["meta"]["media_kind"], "live_recording")
         self.assertEqual(
             persisted["meta"]["url"], "https://www.twitch.tv/nika_livetv"
+        )
+        self.assertIn(
+            "Twitch-Livestream-Aufnahme von nika_livetv vom 23.08.2026",
+            persisted["description"],
+        )
+        self.assertIn(
+            "Twitch-Kanal: https://www.twitch.tv/nika_livetv",
+            persisted["description"],
+        )
+        self.assertNotIn("VOD ID:", persisted["description"])
+        self.assertNotIn("/videos/", persisted["description"])
+
+    def test_live_recording_default_filename_preserves_live_marker(self):
+        video = self.make_video(
+            "20260823 - Nika - LIVE - Nika (live) [9876543210].mp4",
+            folder="nika_livetv",
+        )
+        self.write_info(
+            video,
+            {
+                "id": "9876543210",
+                "title": "Nika (live)",
+                "description": "The actual broadcast title",
+                "uploader_id": "nika_livetv",
+                "upload_date": "20260823",
+                "webpage_url": "https://www.twitch.tv/nika_livetv",
+                "is_live": True,
+                "live_status": "is_live",
+            },
+        )
+
+        prepared = self.prepare(
+            video,
+            {
+                **self.settings,
+                "youtube_description_template": (
+                    youtube.DEFAULT_YOUTUBE_DESCRIPTION_TEMPLATE
+                ),
+            },
+        )
+
+        self.assertEqual(
+            prepared.name,
+            "23.08.2026 - nika_livetv - LIVE - The actual broadcast title.mp4",
+        )
+        persisted = json.loads(
+            prepared.with_suffix(".youtube.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted["meta"]["live_label"], "LIVE")
+
+    def test_live_recording_custom_templates_remain_authoritative(self):
+        video = self.make_video(
+            "20260823 - Nika - LIVE - Nika (live) [9876543210].mp4",
+            folder="nika_livetv",
+        )
+        self.write_info(
+            video,
+            {
+                "title": "Nika (live)",
+                "description": "The actual broadcast title",
+                "uploader_id": "nika_livetv",
+                "upload_date": "20260823",
+                "webpage_url": "https://www.twitch.tv/nika_livetv",
+                "is_live": True,
+            },
+        )
+        settings = {
+            **self.settings,
+            "youtube_title_template": "Archive {media_kind}: {title}",
+            "youtube_description_template": "{source_label}: {source_url}",
+            "manual_upload_filename_template": "{date_de} - {live_label} - {title}",
+            "manual_upload_rename_video": False,
+        }
+
+        metadata = self.build_metadata(video, settings)
+
+        self.assertEqual(
+            metadata["title"], "Archive live_recording: The actual broadcast title"
+        )
+        self.assertEqual(
+            metadata["description"],
+            "Twitch-Livestream-Aufnahme: https://www.twitch.tv/nika_livetv",
+        )
+        self.assertEqual(
+            youtube.manual_upload_filename(video, settings, metadata),
+            "23.08.2026 - LIVE - The actual broadcast title",
         )
 
     def test_metadata_and_templates_preserve_date_de_compatibility(self):

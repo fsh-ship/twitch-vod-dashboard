@@ -424,6 +424,7 @@ class RecordingWorkerDependencies:
     popen: Callable[..., Any] = subprocess.Popen
     terminate_process: Callable[..., str] = terminate_recording_process_tree
     thread_factory: Callable[..., threading.Thread] = threading.Thread
+    prepare_manual_upload: Optional[Callable[..., Path]] = None
 
 
 @dataclass(frozen=True)
@@ -3631,6 +3632,25 @@ def run_recording_job(
         settings["quality"] = str(
             job.get("quality") or settings.get("quality") or "source/best"
         )
+
+        def prepare_confirmed_output() -> Optional[str]:
+            if not output_path or dependencies.prepare_manual_upload is None:
+                return output_path
+            try:
+                prepared_path = dependencies.prepare_manual_upload(
+                    output_path, settings, job_id=job_id
+                )
+                return dependencies.resolve_completed_output(
+                    prepared_path, settings
+                )
+            except Exception as exc:
+                dependencies.append_log(
+                    job_id,
+                    "Recording completed, but Prepare for YouTube failed: "
+                    + type(exc).__name__ + ".",
+                )
+                return output_path
+
         command = dependencies.build_recording_command(
             streamer, settings, attempt=int(job.get("attempt") or 1)
         )
@@ -3707,6 +3727,7 @@ def run_recording_job(
                     job_id, "Recording stop did not finalize cleanly."
                 )
             elif output_path:
+                output_path = prepare_confirmed_output()
                 manager.finalize_recording_job(
                     job_id,
                     item_id,
@@ -3729,6 +3750,7 @@ def run_recording_job(
                     "Recording stopped without a confirmed final media file.",
                 )
         elif returncode == 0:
+            output_path = prepare_confirmed_output()
             manager.finalize_recording_job(
                 job_id,
                 item_id,

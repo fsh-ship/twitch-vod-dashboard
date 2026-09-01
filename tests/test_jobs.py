@@ -992,6 +992,7 @@ class RecordingWorkerTests(unittest.TestCase):
         lines,
         returncode=0,
         stop_result=RECORDING_STOP_RESULT_GRACEFUL,
+        prepare_manual_upload=None,
     ):
         process_calls = []
 
@@ -1035,6 +1036,7 @@ class RecordingWorkerTests(unittest.TestCase):
             popen=popen,
             terminate_process=mock.Mock(return_value=stop_result),
             thread_factory=ImmediateThread,
+            prepare_manual_upload=prepare_manual_upload,
         ), process_calls
 
     def test_success_tracks_duration_process_and_safe_final_output(self):
@@ -1076,6 +1078,163 @@ class RecordingWorkerTests(unittest.TestCase):
         self.assertNotIn("shell", kwargs)
         for key, value in download_process_group_options().items():
             self.assertEqual(kwargs[key], value)
+
+    def test_natural_end_prepares_confirmed_output_once(self):
+        job_id = self.create_job()
+        video = self.root / "nika_livetv" / "recording.mp4"
+        video.parent.mkdir()
+        video.write_bytes(b"video")
+        prepare = mock.Mock(return_value=video)
+        dependencies, _ = self.dependencies(
+            job_id,
+            [f"{self.OUTPUT_MARKER}{video}\n"],
+            prepare_manual_upload=prepare,
+        )
+
+        run_recording_job(job_id, self.manager, dependencies)
+
+        prepare.assert_called_once()
+        self.assertEqual(prepare.call_args.args[0], "nika_livetv/recording.mp4")
+        self.assertEqual(
+            prepare.call_args.args[1]["quality"], "1080p60/source/best"
+        )
+        self.assertEqual(prepare.call_args.kwargs["job_id"], job_id)
+        job = self.manager.jobs[job_id]
+        self.assertEqual(job["state"], "completed")
+        self.assertEqual(job["completion_reason"], "natural_end")
+        self.assertEqual(job["output_path"], "nika_livetv/recording.mp4")
+
+    def test_completed_user_stop_prepares_confirmed_output_once(self):
+        job_id = self.create_job()
+        video = self.root / "nika_livetv" / "stopped.mp4"
+        video.parent.mkdir()
+        video.write_bytes(b"video")
+        prepare = mock.Mock(return_value=video)
+
+        def request_stop():
+            self.assertTrue(self.manager.request_recording_stop(job_id))
+            yield f"{self.OUTPUT_MARKER}{video}\n"
+
+        dependencies, _ = self.dependencies(
+            job_id,
+            request_stop(),
+            returncode=130,
+            prepare_manual_upload=prepare,
+        )
+
+        run_recording_job(job_id, self.manager, dependencies)
+
+        prepare.assert_called_once()
+        self.assertEqual(prepare.call_args.args[0], "nika_livetv/stopped.mp4")
+        self.assertEqual(
+            prepare.call_args.args[1]["quality"], "1080p60/source/best"
+        )
+        self.assertEqual(prepare.call_args.kwargs["job_id"], job_id)
+        self.assertEqual(self.manager.jobs[job_id]["state"], "completed")
+        self.assertEqual(
+            self.manager.jobs[job_id]["completion_reason"], "stopped_by_user"
+        )
+
+    def test_prepared_recording_output_updates_final_job_path(self):
+        job_id = self.create_job()
+        original = self.root / "nika_livetv" / "recording.mp4"
+        prepared = self.root / "nika_livetv" / "LIVE - recording.mp4"
+        original.parent.mkdir()
+        original.write_bytes(b"video")
+        prepared.write_bytes(b"video")
+        prepare = mock.Mock(return_value=prepared)
+        dependencies, _ = self.dependencies(
+            job_id,
+            [f"{self.OUTPUT_MARKER}{original}\n"],
+            prepare_manual_upload=prepare,
+        )
+
+        run_recording_job(job_id, self.manager, dependencies)
+
+        self.assertEqual(
+            self.manager.jobs[job_id]["output_path"],
+            "nika_livetv/LIVE - recording.mp4",
+        )
+
+    def test_failed_or_incomplete_recording_never_prepares_output(self):
+        failed_id = self.create_job()
+        prepare = mock.Mock()
+        dependencies, _ = self.dependencies(
+            failed_id, [], returncode=9, prepare_manual_upload=prepare
+        )
+        run_recording_job(failed_id, self.manager, dependencies)
+
+        incomplete_id = self.create_job()
+
+        def request_stop():
+            self.manager.request_recording_stop(incomplete_id)
+            yield "frame=1 time=00:00:12.00 speed=1x\n"
+
+        dependencies, _ = self.dependencies(
+            incomplete_id,
+            request_stop(),
+            returncode=130,
+            prepare_manual_upload=prepare,
+        )
+        run_recording_job(incomplete_id, self.manager, dependencies)
+
+        missing_output_id = self.create_job()
+        dependencies, _ = self.dependencies(
+            missing_output_id, [], prepare_manual_upload=prepare
+        )
+        run_recording_job(missing_output_id, self.manager, dependencies)
+
+        hard_stop_id = self.create_job()
+        video = self.root / "nika_livetv" / "forced.mp4"
+        video.parent.mkdir(exist_ok=True)
+        video.write_bytes(b"video")
+
+        def request_hard_stop():
+            self.manager.request_recording_stop(hard_stop_id)
+            yield f"{self.OUTPUT_MARKER}{video}\n"
+
+        dependencies, _ = self.dependencies(
+            hard_stop_id,
+            request_hard_stop(),
+            returncode=-9,
+            stop_result=RECORDING_STOP_RESULT_KILLED,
+            prepare_manual_upload=prepare,
+        )
+        run_recording_job(hard_stop_id, self.manager, dependencies)
+
+        prepare.assert_not_called()
+        self.assertEqual(self.manager.jobs[failed_id]["state"], "failed")
+        self.assertEqual(
+            self.manager.jobs[incomplete_id]["completion_reason"], "stop_incomplete"
+        )
+        self.assertEqual(self.manager.jobs[missing_output_id]["state"], "completed")
+        self.assertFalse(self.manager.jobs[missing_output_id]["output_complete"])
+        self.assertEqual(
+            self.manager.jobs[hard_stop_id]["completion_reason"], "stop_failed"
+        )
+
+    def test_prepare_failure_keeps_confirmed_recording_completed(self):
+        job_id = self.create_job()
+        video = self.root / "nika_livetv" / "recording.mp4"
+        video.parent.mkdir()
+        video.write_bytes(b"video")
+        dependencies, _ = self.dependencies(
+            job_id,
+            [f"{self.OUTPUT_MARKER}{video}\n"],
+            prepare_manual_upload=mock.Mock(side_effect=OSError("read-only")),
+        )
+
+        run_recording_job(job_id, self.manager, dependencies)
+
+        job = self.manager.jobs[job_id]
+        self.assertEqual(job["state"], "completed")
+        self.assertTrue(job["output_complete"])
+        self.assertEqual(job["output_path"], "nika_livetv/recording.mp4")
+        self.assertTrue(video.exists())
+        self.assertIn(
+            "Recording completed, but Prepare for YouTube failed: OSError.",
+            job["log"],
+        )
 
     def test_retry_attempt_reaches_recording_command_builder(self):
         job_id = self.create_job(attempt=2)
