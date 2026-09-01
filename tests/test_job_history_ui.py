@@ -23,7 +23,7 @@ const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const classifierStart = source.indexOf('function parseProgress');
 const classifierEnd = source.indexOf('function renderQueueGroup');
 const historyStart = source.indexOf('function queueHistoryTimestamp');
-const historyEnd = source.indexOf('function renderQueuePersistenceStatus');
+const historyEnd = source.indexOf('function queueOperationsView');
 const errorStart = source.indexOf('function friendlyQueueActionError');
 const errorEnd = source.indexOf('function renderQueueLaneControls');
 if ([classifierStart, classifierEnd, historyStart, historyEnd, errorStart, errorEnd].some(value => value < 0)) throw new Error('Queue history helpers not found');
@@ -95,7 +95,6 @@ if ([classifierStart, classifierEnd, historyStart, queueRenderStart, queueRender
 const lastResults = [];
 const localVideoCache = new Map();
 const queueDetailOpenState = {};
-let autoYoutubePlaylistHistoryAutoOpened = false;
 function rememberedSearchResults() { return []; }
 function escapeHtml(value) { return String(value ?? ''); }
 function renderProgressBar() { return ''; }
@@ -106,6 +105,7 @@ function element() {
 const elements = Object.fromEntries([
   'queueRunning', 'queueWaiting', 'queueErrors', 'queueCompleted',
   'queueCancelled', 'queueDone', 'queueCancelledCount', 'queueFailed',
+  'queueOperationalSummary',
   'queueActive', 'queueWaitingCount', 'clearCompletedJobs',
   'queueRunningDownloads', 'queueRunningUploads',
   'queueWaitingDownloads', 'queueWaitingUploads',
@@ -127,6 +127,10 @@ const queue = renderVodQueue(input.jobs || [], {}, {});
 process.stdout.write(JSON.stringify({
   completedDetailsOpen:elements.queueCompletedDetails.open,
   completedJobIds:(elements.queueCompleted.items || []).map(item => String(item.job.id)),
+  attentionJobIds:(elements.queueErrors.items || []).map(item => String(item.job.id)),
+  attentionItemIds:(elements.queueErrors.items || []).map(item => String(item.itemId)),
+  attentionCount:elements.queueFailed.textContent,
+  summaryHtml:elements.queueOperationalSummary.innerHTML,
   completedCount:queue.completed.length,
 }));
 """
@@ -615,7 +619,7 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertIn("Review required", card)
         self.assertNotIn('data-queue-action="add-auto-youtube-playlist"', card)
 
-    def test_playlist_pending_job_79_opens_completed_history_without_local_media(self):
+    def test_playlist_pending_job_79_is_promoted_without_opening_history(self):
         job = _upload_job("79", deferred=False, states=["completed"])
         job["urls"] = ["C:/media/deleted-job-79.mkv"]
         job["auto_youtube_playlist"] = {
@@ -627,9 +631,76 @@ class JobHistoryUiTests(unittest.TestCase):
 
         presentation = _evaluate_completed_history_presentation([job])
 
-        self.assertTrue(presentation["completedDetailsOpen"])
-        self.assertEqual(presentation["completedJobIds"], ["79"])
-        self.assertEqual(presentation["completedCount"], 1)
+        self.assertFalse(presentation["completedDetailsOpen"])
+        self.assertEqual(presentation["completedJobIds"], [])
+        self.assertEqual(presentation["attentionJobIds"], ["79"])
+        self.assertEqual(presentation["attentionCount"], "1")
+        self.assertEqual(presentation["completedCount"], 0)
+
+    def test_large_completed_history_stays_closed_and_normal_completed_stays_history(self):
+        jobs = [
+            _download_job(str(1000 + index), "completed")
+            for index in range(150)
+        ]
+
+        presentation = _evaluate_completed_history_presentation(jobs)
+
+        self.assertFalse(presentation["completedDetailsOpen"])
+        self.assertEqual(presentation["completedCount"], 150)
+        self.assertEqual(len(presentation["completedJobIds"]), 150)
+        self.assertEqual(presentation["attentionJobIds"], [])
+        self.assertEqual(presentation["attentionCount"], "0")
+
+    def test_playlist_attention_is_promoted_and_playlist_added_returns_to_history(self):
+        pending_review = _upload_job("95", deferred=False, states=["completed"])
+        pending_review["auto_youtube_playlist"] = {
+            "state": "needs_attention",
+            "eligible": False,
+            "pending_parts": 0,
+            "part_count": 1,
+        }
+        added = _upload_job("96", deferred=False, states=["completed"])
+        added["auto_youtube_playlist"] = {
+            "state": "playlist_added",
+            "eligible": False,
+            "pending_parts": 0,
+            "part_count": 1,
+        }
+
+        presentation = _evaluate_completed_history_presentation(
+            [pending_review, added]
+        )
+
+        self.assertFalse(presentation["completedDetailsOpen"])
+        self.assertEqual(presentation["attentionJobIds"], ["95"])
+        self.assertEqual(presentation["completedJobIds"], ["96"])
+        self.assertEqual(presentation["attentionCount"], "1")
+
+    def test_attention_summary_counts_playlist_followups_with_errors_and_uncertain_uploads(self):
+        failed = _download_job("97", "failed")
+        uncertain_a = _upload_job(
+            "98", deferred=True, states=["failed"],
+            failure_kinds=["uncertain"],
+        )
+        uncertain_b = _upload_job(
+            "99", deferred=True, states=["failed"],
+            failure_kinds=["uncertain"],
+        )
+        pending = _upload_job("100", deferred=False, states=["completed"])
+        pending["auto_youtube_playlist"] = {
+            "state": "playlist_pending",
+            "eligible": True,
+            "pending_parts": 1,
+            "part_count": 1,
+        }
+
+        presentation = _evaluate_completed_history_presentation(
+            [failed, uncertain_a, uncertain_b, pending]
+        )
+
+        self.assertEqual(presentation["attentionCount"], "4")
+        self.assertIn("4 need review", presentation["summaryHtml"])
+        self.assertEqual(presentation["completedJobIds"], [])
 
     def test_start_upload_interaction_requires_confirmation_and_prevents_duplicates(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")

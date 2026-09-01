@@ -677,9 +677,10 @@ def _render_queue_item_with_saved_open_state(item: dict) -> str:
     runner = r"""
 const fs = require('fs');
 const source = fs.readFileSync('static/app.js', 'utf8');
+const helperStart = source.indexOf('function queuePlaylistFollowupRequiresAction');
 const start = source.indexOf('function queueRecoveryPresentation');
 const end = source.indexOf('function renderQueueGroup');
-if (start < 0 || end < 0 || end <= start) throw new Error('Queue renderer source not found');
+if (helperStart < 0 || start < 0 || end < 0 || end <= start) throw new Error('Queue renderer source not found');
 const queueDetailOpenState = {'youtube_upload:upload-1:upload-1-item-1': true};
 function escapeHtml(value) { return String(value || ''); }
 function niceStatus(value) { return value; }
@@ -688,6 +689,7 @@ function formatProcessedDuration(value) { return `${value}s`; }
 function queueErrorSummary(value) { return String(value || ''); }
 function queueItemKey(value) { return `${value.job.type || 'download'}:${value.job.id}:${value.itemId || value.index}`; }
 function streamerAvatarForKnownIdentity(value, size) { return value ? `<avatar data-size="${size}">${value}</avatar>` : ''; }
+eval(source.slice(helperStart, source.indexOf('function queueOperationsView', helperStart)));
 eval(source.slice(start, end));
 const item = JSON.parse(fs.readFileSync(0, 'utf8'));
 item.itemId = item.itemId || 'upload-1-item-1';
@@ -1967,9 +1969,11 @@ class V11UiContractTests(unittest.TestCase):
         runner = r"""
 const fs = require('fs');
 const source = fs.readFileSync('static/app.js', 'utf8');
+const helperStart = source.indexOf('function queuePlaylistFollowupRequiresAction');
 const start = source.indexOf('function queueOperationsView');
 const end = source.indexOf('function setQueueWorkspaceVisibility', start);
-if (start < 0 || end < 0 || end <= start) throw new Error('Queue operations helper not found');
+if (helperStart < 0 || start < 0 || end < 0 || end <= start) throw new Error('Queue operations helper not found');
+eval(source.slice(helperStart, start));
 eval(source.slice(start, end));
 const download = {state:'running', job:{type:'download', id:'download-1'}};
 const upload = {state:'running', job:{type:'youtube_upload', id:'upload-1'}};
@@ -2061,9 +2065,10 @@ process.stdout.write(JSON.stringify({idle, active}));
         runner = r"""
 const fs = require('fs');
 const source = fs.readFileSync('static/app.js', 'utf8');
+const helperStart = source.indexOf('function queuePlaylistFollowupRequiresAction');
 const start = source.indexOf('function queueOperationsView');
 const end = source.indexOf('function renderVodQueue', start);
-if (start < 0 || end < 0 || end <= start) throw new Error('Queue lane renderer not found');
+if (helperStart < 0 || start < 0 || end < 0 || end <= start) throw new Error('Queue lane renderer not found');
 function element() {
   const classes = new Set();
   return {
@@ -2085,6 +2090,7 @@ const elements = Object.fromEntries([
 function $(id) { return elements[id] || null; }
 function escapeHtml(value) { return String(value); }
 function renderQueueGroup(id, items) { elements[id].items = items; }
+eval(source.slice(helperStart, start));
 eval(source.slice(start, end));
 const controls = {download:{queue_paused:false}, youtube_upload:{queue_paused:false}};
 renderQueueOperationLanes(queueOperationsView([], controls));

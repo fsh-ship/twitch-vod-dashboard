@@ -454,7 +454,6 @@ let queueDetailOpenState = {};
 const pendingAutoYoutubeReleases = new Set();
 const pendingAutoYoutubePlaylistActions = new Set();
 const pendingAutoYoutubeRecoveries = new Set();
-let autoYoutubePlaylistHistoryAutoOpened = false;
 let autoExpandJobDetails = localStorage.getItem('vodJobAutoExpand') === '1';
 let youtubePlaylistChoices = [];
 let streamerProfileDraft = {};
@@ -3050,8 +3049,9 @@ function renderQueueVodItem(item, compact=false) {
   const reviewRequired = presentation.reviewRequired ? '<div class="queue-review-required" role="note">Review required</div>' : '';
   const support = presentation.support ? `<div class="queue-item-support">${escapeHtml(presentation.support)}</div>` : '';
   const actions = actionButtons.length ? `<div class="queue-item-actions">${actionButtons.join('')}</div>` : '';
-  const attention = item.state === 'interrupted' ? 'has-attention' : item.state === 'error' ? 'has-error' : '';
-  const pillClass = item.state === 'error' ? 'bad' : item.state === 'interrupted' ? 'attention' : item.state === 'completed' ? 'good' : activeTransfer ? 'accent' : 'muted';
+  const playlistFollowup = queuePlaylistFollowupRequiresAction(item);
+  const attention = item.state === 'interrupted' || playlistFollowup ? 'has-attention' : item.state === 'error' ? 'has-error' : '';
+  const pillClass = item.state === 'error' ? 'bad' : item.state === 'interrupted' || playlistFollowup ? 'attention' : item.state === 'completed' ? 'good' : activeTransfer ? 'accent' : 'muted';
   const details = queueTechnicalDetailsHtml(item, itemId, detailId, detailOpen, error);
   if (compact) {
     return `<article class="queue-vod-item compact ${attention} ${presentation.reviewRequired ? 'is-uncertain' : ''}">
@@ -3267,10 +3267,24 @@ function renderQueuePersistenceStatus(status={}) {
   box.hidden = false;
 }
 
+function queuePlaylistFollowupRequiresAction(item) {
+  const playlist = item?.job?.auto_youtube_playlist;
+  return item?.state === 'completed'
+    && item.job?.type === 'youtube_upload'
+    && item.job?.origin === 'auto_youtube'
+    && (
+      (playlist?.state === 'playlist_pending' && playlist?.eligible === true)
+      || playlist?.state === 'needs_attention'
+    );
+}
+
 function queueOperationsView(items, queueControls={}) {
   const active = (items || []).filter(item => item.state === 'running' || item.state === 'cancelling');
   const waiting = (items || []).filter(item => item.state === 'waiting');
-  const errors = (items || []).filter(item => (item.state === 'error' || item.state === 'interrupted') && !item.resolved);
+  const errors = (items || []).filter(item => (
+    ((item.state === 'error' || item.state === 'interrupted') && !item.resolved)
+    || queuePlaylistFollowupRequiresAction(item)
+  ));
   const lane = type => ({
     active:active.filter(item => item.job?.type === type),
     waiting:waiting.filter(item => item.job?.type === type),
@@ -3343,7 +3357,9 @@ function renderVodQueue(jobs, queueControls={}, persistenceStatus={}) {
   const operations = queueOperationsView(items, queueControls);
   const {active:running, waiting} = operations;
   const errors = distinguishQueueItems(queueHistoryNewest(operations.errors));
-  const completed = distinguishQueueItems(queueHistoryNewest(items.filter(item => item.state === 'completed')));
+  const completed = distinguishQueueItems(queueHistoryNewest(items.filter(item => (
+    item.state === 'completed' && !queuePlaylistFollowupRequiresAction(item)
+  ))));
   const cancelled = distinguishQueueItems(queueHistoryNewest(items.filter(item => item.state === 'cancelled')));
   document.querySelector('#page-queue .completed-section')?.classList.toggle('is-empty', completed.length === 0);
   renderQueueOperationalSummary({...operations, errors});
@@ -3358,19 +3374,6 @@ function renderVodQueue(jobs, queueControls={}, persistenceStatus={}) {
   setQueueWorkspaceCount('queueWaitingCount', waiting.length);
   setQueueWorkspaceCount('queueFailed', errors.length);
   if ($('queueDone')) $('queueDone').textContent = String(completed.length);
-  const hasEligibleAutoYoutubePlaylist = completed.some(item => (
-    item.job?.type === 'youtube_upload'
-    && item.job?.origin === 'auto_youtube'
-    && item.job?.auto_youtube_playlist?.state === 'playlist_pending'
-    && item.job?.auto_youtube_playlist?.eligible === true
-  ));
-  if (!hasEligibleAutoYoutubePlaylist) {
-    autoYoutubePlaylistHistoryAutoOpened = false;
-  } else if (!autoYoutubePlaylistHistoryAutoOpened) {
-    const history = $('queueCompletedDetails');
-    if (history) history.open = true;
-    autoYoutubePlaylistHistoryAutoOpened = true;
-  }
   setQueueWorkspaceCount('queueCancelledCount', cancelled.length);
   if ($('clearCompletedJobs')) {
     $('clearCompletedJobs').disabled = completed.length === 0;
