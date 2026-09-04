@@ -108,6 +108,7 @@ const elements = Object.fromEntries([
   'queueOperationalSummary',
   'queueActive', 'queueWaitingCount', 'clearCompletedJobs',
   'queueRunningDownloads', 'queueRunningUploads',
+  'queueRunningDownloadsCount', 'queueRunningUploadsCount',
   'queueWaitingDownloads', 'queueWaitingUploads',
   'queueCancelledSection', 'queueErrorsSection', 'queuePersistenceWarning',
   'queueCompletedDetails'
@@ -131,6 +132,10 @@ process.stdout.write(JSON.stringify({
   attentionItemIds:(elements.queueErrors.items || []).map(item => String(item.itemId)),
   attentionCount:elements.queueFailed.textContent,
   summaryHtml:elements.queueOperationalSummary.innerHTML,
+  activeCount:elements.queueActive.textContent,
+  downloadActiveCount:elements.queueRunningDownloadsCount.textContent,
+  uploadActiveCount:elements.queueRunningUploadsCount.textContent,
+  runningDownloadJobIds:(elements.queueRunningDownloads.items || []).map(item => String(item.job.id)),
   completedCount:queue.completed.length,
 }));
 """
@@ -650,6 +655,18 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertEqual(len(presentation["completedJobIds"]), 150)
         self.assertEqual(presentation["attentionJobIds"], [])
         self.assertEqual(presentation["attentionCount"], "0")
+
+    def test_legacy_download_lane_matches_running_summary_and_visible_lane(self):
+        legacy_download = _download_job("200", "running")
+        legacy_download["lane"] = "download"
+
+        presentation = _evaluate_completed_history_presentation([legacy_download])
+
+        self.assertEqual(presentation["activeCount"], "1")
+        self.assertEqual(presentation["downloadActiveCount"], "1")
+        self.assertEqual(presentation["uploadActiveCount"], "0")
+        self.assertEqual(presentation["runningDownloadJobIds"], ["200"])
+        self.assertIn("1 download · 0 upload", presentation["summaryHtml"])
 
     def test_playlist_attention_is_promoted_and_playlist_added_returns_to_history(self):
         pending_review = _upload_job("95", deferred=False, states=["completed"])

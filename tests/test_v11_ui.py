@@ -489,11 +489,14 @@ def _evaluate_dashboard_queue_views() -> dict:
     runner = r"""
 const fs = require('fs');
 const source = fs.readFileSync('static/app.js', 'utf8');
+const helperStart = source.indexOf('function effectiveQueueJobLane');
 const start = source.indexOf('function dashboardQueueView');
 const end = source.indexOf('function dashboardYoutubeView', start);
-if (start < 0 || end < 0 || end <= start) throw new Error('Dashboard queue helpers not found');
+if (helperStart < 0 || start < 0 || end < 0 || end <= start) throw new Error('Dashboard queue helpers not found');
+eval(source.slice(helperStart, source.indexOf('function queuePlaylistFollowupRequiresAction', helperStart)));
 eval(source.slice(start, end));
 const download = {state:'running', job:{type:'download'}, operation:'Downloading'};
+const legacyDownload = {state:'running', job:{lane:'download'}, operation:'Downloading'};
 const upload = {state:'running', job:{type:'youtube_upload'}, operation:'Uploading to YouTube'};
 const waiting = {state:'waiting', job:{type:'download'}, operation:'Waiting to download'};
 const failure = {state:'error', resolved:false, job:{type:'youtube_upload'}, operation:'YouTube upload failed'};
@@ -501,6 +504,7 @@ const resolved = {state:'error', resolved:true, job:{type:'download'}, operation
 process.stdout.write(JSON.stringify({
   simultaneous: dashboardQueueView([download, upload, waiting]),
   oneLane: dashboardQueueView([download]),
+  legacyDownload: dashboardQueueView([legacyDownload]),
   idle: dashboardQueueView([]),
   attention: dashboardQueueView([failure, resolved])
 }));
@@ -677,7 +681,7 @@ def _render_queue_item_with_saved_open_state(item: dict) -> str:
     runner = r"""
 const fs = require('fs');
 const source = fs.readFileSync('static/app.js', 'utf8');
-const helperStart = source.indexOf('function queuePlaylistFollowupRequiresAction');
+const helperStart = source.indexOf('function effectiveQueueJobLane');
 const start = source.indexOf('function queueRecoveryPresentation');
 const end = source.indexOf('function renderQueueGroup');
 if (helperStart < 0 || start < 0 || end < 0 || end <= start) throw new Error('Queue renderer source not found');
@@ -1969,23 +1973,27 @@ class V11UiContractTests(unittest.TestCase):
         runner = r"""
 const fs = require('fs');
 const source = fs.readFileSync('static/app.js', 'utf8');
-const helperStart = source.indexOf('function queuePlaylistFollowupRequiresAction');
+const helperStart = source.indexOf('function effectiveQueueJobLane');
 const start = source.indexOf('function queueOperationsView');
 const end = source.indexOf('function setQueueWorkspaceVisibility', start);
 if (helperStart < 0 || start < 0 || end < 0 || end <= start) throw new Error('Queue operations helper not found');
 eval(source.slice(helperStart, start));
 eval(source.slice(start, end));
 const download = {state:'running', job:{type:'download', id:'download-1'}};
+const legacyDownload = {state:'running', job:{lane:'download', id:'legacy-download'}};
 const upload = {state:'running', job:{type:'youtube_upload', id:'upload-1'}};
 const waitingDownload = {state:'waiting', job:{type:'download', id:'download-2'}};
 const waitingUpload = {state:'waiting', job:{type:'youtube_upload', id:'upload-2'}};
 const failed = {state:'error', resolved:false, job:{type:'youtube_upload', id:'upload-3'}};
+const recording = {state:'running', job:{lane:'recording', id:'recording-1'}};
 const view = queueOperationsView(
-  [download, upload, waitingDownload, waitingUpload, failed],
+  [download, legacyDownload, upload, waitingDownload, waitingUpload, failed, recording],
   {download:{queue_paused:false}, youtube_upload:{queue_paused:true}}
 );
 process.stdout.write(JSON.stringify({
   active:view.active.map(item => item.job.id),
+  downloadActive:view.download.active.map(item => item.job.id),
+  uploadActive:view.upload.active.map(item => item.job.id),
   downloadWaiting:view.download.waiting.map(item => item.job.id),
   uploadWaiting:view.upload.waiting.map(item => item.job.id),
   errors:view.errors.map(item => item.job.id),
@@ -1996,7 +2004,14 @@ process.stdout.write(JSON.stringify({
         if completed.returncode != 0:
             self.fail(completed.stderr or completed.stdout)
         view = json.loads(completed.stdout)
-        self.assertEqual(view["active"], ["download-1", "upload-1"])
+        self.assertEqual(
+            view["active"],
+            ["download-1", "legacy-download", "upload-1", "recording-1"],
+        )
+        self.assertEqual(
+            view["downloadActive"], ["download-1", "legacy-download"]
+        )
+        self.assertEqual(view["uploadActive"], ["upload-1"])
         self.assertEqual(view["downloadWaiting"], ["download-2"])
         self.assertEqual(view["uploadWaiting"], ["upload-2"])
         self.assertEqual(view["errors"], ["upload-3"])
@@ -2065,7 +2080,7 @@ process.stdout.write(JSON.stringify({idle, active}));
         runner = r"""
 const fs = require('fs');
 const source = fs.readFileSync('static/app.js', 'utf8');
-const helperStart = source.indexOf('function queuePlaylistFollowupRequiresAction');
+const helperStart = source.indexOf('function effectiveQueueJobLane');
 const start = source.indexOf('function queueOperationsView');
 const end = source.indexOf('function renderVodQueue', start);
 if (helperStart < 0 || start < 0 || end < 0 || end <= start) throw new Error('Queue lane renderer not found');
@@ -2278,6 +2293,8 @@ process.stdout.write(JSON.stringify({idle, waiting}));
         self.assertIn("1 upload", views["simultaneous"]["metrics"])
         self.assertIn("1 waiting", views["simultaneous"]["metrics"])
         self.assertEqual(views["oneLane"]["title"], "1 running")
+        self.assertEqual(views["legacyDownload"]["title"], "1 running")
+        self.assertEqual(views["legacyDownload"]["metrics"], ["1 download"])
         self.assertEqual(views["idle"]["title"], "Healthy")
         self.assertEqual(views["idle"]["detail"], "No active or waiting work.")
         self.assertEqual(views["attention"]["kind"], "degraded")

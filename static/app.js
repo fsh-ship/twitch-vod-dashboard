@@ -3267,6 +3267,13 @@ function renderQueuePersistenceStatus(status={}) {
   box.hidden = false;
 }
 
+function effectiveQueueJobLane(job={}) {
+  const lane = String(job?.lane || '').trim();
+  if (['download', 'youtube_upload', 'recording'].includes(lane)) return lane;
+  if (job?.type === 'recording') return 'recording';
+  return job?.type === 'youtube_upload' ? 'youtube_upload' : 'download';
+}
+
 function queuePlaylistFollowupRequiresAction(item) {
   const playlist = item?.job?.auto_youtube_playlist;
   return item?.state === 'completed'
@@ -3286,8 +3293,8 @@ function queueOperationsView(items, queueControls={}) {
     || queuePlaylistFollowupRequiresAction(item)
   ));
   const lane = type => ({
-    active:active.filter(item => item.job?.type === type),
-    waiting:waiting.filter(item => item.job?.type === type),
+    active:active.filter(item => effectiveQueueJobLane(item.job) === type),
+    waiting:waiting.filter(item => effectiveQueueJobLane(item.job) === type),
     control:queueControls?.[type] || null,
   });
   return {active, waiting, errors, download:lane('download'), upload:lane('youtube_upload')};
@@ -3510,13 +3517,13 @@ function renderDashboardLiveRecording(snapshot=autoRecorderStatusSnapshot) {
 }
 
 function dashboardQueueView(queue) {
-  const operational = (queue || []).filter(item => item.job?.type !== 'recording');
+  const operational = (queue || []).filter(item => effectiveQueueJobLane(item.job) !== 'recording');
   const active = operational.filter(item => item.state === 'running' || item.state === 'cancelling');
   const waiting = operational.filter(item => item.state === 'waiting');
   const unresolvedErrors = operational.filter(item => item.state === 'error' && !item.resolved);
   const errors = [...unresolvedErrors, ...operational.filter(item => item.state === 'interrupted' && !item.resolved)];
-  const downloads = active.filter(item => item.job?.type === 'download').length;
-  const uploads = active.filter(item => item.job?.type === 'youtube_upload').length;
+  const downloads = active.filter(item => effectiveQueueJobLane(item.job) === 'download').length;
+  const uploads = active.filter(item => effectiveQueueJobLane(item.job) === 'youtube_upload').length;
   const title = errors.length ? 'Needs attention' : active.length ? `${active.length} running` : waiting.length ? 'Waiting' : 'Healthy';
   const detail = errors.length ? `${errors.length} item${errors.length === 1 ? '' : 's'} need review.` : active.length ? 'Queue is processing work.' : waiting.length ? `${waiting.length} item${waiting.length === 1 ? '' : 's'} waiting to start.` : 'No active or waiting work.';
   const metrics = [];
@@ -3575,7 +3582,7 @@ function dashboardLifecycleHtml(item) {
 }
 
 function dashboardActivityCardHtml(item) {
-  const lane = item.job?.type === 'youtube_upload' ? 'Upload' : 'Download';
+  const lane = effectiveQueueJobLane(item.job) === 'youtube_upload' ? 'Upload' : 'Download';
   const progress = Number(item.progress);
   const hasProgress = Number.isFinite(progress);
   return `<article class="dashboard-activity-card is-${lane.toLowerCase()}"><div class="dashboard-activity-card-head"><span class="dashboard-activity-lane">${lane}</span><span class="pill accent">${escapeHtml(item.operation || 'Running')}</span></div><strong>${escapeHtml(item.streamer || item.title || 'Current item')}</strong><span class="dashboard-activity-title">${escapeHtml(item.title || item.filename || item.job?.label || '')}</span>${hasProgress ? `<div class="dashboard-activity-progress"><span><strong>${Math.max(0, Math.min(100, progress)).toFixed(progress % 1 ? 1 : 0)}%</strong><small>${escapeHtml(item.extra || '')}</small></span><div class="progress-bar"><span style="width:${Math.max(0, Math.min(100, progress))}%"></span></div></div>` : `<span class="dashboard-activity-detail">${escapeHtml(item.extra || item.operation || 'Processing')}</span>`}${dashboardLifecycleHtml(item)}</article>`;
