@@ -1552,6 +1552,13 @@ def _auto_youtube_playlist_service(
     )
 
 
+def _auto_youtube_queue_state_records() -> Mapping[str, Mapping[str, Any]]:
+    """Load one immutable ownership snapshot for one read-only Queue response."""
+    return dashboard_youtube_upload_state.YouTubeUploadStateStore.from_dashboard_dir(
+        DEFAULT_DASHBOARD_DIR
+    ).list_records()
+
+
 def admit_auto_youtube_intent(
     job_id: str, item_id: str, completion_settings: Mapping[str, Any]
 ) -> str:
@@ -2852,37 +2859,45 @@ def api_jobs():
     jobs_snapshot = manager.snapshot_jobs(reverse=True)
     if any(job.get("origin") == "auto_youtube" for job in jobs_snapshot):
         try:
-            recovery_statuses = _auto_youtube_execution_service(
-                manager
-            ).recovery_status_for_jobs(jobs_snapshot)
-            for job in jobs_snapshot:
-                status = recovery_statuses.get(str(job.get("id") or ""))
-                if status is not None:
-                    job["auto_youtube_recovery"] = status
+            ownership_records = _auto_youtube_queue_state_records()
         except Exception:
-            app.logger.warning(
-                "Auto YouTube recovery status was unavailable."
-            )
-        try:
-            playlist_statuses = _auto_youtube_playlist_service(
-                manager
-            ).status_for_jobs(jobs_snapshot)
-            for job in jobs_snapshot:
-                status = playlist_statuses.get(str(job.get("id") or ""))
-                if status is not None:
-                    job["auto_youtube_playlist"] = status
-        except Exception:
-            app.logger.warning("Auto YouTube playlist status was unavailable.")
-        try:
-            cleanup_statuses = _auto_youtube_cleanup_service(
-                manager
-            ).status_for_jobs(jobs_snapshot)
-            for job in jobs_snapshot:
-                status = cleanup_statuses.get(str(job.get("id") or ""))
-                if status is not None:
-                    job["auto_youtube_cleanup"] = status
-        except Exception:
-            app.logger.warning("Auto YouTube local cleanup status was unavailable.")
+            app.logger.warning("Auto YouTube Queue status was unavailable.")
+            ownership_records = None
+        if ownership_records is not None:
+            try:
+                recovery_statuses = _auto_youtube_execution_service(
+                    manager
+                ).recovery_status_for_jobs(
+                    jobs_snapshot, records=ownership_records
+                )
+                for job in jobs_snapshot:
+                    status = recovery_statuses.get(str(job.get("id") or ""))
+                    if status is not None:
+                        job["auto_youtube_recovery"] = status
+            except Exception:
+                app.logger.warning(
+                    "Auto YouTube recovery status was unavailable."
+                )
+            try:
+                playlist_statuses = _auto_youtube_playlist_service(
+                    manager
+                ).status_for_jobs(jobs_snapshot, records=ownership_records)
+                for job in jobs_snapshot:
+                    status = playlist_statuses.get(str(job.get("id") or ""))
+                    if status is not None:
+                        job["auto_youtube_playlist"] = status
+            except Exception:
+                app.logger.warning("Auto YouTube playlist status was unavailable.")
+            try:
+                cleanup_statuses = _auto_youtube_cleanup_service(
+                    manager
+                ).status_for_jobs(jobs_snapshot, records=ownership_records)
+                for job in jobs_snapshot:
+                    status = cleanup_statuses.get(str(job.get("id") or ""))
+                    if status is not None:
+                        job["auto_youtube_cleanup"] = status
+            except Exception:
+                app.logger.warning("Auto YouTube local cleanup status was unavailable.")
     persistence = manager.persistence_status()
     return jsonify({
         "jobs": jobs_snapshot,

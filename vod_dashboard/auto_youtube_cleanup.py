@@ -88,11 +88,18 @@ class AutoYouTubeCleanupService:
             if code in {"keep_local_not_allowed", "upload_not_found"}: raise AutoYouTubeCleanupError(code) from exc
             raise AutoYouTubeCleanupError("cleanup_persistence_failed") from exc
 
-    def status_for_jobs(self, jobs: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    def status_for_jobs(
+        self,
+        jobs: Iterable[Mapping[str, Any]],
+        *,
+        records: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    ) -> dict[str, dict[str, Any]]:
         wanted = {str(job.get("id") or "") for job in jobs if job.get("origin") == "auto_youtube"}
         result: dict[str, dict[str, Any]] = {}
         if not wanted: return result
-        for record in self._state_store.list_records().values():
+        if records is None:
+            records = self._state_store.list_records()
+        for record in records.values():
             job_id = str(record.get("upload_job_id") or "")
             if job_id in wanted: result[job_id] = cleanup_status(record, media_policy=self._media_policy, now=self._now())
         return result

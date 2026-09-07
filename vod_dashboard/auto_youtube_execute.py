@@ -16,6 +16,7 @@ from vod_dashboard.youtube_upload_state import (
     YouTubeUploadStatePersistenceError,
     YouTubeUploadStateStore,
     YouTubeUploadStateValidationError,
+    canonical_upload_key,
 )
 
 
@@ -80,14 +81,31 @@ class AutoYouTubeExecutionService:
             },
         }
 
-    def _ownership(self, job_id: str) -> tuple[Mapping[str, Any], Mapping[str, Any], list[Dict[str, Any]]]:
+    def _ownership(
+        self,
+        job_id: str,
+        *,
+        records: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any], list[Dict[str, Any]]]:
         job = self._job_manager.get_job(str(job_id))
         if not isinstance(job, Mapping) or job.get("type") != "youtube_upload" or job.get("origin") != "auto_youtube":
             raise AutoYouTubeExecutionError("invalid_auto_youtube_job")
         context = job.get("auto_youtube_context")
         if not isinstance(context, Mapping):
             raise AutoYouTubeExecutionError("invalid_auto_youtube_job")
-        record = self._state_store.get(context.get("streamer"), context.get("twitch_vod_id"))
+        if records is None:
+            record = self._state_store.get(
+                context.get("streamer"), context.get("twitch_vod_id")
+            )
+        else:
+            try:
+                record = records.get(
+                    canonical_upload_key(
+                        context.get("streamer"), context.get("twitch_vod_id")
+                    )
+                )
+            except YouTubeUploadStateValidationError:
+                record = None
         if not isinstance(record, Mapping) or str(record.get("upload_job_id") or "") != str(job_id):
             raise AutoYouTubeExecutionError("ownership_mismatch")
         materializer = self._materializer()
@@ -154,11 +172,15 @@ class AutoYouTubeExecutionService:
             raise AutoYouTubeExecutionError("conflicting_ownership")
 
     def _uncertain_recovery_candidate(
-        self, job_id: str, item_id: str
+        self,
+        job_id: str,
+        item_id: str,
+        *,
+        records: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> tuple[
         Mapping[str, Any], Mapping[str, Any], list[Dict[str, Any]], int
     ]:
-        job, record, descriptors = self._ownership(job_id)
+        job, record, descriptors = self._ownership(job_id, records=records)
         self._validate_unique_lineage(job_id, job)
         item_ids = list(job.get("item_ids") or [])
         try:
@@ -214,12 +236,52 @@ class AutoYouTubeExecutionService:
                 raise AutoYouTubeExecutionError("ownership_mismatch")
         return job, record, descriptors, index
 
+    @staticmethod
+    def _possible_uncertain_item_ids(snapshot: Mapping[str, Any]) -> list[str]:
+        if snapshot.get("execution_deferred") is not True:
+            return []
+        item_ids = list(snapshot.get("item_ids") or [])
+        states = list(snapshot.get("item_states") or [])
+        failure_kinds = list(snapshot.get("item_failure_kinds") or [])
+        completion_reasons = list(snapshot.get("item_completion_reasons") or [])
+        recovery_reasons = list(snapshot.get("item_recovery_reasons") or [])
+        if not (
+            len(item_ids)
+            == len(states)
+            == len(failure_kinds)
+            == len(completion_reasons)
+            == len(recovery_reasons)
+        ):
+            return []
+        return [
+            str(item_id)
+            for item_id, state, failure_kind, completion_reason, recovery_reason in zip(
+                item_ids,
+                states,
+                failure_kinds,
+                completion_reasons,
+                recovery_reasons,
+            )
+            if (
+                state == "failed"
+                and failure_kind == "uncertain"
+                and str(recovery_reason or completion_reason or "")
+                == "upload_outcome_uncertain"
+            )
+        ]
+
     def recovery_status_for_jobs(
-        self, jobs: list[Mapping[str, Any]]
+        self,
+        jobs: list[Mapping[str, Any]],
+        *,
+        records: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Return read-only, ledger-backed eligibility for Queue rendering."""
-        if self._state_store.health().get("healthy") is not True:
-            return {}
+        if records is None:
+            try:
+                records = self._state_store.list_records()
+            except Exception:
+                return {}
         health = self._job_manager.persistence_status()
         if health.get("enabled") is not True or health.get("healthy") is not True:
             return {}
@@ -229,9 +291,11 @@ class AutoYouTubeExecutionService:
                 continue
             job_id = str(snapshot.get("id") or "")
             eligible: list[str] = []
-            for item_id in list(snapshot.get("item_ids") or []):
+            for item_id in self._possible_uncertain_item_ids(snapshot):
                 try:
-                    self._uncertain_recovery_candidate(job_id, str(item_id))
+                    self._uncertain_recovery_candidate(
+                        job_id, item_id, records=records
+                    )
                 except Exception:
                     continue
                 eligible.append(str(item_id))

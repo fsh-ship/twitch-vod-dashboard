@@ -685,6 +685,8 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
         with mock.patch.object(
             dashboard, "_job_manager_for_compatibility", return_value=manager
         ), mock.patch.object(
+            dashboard, "_auto_youtube_queue_state_records", return_value={}
+        ), mock.patch.object(
             dashboard,
             "_auto_youtube_playlist_service",
             return_value=service,
@@ -696,7 +698,7 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
             response.get_json()["jobs"][0]["auto_youtube_playlist"]["state"],
             "playlist_pending",
         )
-        service.status_for_jobs.assert_called_once_with([auto_job])
+        service.status_for_jobs.assert_called_once_with([auto_job], records={})
         service.add_to_playlist.assert_not_called()
         manager.start_worker.assert_not_called()
 
@@ -728,6 +730,8 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
         with mock.patch.object(
             dashboard, "_job_manager_for_compatibility", return_value=manager
         ), mock.patch.object(
+            dashboard, "_auto_youtube_queue_state_records", return_value={}
+        ), mock.patch.object(
             dashboard, "_auto_youtube_execution_service",
             return_value=execution,
         ), mock.patch.object(
@@ -745,8 +749,71 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
             ["eligible_item_ids"],
             ["79-item-1"],
         )
-        execution.recovery_status_for_jobs.assert_called_once_with([auto_job])
+        execution.recovery_status_for_jobs.assert_called_once_with(
+            [auto_job], records={}
+        )
         execution.recover_uncertain_part_for_execution.assert_not_called()
+        manager.start_worker.assert_not_called()
+
+    def test_queue_snapshot_loads_one_auto_youtube_ledger_snapshot_for_all_statuses(self):
+        manager = mock.Mock()
+        jobs = [
+            {
+                "id": str(100 + index),
+                "type": "youtube_upload",
+                "origin": "auto_youtube",
+            }
+            for index in range(43)
+        ]
+        records = {"cptmary:2857167152": {"upload_job_id": "100"}}
+        manager.snapshot_jobs.return_value = jobs
+        manager.persistence_status.return_value = {
+            "enabled": True,
+            "healthy": True,
+            "load_degraded": False,
+        }
+        manager.queue_controls_snapshot.return_value = {}
+        execution = mock.Mock()
+        execution.recovery_status_for_jobs.return_value = {
+            "100": {"eligible_item_ids": ["100-item-1"]}
+        }
+        playlist = mock.Mock()
+        playlist.status_for_jobs.return_value = {
+            "100": {"state": "playlist_pending", "eligible": True}
+        }
+        cleanup = mock.Mock()
+        cleanup.status_for_jobs.return_value = {
+            "100": {"state": "scheduled", "can_keep_local": True}
+        }
+        with mock.patch.object(
+            dashboard, "_job_manager_for_compatibility", return_value=manager
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_queue_state_records", return_value=records
+        ) as snapshot_reader, mock.patch.object(
+            dashboard, "_auto_youtube_execution_service", return_value=execution
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_playlist_service", return_value=playlist
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_cleanup_service", return_value=cleanup
+        ):
+            response = self.client.get("/api/jobs")
+
+        self.assertEqual(response.status_code, 200)
+        rendered = response.get_json()["jobs"][0]
+        self.assertEqual(
+            rendered["auto_youtube_recovery"]["eligible_item_ids"],
+            ["100-item-1"],
+        )
+        self.assertEqual(
+            rendered["auto_youtube_playlist"]["state"], "playlist_pending"
+        )
+        self.assertEqual(rendered["auto_youtube_cleanup"]["state"], "scheduled")
+        snapshot_reader.assert_called_once_with()
+        execution.recovery_status_for_jobs.assert_called_once_with(
+            jobs, records=records
+        )
+        playlist.status_for_jobs.assert_called_once_with(jobs, records=records)
+        cleanup.status_for_jobs.assert_called_once_with(jobs, records=records)
         manager.start_worker.assert_not_called()
 
     def test_uncertain_auto_youtube_recovery_requires_exact_reviewed_item(self):

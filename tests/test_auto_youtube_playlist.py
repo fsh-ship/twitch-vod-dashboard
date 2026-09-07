@@ -226,6 +226,22 @@ class AutoYouTubePlaylistTests(unittest.TestCase):
             },
         )
 
+    def test_status_for_many_jobs_reuses_the_provided_ledger_snapshot(self):
+        job_id, _streamer, _vod_id, _sender = self._create_confirmed_bundle()
+        job = self.manager.get_job(job_id)
+        records = self.store.list_records()
+        service = self._service(membership=mock.Mock(), inserter=mock.Mock())
+
+        with mock.patch.object(
+            self.store, "get", side_effect=AssertionError("must use snapshot")
+        ), mock.patch.object(
+            self.store, "list_records", side_effect=AssertionError("must use snapshot")
+        ):
+            statuses = service.status_for_jobs([job] * 43, records=records)
+
+        self.assertEqual(statuses[job_id]["state"], "playlist_pending")
+        self.assertTrue(statuses[job_id]["eligible"])
+
     def test_job_79_playlist_action_confirms_frozen_membership_without_video_upload(self):
         self.manager.counter = 78
         job_id, streamer, vod_id, video_sender = self._create_confirmed_bundle()

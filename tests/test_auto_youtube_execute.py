@@ -729,6 +729,35 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
             "YT_VIDEO_1",
         )
 
+    def test_recovery_status_uses_one_ledger_load_and_skips_completed_jobs(self):
+        executor = self.executor()
+        completed_jobs = [
+            {
+                "id": str(index),
+                "type": "youtube_upload",
+                "origin": "auto_youtube",
+                "state": "completed",
+                "execution_deferred": False,
+                "item_ids": [f"{index}-item-1"],
+                "item_states": ["completed"],
+                "item_failure_kinds": [None],
+                "item_completion_reasons": [None],
+                "item_recovery_reasons": [None],
+            }
+            for index in range(43)
+        ]
+        with mock.patch.object(
+            self.store, "_load_locked", wraps=self.store._load_locked
+        ) as loads, mock.patch.object(
+            executor,
+            "_uncertain_recovery_candidate",
+            side_effect=AssertionError("completed jobs must not enter recovery"),
+        ):
+            status = executor.recovery_status_for_jobs(completed_jobs)
+
+        self.assertEqual(status, {})
+        self.assertEqual(loads.call_count, 1)
+
     def test_uncertain_recovery_preserves_confirmed_multipart_prefix(self):
         job_id = self.create_bundle(2, playlist_id="FROZEN_PLAYLIST")
         executor = self.executor()

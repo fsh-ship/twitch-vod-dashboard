@@ -8,6 +8,8 @@ from vod_dashboard.media import MediaPathPolicy
 from vod_dashboard.youtube_upload_state import (
     YouTubeUploadStatePersistenceError,
     YouTubeUploadStateStore,
+    YouTubeUploadStateValidationError,
+    canonical_upload_key,
 )
 
 
@@ -170,9 +172,14 @@ class AutoYouTubePlaylistService:
         )
 
     def status_for_jobs(
-        self, jobs: list[Mapping[str, Any]]
+        self,
+        jobs: list[Mapping[str, Any]],
+        *,
+        records: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Return read-only, non-sensitive UI state for known auto jobs."""
+        if records is None:
+            records = self._state_store.list_records()
         result: Dict[str, Dict[str, Any]] = {}
         for job in jobs:
             if (
@@ -183,9 +190,14 @@ class AutoYouTubePlaylistService:
             context = job.get("auto_youtube_context")
             if not isinstance(context, Mapping):
                 continue
-            record = self._state_store.get(
-                context.get("streamer"), context.get("twitch_vod_id")
-            )
+            try:
+                record = records.get(
+                    canonical_upload_key(
+                        context.get("streamer"), context.get("twitch_vod_id")
+                    )
+                )
+            except YouTubeUploadStateValidationError:
+                continue
             if (
                 not isinstance(record, Mapping)
                 or str(record.get("upload_job_id") or "") != str(job.get("id") or "")
