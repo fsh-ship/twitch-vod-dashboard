@@ -285,6 +285,11 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
                 "api_recover_uncertain_auto_youtube_item",
             ),
             (
+                "/api/jobs/auto-youtube/recover-known",
+                "POST",
+                "api_recover_known_auto_youtube_item",
+            ),
+            (
                 "/api/jobs/auto-youtube/playlist",
                 "POST",
                 "api_add_auto_youtube_playlist",
@@ -924,6 +929,80 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
         manager.start_worker.assert_called_once_with(
             dashboard.run_upload_job, "79"
         )
+
+    def test_known_auto_youtube_recovery_needs_no_review_and_starts_once(self):
+        manager = mock.Mock()
+        service = mock.Mock()
+        service.recover_known_pretransfer_part_for_execution.side_effect = [
+            {"job_id": "79", "item_id": "79-item-1", "part_index": 1},
+            dashboard.dashboard_auto_youtube_execute.AutoYouTubeExecutionError(
+                "known_recovery_not_allowed"
+            ),
+        ]
+        payload = {"job_id": "79", "item_id": "79-item-1"}
+        with mock.patch.object(
+            dashboard, "_job_manager_for_compatibility", return_value=manager
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_execution_service", return_value=service
+        ):
+            invalid = self.client.post(
+                "/api/jobs/auto-youtube/recover-known",
+                json={**payload, "reviewed": True}, headers=self.csrf_headers,
+            )
+            first = self.client.post(
+                "/api/jobs/auto-youtube/recover-known",
+                json=payload, headers=self.csrf_headers,
+            )
+            second = self.client.post(
+                "/api/jobs/auto-youtube/recover-known",
+                json=payload, headers=self.csrf_headers,
+            )
+
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 409)
+        service.recover_known_pretransfer_part_for_execution.assert_has_calls([
+            mock.call("79", "79-item-1"),
+            mock.call("79", "79-item-1"),
+        ])
+        manager.start_worker.assert_called_once_with(
+            dashboard.run_upload_job, "79"
+        )
+
+    def test_known_auto_youtube_recovery_failures_never_start_worker(self):
+        manager = mock.Mock()
+        cases = [
+            ("invalid_auto_youtube_job", 404),
+            ("ownership_mismatch", 409),
+            ("conflicting_ownership", 409),
+            ("video_already_confirmed", 409),
+            ("known_recovery_not_allowed", 409),
+            ("known_recovery_media_invalid", 409),
+            ("known_recovery_persistence_failed", 503),
+            ("job_store_unavailable", 503),
+            ("ownership_store_unavailable", 503),
+        ]
+        for reason, expected_status in cases:
+            with self.subTest(reason=reason):
+                service = mock.Mock()
+                service.recover_known_pretransfer_part_for_execution.side_effect = (
+                    dashboard.dashboard_auto_youtube_execute.AutoYouTubeExecutionError(
+                        reason
+                    )
+                )
+                with mock.patch.object(
+                    dashboard, "_job_manager_for_compatibility", return_value=manager
+                ), mock.patch.object(
+                    dashboard, "_auto_youtube_execution_service", return_value=service
+                ):
+                    response = self.client.post(
+                        "/api/jobs/auto-youtube/recover-known",
+                        json={"job_id": "79", "item_id": "79-item-1"},
+                        headers=self.csrf_headers,
+                    )
+                self.assertEqual(response.status_code, expected_status)
+                self.assertEqual(response.get_json()["reason"], reason)
+        manager.start_worker.assert_not_called()
 
     def test_uncertain_auto_youtube_recovery_failures_never_start_worker(self):
         manager = mock.Mock()

@@ -1727,6 +1727,32 @@ class JobManager:
         self, job_id: str, item_id: str
     ) -> bool:
         """Durably queue one reviewed uncertain item while retaining its gate."""
+        return self._stage_auto_youtube_item_recovery(
+            job_id,
+            item_id,
+            failure_kind="uncertain",
+            reason="upload_outcome_uncertain",
+        )
+
+    def stage_known_auto_youtube_item_recovery(
+        self, job_id: str, item_id: str, *, reason: str
+    ) -> bool:
+        """Durably queue one proven pre-transfer known failure."""
+        return self._stage_auto_youtube_item_recovery(
+            job_id,
+            item_id,
+            failure_kind="known",
+            reason=str(reason),
+        )
+
+    def _stage_auto_youtube_item_recovery(
+        self,
+        job_id: str,
+        item_id: str,
+        *,
+        failure_kind: str,
+        reason: str,
+    ) -> bool:
         with self._condition:
             job = self.jobs.get(str(job_id))
             if job is None or not self._is_deferred_auto_youtube(job):
@@ -1734,15 +1760,15 @@ class JobManager:
             index = self._item_index_locked(job, str(item_id))
             if index is None:
                 return False
-            reason = str(
+            current_reason = str(
                 job["item_recovery_reasons"][index]
                 or job["item_completion_reasons"][index]
                 or ""
             )
             if (
                 job["item_states"][index] != "failed"
-                or job["item_failure_kinds"][index] != "uncertain"
-                or reason != "upload_outcome_uncertain"
+                or job["item_failure_kinds"][index] != failure_kind
+                or current_reason != reason
                 or job["item_retry_job_ids"][index]
                 or self._lane_active.get("youtube_upload")
                 == (str(job_id), str(item_id))

@@ -2871,6 +2871,16 @@ function queueRecoveryPresentation(item) {
   if (
     type === 'upload'
     && item.job?.origin === 'auto_youtube'
+    && item.failureKind === 'known'
+    && reason === 'youtube_not_connected'
+  ) return {
+    status:'Upload retry available',
+    support:'YouTube was not connected before this upload started. Reconnect YouTube, then retry the upload.',
+    reviewRequired:false,
+  };
+  if (
+    type === 'upload'
+    && item.job?.origin === 'auto_youtube'
     && item.job?.execution_deferred === true
     && item.state === 'waiting'
   ) return {
@@ -3036,9 +3046,15 @@ function renderQueueVodItem(item, compact=false) {
     && ['error', 'interrupted'].includes(item.state)
     && Array.isArray(recoveryStatus.eligible_item_ids)
     && recoveryStatus.eligible_item_ids.includes(itemId);
+  const canRecoverKnownAutoYoutube = item.job?.type === 'youtube_upload'
+    && item.job?.origin === 'auto_youtube'
+    && item.state === 'error'
+    && Array.isArray(recoveryStatus.known_eligible_item_ids)
+    && recoveryStatus.known_eligible_item_ids.includes(itemId);
   if (canStartAutoYoutube) actionButtons.push(`<button type="button" class="primary queue-item-action" data-queue-action="start-auto-youtube" data-job-id="${escapeHtml(item.job.id)}" data-part-count="${bundleStates.length}" aria-label="Start YouTube upload: ${escapeHtml(accessibleTitle)}">Start upload</button>`);
   if (canAddAutoYoutubePlaylist) actionButtons.push(`<button type="button" class="primary queue-item-action" data-queue-action="add-auto-youtube-playlist" data-job-id="${escapeHtml(item.job.id)}" data-part-count="${escapeHtml(playlistStatus.part_count || bundleStates.length)}" aria-label="Add ${escapeHtml(accessibleTitle)} to its YouTube playlist">Add to playlist</button>`);
   if (canRecoverUncertainAutoYoutube) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="recover-auto-youtube" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Retry YouTube upload after review: ${escapeHtml(accessibleTitle)}">Retry upload</button>`);
+  if (canRecoverKnownAutoYoutube) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="recover-known-auto-youtube" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Retry YouTube upload: ${escapeHtml(accessibleTitle)}">Retry upload</button>`);
   if (capabilities.can_cancel) actionButtons.push(`<button type="button" class="danger-outline queue-item-action" data-queue-action="cancel" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Cancel ${escapeHtml(accessibleTitle)}">Cancel</button>`);
   if (capabilities.can_stop_after_current) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="stop" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Stop Queue after ${escapeHtml(accessibleTitle)}">Stop after current</button>`);
   if (capabilities.can_remove) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="remove" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Remove ${escapeHtml(accessibleTitle)} from Queue">Remove from Queue</button>`);
@@ -3096,21 +3112,24 @@ function wireQueueItemInteractions(box) {
     'start-auto-youtube': ['/api/jobs/auto-youtube/release', 'Starting YouTube upload...'],
     'add-auto-youtube-playlist': ['/api/jobs/auto-youtube/playlist', 'Adding to YouTube playlist...'],
     'recover-auto-youtube': ['/api/jobs/auto-youtube/recover-uncertain', 'Requeuing reviewed YouTube upload...'],
+    'recover-known-auto-youtube': ['/api/jobs/auto-youtube/recover-known', 'Requeuing YouTube upload...'],
   };
   box.querySelectorAll('.queue-item-action').forEach(button => button.addEventListener('click', async () => {
     const action = button.dataset.queueAction;
     const route = actionRoutes[action];
     if (!route) return;
-    const pendingKey = ['start-auto-youtube', 'add-auto-youtube-playlist', 'recover-auto-youtube'].includes(action)
-      ? [button.dataset.jobId, action === 'recover-auto-youtube' ? button.dataset.itemId : ''].filter(Boolean).join(':')
+    const isAutoYoutubeRecovery = ['recover-auto-youtube', 'recover-known-auto-youtube'].includes(action);
+    const isPendingAutoYoutubeAction = ['start-auto-youtube', 'add-auto-youtube-playlist', 'recover-auto-youtube', 'recover-known-auto-youtube'].includes(action);
+    const pendingKey = isPendingAutoYoutubeAction
+      ? [button.dataset.jobId, isAutoYoutubeRecovery ? button.dataset.itemId : ''].filter(Boolean).join(':')
       : '';
     const pendingActions = action === 'add-auto-youtube-playlist'
       ? pendingAutoYoutubePlaylistActions
-      : action === 'recover-auto-youtube'
+      : isAutoYoutubeRecovery
         ? pendingAutoYoutubeRecoveries
         : pendingAutoYoutubeReleases;
     if (pendingKey && pendingActions.has(pendingKey)) return;
-    if (['start-auto-youtube', 'add-auto-youtube-playlist', 'recover-auto-youtube'].includes(action)) {
+    if (['start-auto-youtube', 'add-auto-youtube-playlist', 'recover-auto-youtube', 'recover-known-auto-youtube'].includes(action)) {
       const partCount = Number(button.dataset.partCount);
       const partNote = Number.isInteger(partCount) && partCount > 1
         ? `\nThis VOD contains ${partCount} parts.`
@@ -3119,18 +3138,24 @@ function wireQueueItemInteractions(box) {
         ? `Add this uploaded video to its YouTube playlist now?${partNote}`
         : action === 'recover-auto-youtube'
           ? 'Only retry after checking YouTube Studio. If the video exists there, retrying may create a duplicate.\n\nConfirm that no valid upload remains and any incomplete entry was deleted.'
+          : action === 'recover-known-auto-youtube'
+            ? 'Retry this upload now? The previous failure occurred before any YouTube upload transfer began.'
           : `Start this YouTube upload now?${partNote}`;
       const confirmed = await confirmAction({
         title:action === 'add-auto-youtube-playlist'
           ? 'Add to YouTube playlist'
           : action === 'recover-auto-youtube'
             ? 'Retry uncertain upload?'
+            : action === 'recover-known-auto-youtube'
+              ? 'Retry upload?'
             : 'Start YouTube upload',
         message:question,
         confirmLabel:action === 'add-auto-youtube-playlist'
           ? 'Add to playlist'
           : action === 'recover-auto-youtube'
             ? 'I checked — retry upload'
+            : action === 'recover-known-auto-youtube'
+              ? 'Retry upload'
             : 'Start upload'
       });
       if (!confirmed) return;
@@ -3143,12 +3168,15 @@ function wireQueueItemInteractions(box) {
         ? {job_id:button.dataset.jobId}
         : action === 'recover-auto-youtube'
           ? {job_id:button.dataset.jobId, item_id:button.dataset.itemId, reviewed:true}
+          : action === 'recover-known-auto-youtube'
+            ? {job_id:button.dataset.jobId, item_id:button.dataset.itemId}
           : {job_id:button.dataset.jobId, item_id:button.dataset.itemId};
       const result = await api(route[0], {method:'POST', body:JSON.stringify(payload)});
       if (action === 'retry' && result.retry_job_id) showToast(`Retry started as Job ${result.retry_job_id}.`);
       if (action === 'start-auto-youtube') showToast('YouTube upload queued.');
       if (action === 'add-auto-youtube-playlist') showToast('YouTube playlist updated.');
       if (action === 'recover-auto-youtube') showToast('Reviewed upload requeued.');
+      if (action === 'recover-known-auto-youtube') showToast('YouTube upload requeued.');
       await pollJobs();
     } catch (error) {
       button.disabled = false;
@@ -3188,6 +3216,10 @@ function friendlyQueueActionError(error) {
     recovery_media_invalid:'The prepared upload media is no longer available or has changed.',
     recovery_persistence_failed:'The reviewed recovery could not be saved safely. No upload was started.',
     recovery_worker_start_failed:'The reviewed upload was saved but its worker could not be started. Try again.',
+    known_recovery_not_allowed:'This upload is not eligible for known-failure recovery.',
+    known_recovery_media_invalid:'The prepared upload media is no longer available or has changed.',
+    known_recovery_persistence_failed:'The known-failure recovery could not be saved safely. No upload was started.',
+    known_recovery_worker_start_failed:'The upload was saved but its worker could not be started. Try again.',
   };
   return messages[String(error?.reason || '')] || String(error?.message || 'The Queue action could not be completed.');
 }

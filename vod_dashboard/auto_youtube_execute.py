@@ -16,6 +16,7 @@ from vod_dashboard.youtube_upload_state import (
     YouTubeUploadStatePersistenceError,
     YouTubeUploadStateStore,
     YouTubeUploadStateValidationError,
+    SAFE_KNOWN_PRETRANSFER_RECOVERY_REASONS,
     canonical_upload_key,
 )
 
@@ -236,6 +237,70 @@ class AutoYouTubeExecutionService:
                 raise AutoYouTubeExecutionError("ownership_mismatch")
         return job, record, descriptors, index
 
+    def _known_pretransfer_recovery_candidate(
+        self,
+        job_id: str,
+        item_id: str,
+        *,
+        records: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    ) -> tuple[
+        Mapping[str, Any], Mapping[str, Any], list[Dict[str, Any]], int, str
+    ]:
+        job, record, descriptors = self._ownership(job_id, records=records)
+        self._validate_unique_lineage(job_id, job)
+        item_ids = list(job.get("item_ids") or [])
+        try:
+            index = item_ids.index(str(item_id))
+        except ValueError as exc:
+            raise AutoYouTubeExecutionError("ownership_mismatch") from exc
+        parts = list(record.get("parts") or [])
+        states = list(job.get("item_states") or [])
+        failure_kinds = list(job.get("item_failure_kinds") or [])
+        completion_reasons = list(job.get("item_completion_reasons") or [])
+        recovery_reasons = list(job.get("item_recovery_reasons") or [])
+        if not (
+            len(parts)
+            == len(item_ids)
+            == len(states)
+            == len(failure_kinds)
+            == len(completion_reasons)
+            == len(recovery_reasons)
+        ) or index >= len(parts):
+            raise AutoYouTubeExecutionError("ownership_mismatch")
+        part = parts[index]
+        reason = str(recovery_reasons[index] or completion_reasons[index] or "")
+        if part.get("youtube_video_id") is not None:
+            raise AutoYouTubeExecutionError("video_already_confirmed")
+        if (
+            reason not in SAFE_KNOWN_PRETRANSFER_RECOVERY_REASONS
+            or job.get("execution_deferred") is not True
+            or record.get("state") != "needs_attention"
+            or record.get("reason") != reason
+            or states[index] != "failed"
+            or failure_kinds[index] != "known"
+            or part.get("upload_item_id") != str(item_id)
+            or part.get("upload_state") != "failed_known"
+            or part.get("reason") != reason
+            or part.get("attempts") != 0
+        ):
+            raise AutoYouTubeExecutionError("known_recovery_not_allowed")
+        for position, candidate in enumerate(parts):
+            if position < index:
+                if (
+                    candidate.get("upload_state")
+                    not in {"video_confirmed", "completed"}
+                    or not candidate.get("youtube_video_id")
+                    or states[position] != "completed"
+                ):
+                    raise AutoYouTubeExecutionError("ownership_mismatch")
+            elif position > index and (
+                candidate.get("upload_state") != "queued"
+                or candidate.get("youtube_video_id") is not None
+                or states[position] != "queued"
+            ):
+                raise AutoYouTubeExecutionError("ownership_mismatch")
+        return job, record, descriptors, index, reason
+
     @staticmethod
     def _possible_uncertain_item_ids(snapshot: Mapping[str, Any]) -> list[str]:
         if snapshot.get("execution_deferred") is not True:
@@ -267,6 +332,42 @@ class AutoYouTubeExecutionService:
                 and failure_kind == "uncertain"
                 and str(recovery_reason or completion_reason or "")
                 == "upload_outcome_uncertain"
+            )
+        ]
+
+    @staticmethod
+    def _possible_known_pretransfer_item_ids(
+        snapshot: Mapping[str, Any]
+    ) -> list[str]:
+        if snapshot.get("execution_deferred") is not True:
+            return []
+        item_ids = list(snapshot.get("item_ids") or [])
+        states = list(snapshot.get("item_states") or [])
+        failure_kinds = list(snapshot.get("item_failure_kinds") or [])
+        completion_reasons = list(snapshot.get("item_completion_reasons") or [])
+        recovery_reasons = list(snapshot.get("item_recovery_reasons") or [])
+        if not (
+            len(item_ids)
+            == len(states)
+            == len(failure_kinds)
+            == len(completion_reasons)
+            == len(recovery_reasons)
+        ):
+            return []
+        return [
+            str(item_id)
+            for item_id, state, failure_kind, completion_reason, recovery_reason in zip(
+                item_ids,
+                states,
+                failure_kinds,
+                completion_reasons,
+                recovery_reasons,
+            )
+            if (
+                state == "failed"
+                and failure_kind == "known"
+                and str(recovery_reason or completion_reason or "")
+                in SAFE_KNOWN_PRETRANSFER_RECOVERY_REASONS
             )
         ]
 
@@ -304,6 +405,19 @@ class AutoYouTubeExecutionService:
                     "reason": "upload_outcome_uncertain",
                     "eligible_item_ids": eligible,
                 }
+            known_eligible: list[str] = []
+            for item_id in self._possible_known_pretransfer_item_ids(snapshot):
+                try:
+                    self._known_pretransfer_recovery_candidate(
+                        job_id, item_id, records=records
+                    )
+                except Exception:
+                    continue
+                known_eligible.append(item_id)
+            if known_eligible:
+                result.setdefault(job_id, {})["known_eligible_item_ids"] = (
+                    known_eligible
+                )
         return result
 
     def recover_uncertain_part_for_execution(
@@ -395,6 +509,109 @@ class AutoYouTubeExecutionService:
             str(job_id),
             f"Auto YouTube part {index + 1}/{len(recovered_parts)} was requeued "
             "after explicit YouTube Studio review.",
+        )
+        return {
+            "job_id": str(job_id),
+            "item_id": str(item_id),
+            "part_index": index + 1,
+        }
+
+    def recover_known_pretransfer_part_for_execution(
+        self, job_id: str, item_id: str
+    ) -> Dict[str, Any]:
+        """Durably retry one proven pre-transfer known failure."""
+        if self._state_store.health().get("healthy") is not True:
+            raise AutoYouTubeExecutionError("ownership_store_unavailable")
+        health = self._job_manager.persistence_status()
+        if health.get("enabled") is not True or health.get("healthy") is not True:
+            raise AutoYouTubeExecutionError("job_store_unavailable")
+        job, record, descriptors, index, reason = (
+            self._known_pretransfer_recovery_candidate(
+                str(job_id), str(item_id)
+            )
+        )
+        try:
+            self._materializer()._validate_media(record, descriptors)
+        except (_MissingMaterializationMedia, _InvalidMaterializationMedia) as exc:
+            raise AutoYouTubeExecutionError(
+                "known_recovery_media_invalid"
+            ) from exc
+        if not self._job_manager.stage_known_auto_youtube_item_recovery(
+            str(job_id), str(item_id), reason=reason
+        ):
+            raise AutoYouTubeExecutionError("known_recovery_not_allowed")
+        try:
+            recovered = self._state_store.recover_known_pretransfer_part(
+                record["streamer"],
+                record["twitch_vod_id"],
+                upload_job_id=str(job_id),
+                upload_item_id=str(item_id),
+                part_index=index + 1,
+                reason=reason,
+            )
+        except YouTubeUploadStateValidationError as exc:
+            try:
+                self._job_manager.block_auto_youtube_item(
+                    str(job_id),
+                    str(item_id),
+                    uncertain=False,
+                    reason=reason,
+                )
+            except Exception:
+                pass
+            raise AutoYouTubeExecutionError(
+                "known_recovery_not_allowed"
+            ) from exc
+        except YouTubeUploadStatePersistenceError as exc:
+            try:
+                self._job_manager.block_auto_youtube_item(
+                    str(job_id),
+                    str(item_id),
+                    uncertain=False,
+                    reason=reason,
+                )
+            except Exception:
+                pass
+            raise AutoYouTubeExecutionError(
+                "known_recovery_persistence_failed"
+            ) from exc
+
+        current = self._job_manager.get_job(str(job_id)) or {}
+        current_states = list(current.get("item_states") or [])
+        recovered_parts = list(recovered.get("parts") or [])
+        aligned = len(current_states) == len(recovered_parts)
+        if aligned:
+            for position, part in enumerate(recovered_parts):
+                if position < index:
+                    valid = (
+                        part.get("upload_state")
+                        in {"video_confirmed", "completed"}
+                        and bool(part.get("youtube_video_id"))
+                        and current_states[position] == "completed"
+                    )
+                else:
+                    valid = (
+                        part.get("upload_state") == "queued"
+                        and part.get("youtube_video_id") is None
+                        and current_states[position] == "queued"
+                    )
+                if not valid:
+                    aligned = False
+                    break
+        if (
+            current.get("execution_deferred") is not True
+            or recovered.get("state") != "upload_queued"
+            or not aligned
+        ):
+            raise AutoYouTubeExecutionError("ownership_mismatch")
+        if not self._job_manager.release_auto_youtube_job_for_execution(
+            str(job_id)
+        ):
+            raise AutoYouTubeExecutionError("known_recovery_not_allowed")
+        self._log(
+            str(job_id),
+            f"Auto YouTube part {index + 1}/{len(recovered_parts)} was requeued "
+            "after a known pre-transfer failure.",
         )
         return {
             "job_id": str(job_id),

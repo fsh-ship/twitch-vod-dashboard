@@ -506,6 +506,11 @@ class JobHistoryUiTests(unittest.TestCase):
         known = _upload_job(
             "92", states=["failed"], failure_kinds=["known"]
         )
+        known["item_completion_reasons"] = ["youtube_not_connected"]
+        known["item_recovery_reasons"] = ["youtube_not_connected"]
+        known["auto_youtube_recovery"] = {
+            "known_eligible_item_ids": ["92-item-1"],
+        }
         manual = _upload_job(
             "93", origin="manual", states=["failed"],
             failure_kinds=["uncertain"],
@@ -523,9 +528,12 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertIn('data-queue-action="recover-auto-youtube"', cards["91"])
         self.assertIn(">Retry upload<", cards["91"])
         self.assertNotIn('data-queue-action="retry"', cards["91"])
-        self.assertNotIn(
-            'data-queue-action="recover-auto-youtube"', cards["92"]
+        self.assertIn("Upload retry available", cards["92"])
+        self.assertIn(
+            'data-queue-action="recover-known-auto-youtube"', cards["92"]
         )
+        self.assertIn(">Retry upload<", cards["92"])
+        self.assertNotIn("Check YouTube Studio", cards["92"])
         self.assertNotIn(
             'data-queue-action="recover-auto-youtube"', cards["93"]
         )

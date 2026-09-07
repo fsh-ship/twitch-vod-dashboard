@@ -182,6 +182,24 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         )
         return claim["item_id"]
 
+    def make_known_pretransfer_failure(
+        self, job_id, *, part_index=1, reason="youtube_not_connected"
+    ):
+        executor = self.executor()
+        if self.manager.get_job(job_id)["execution_deferred"]:
+            executor.release_auto_youtube_job_for_execution(job_id)
+        claim = self.manager.claim_next_item(job_id)
+        self.assertEqual(claim["index"], part_index - 1)
+        self.store.mark_part_attention(
+            "bearlychen", VOD_ID,
+            upload_job_id=job_id, upload_item_id=claim["item_id"],
+            part_index=part_index, reason=reason, uncertain=False,
+        )
+        self.manager.block_auto_youtube_item(
+            job_id, claim["item_id"], uncertain=False, reason=reason
+        )
+        return claim["item_id"]
+
     def test_deferred_production_style_job_remains_inert_through_reconcile_and_worker_opportunity(self):
         job_id = self.create_bundle()
         executor = self.executor()
@@ -729,6 +747,139 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
             "YT_VIDEO_1",
         )
 
+    def test_known_pretransfer_failure_requeues_same_one_part_job(self):
+        job_id = self.create_bundle()
+        item_id = self.make_known_pretransfer_failure(job_id)
+        executor = self.executor()
+        before = self.manager.get_job(job_id)
+
+        status = executor.recovery_status_for_jobs(self.manager.snapshot_jobs())
+        self.assertEqual(status[job_id]["known_eligible_item_ids"], [item_id])
+        result = executor.recover_known_pretransfer_part_for_execution(
+            job_id, item_id
+        )
+
+        self.assertEqual(result["part_index"], 1)
+        job = self.manager.get_job(job_id)
+        record = self.store.get("bearlychen", VOD_ID)
+        self.assertEqual(job["id"], job_id)
+        self.assertEqual(job["item_ids"], before["item_ids"])
+        self.assertEqual(job["auto_youtube_key"], before["auto_youtube_key"])
+        self.assertFalse(job["execution_deferred"])
+        self.assertEqual(job["item_states"], ["queued"])
+        self.assertEqual(record["state"], "upload_queued")
+        self.assertEqual(record["parts"][0]["upload_state"], "queued")
+        self.assertIsNone(record["parts"][0]["reason"])
+        self.assertEqual(record["parts"][0]["attempts"], 0)
+
+        executor.run_job(job_id)
+
+        self.assertEqual(self.request_sender.call_count, 1)
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed"])
+
+    def test_known_pretransfer_failure_requeues_multipart_bundle_in_order(self):
+        job_id = self.create_bundle(2)
+        item_id = self.make_known_pretransfer_failure(job_id)
+        before = self.manager.get_job(job_id)
+        executor = self.executor()
+
+        executor.recover_known_pretransfer_part_for_execution(job_id, item_id)
+
+        job = self.manager.get_job(job_id)
+        record = self.store.get("bearlychen", VOD_ID)
+        self.assertEqual(job["id"], job_id)
+        self.assertEqual(job["item_ids"], before["item_ids"])
+        self.assertEqual(job["item_states"], ["queued", "queued"])
+        self.assertEqual(
+            [part["upload_state"] for part in record["parts"]],
+            ["queued", "queued"],
+        )
+
+        executor.run_job(job_id)
+
+        self.assertEqual(self.request_sender.call_count, 2)
+        self.assertEqual(
+            self.manager.get_job(job_id)["item_states"],
+            ["completed", "completed"],
+        )
+        self.assertEqual(len(self.manager.snapshot_jobs()), 1)
+
+    def test_known_recovery_rejects_uncertain_and_unsupported_failures(self):
+        job_id = self.create_bundle()
+        item_id = self.make_uncertain(job_id)
+        with self.assertRaisesRegex(
+            AutoYouTubeExecutionError, "known_recovery_not_allowed"
+        ):
+            self.executor().recover_known_pretransfer_part_for_execution(
+                job_id, item_id
+            )
+
+        self.tearDown(); self.setUp()
+        job_id = self.create_bundle()
+        item_id = self.make_known_pretransfer_failure(
+            job_id, reason="api_unavailable"
+        )
+        with self.assertRaisesRegex(
+            AutoYouTubeExecutionError, "known_recovery_not_allowed"
+        ):
+            self.executor().recover_known_pretransfer_part_for_execution(
+                job_id, item_id
+            )
+        self.assertTrue(self.manager.get_job(job_id)["execution_deferred"])
+        self.assertEqual(
+            self.store.get("bearlychen", VOD_ID)["parts"][0]["upload_state"],
+            "failed_known",
+        )
+        self.request_sender.assert_not_called()
+
+    def test_known_recovery_fails_closed_for_media_persistence_or_ownership(self):
+        job_id = self.create_bundle()
+        item_id = self.make_known_pretransfer_failure(job_id)
+        source = self.media_root / "bearlychen" / "source.mkv"
+        source.unlink()
+        with self.assertRaisesRegex(
+            AutoYouTubeExecutionError, "known_recovery_media_invalid"
+        ):
+            self.executor().recover_known_pretransfer_part_for_execution(
+                job_id, item_id
+            )
+        self.assertTrue(self.manager.get_job(job_id)["execution_deferred"])
+
+        self.tearDown(); self.setUp()
+        job_id = self.create_bundle()
+        item_id = self.make_known_pretransfer_failure(job_id)
+        with mock.patch.object(
+            self.store,
+            "recover_known_pretransfer_part",
+            side_effect=YouTubeUploadStatePersistenceError("full"),
+        ):
+            with self.assertRaisesRegex(
+                AutoYouTubeExecutionError, "known_recovery_persistence_failed"
+            ):
+                self.executor().recover_known_pretransfer_part_for_execution(
+                    job_id, item_id
+                )
+        self.assertTrue(self.manager.get_job(job_id)["execution_deferred"])
+        self.assertEqual(
+            self.manager.get_job(job_id)["item_states"], ["failed"]
+        )
+        self.request_sender.assert_not_called()
+
+        self.tearDown(); self.setUp()
+        job_id = self.create_bundle()
+        item_id = self.make_known_pretransfer_failure(job_id)
+        self.store.update_record(
+            "bearlychen", VOD_ID, upload_job_id="999"
+        )
+        with self.assertRaisesRegex(
+            AutoYouTubeExecutionError, "ownership_mismatch"
+        ):
+            self.executor().recover_known_pretransfer_part_for_execution(
+                job_id, item_id
+            )
+        self.assertTrue(self.manager.get_job(job_id)["execution_deferred"])
+        self.request_sender.assert_not_called()
+
     def test_recovery_status_uses_one_ledger_load_and_skips_completed_jobs(self):
         executor = self.executor()
         completed_jobs = [
@@ -1160,6 +1311,10 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
             (
                 "auto_youtube_execute.py",
                 "recover_uncertain_part_for_execution",
+            ),
+            (
+                "auto_youtube_execute.py",
+                "recover_known_pretransfer_part_for_execution",
             ),
         ])
 

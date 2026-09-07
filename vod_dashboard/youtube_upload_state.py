@@ -48,6 +48,7 @@ CLEANUP_REASON_CODES = frozenset({"canonical_missing_before_start", "canonical_i
 SPLIT_MODES = frozenset({"stream_copy"})
 PART_PLAN_VERSION = 1
 REASON_CODES = frozenset({"youtube_not_connected", "token_refresh_failed", "api_unavailable", "local_preparation_failed", "upload_outcome_uncertain", "playlist_failed", "playlist_uncertain", "plan_media_missing", "plan_source_invalid", "plan_preparation_failed", "plan_inputs_missing", "materialization_media_missing", "materialization_source_invalid", "materialization_consistency_error", "multipart_preparation_required", "parts_preparation_failed", "parts_manifest_invalid", "insufficient_storage", "storage_unavailable", "ffmpeg_unavailable", "ffmpeg_failed", "multipart_storage_insufficient", "multipart_storage_unavailable", "multipart_generation_incomplete", "multipart_validation_failed", "multipart_replan_required", "multipart_replan_exhausted", "multipart_replan_source_invalid", "multipart_replan_unsafe", "multipart_replan_failed"})
+SAFE_KNOWN_PRETRANSFER_RECOVERY_REASONS = frozenset({"youtube_not_connected"})
 
 _VOD_ID_RE = re.compile(rf"\d{{6,{MAX_VOD_ID_LENGTH}}}")
 _IDENTIFIER_RE = re.compile(rf"[A-Za-z0-9][A-Za-z0-9_.-]{{0,{MAX_IDENTIFIER_LENGTH - 1}}}")
@@ -719,6 +720,73 @@ class YouTubeUploadStateStore:
                 raise YouTubeUploadStateValidationError(
                     "invalid_part_recovery"
                 )
+            current.update({"upload_state": "queued", "reason": None})
+            new = deepcopy(old)
+            new.update({
+                "state": "upload_queued",
+                "parts": parts,
+                "reason": None,
+                "updated_at": _now(self._clock),
+            })
+            normalized = _record_v5(new, key)
+            doc["uploads"][key] = normalized
+            self._write_locked(doc)
+            return deepcopy(normalized)
+
+    def recover_known_pretransfer_part(
+        self,
+        streamer: Any,
+        twitch_vod_id: Any,
+        *,
+        upload_job_id: Any,
+        upload_item_id: Any,
+        part_index: Any,
+        reason: Any,
+    ) -> UploadRecord:
+        """Reset one known pre-transfer failure without changing ownership."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        job_id = _identifier(upload_job_id, "invalid_part_recovery")
+        item_id = _identifier(upload_item_id, "invalid_part_recovery")
+        safe_reason = _reason(reason)
+        if (
+            safe_reason not in SAFE_KNOWN_PRETRANSFER_RECOVERY_REASONS
+            or isinstance(part_index, bool)
+            or not isinstance(part_index, int)
+            or part_index < 1
+        ):
+            raise YouTubeUploadStateValidationError("invalid_part_recovery")
+        with self._lock:
+            doc = self._load_locked()
+            old = doc["uploads"].get(key)
+            if old is None:
+                raise YouTubeUploadStateValidationError("upload_not_found")
+            if (
+                old["state"] != "needs_attention"
+                or old["reason"] != safe_reason
+                or old["upload_job_id"] != job_id
+                or part_index > len(old["parts"])
+            ):
+                raise YouTubeUploadStateValidationError("invalid_part_recovery")
+            parts = deepcopy(old["parts"])
+            current = parts[part_index - 1]
+            if (
+                current["upload_item_id"] != item_id
+                or current["upload_state"] != "failed_known"
+                or current["reason"] != safe_reason
+                or current["youtube_video_id"] is not None
+                or current["attempts"] != 0
+            ):
+                raise YouTubeUploadStateValidationError("invalid_part_recovery")
+            if any(
+                part["upload_state"] not in {"video_confirmed", "completed"}
+                or part["youtube_video_id"] is None
+                for part in parts[: part_index - 1]
+            ) or any(
+                part["upload_state"] != "queued"
+                or part["youtube_video_id"] is not None
+                for part in parts[part_index:]
+            ):
+                raise YouTubeUploadStateValidationError("invalid_part_recovery")
             current.update({"upload_state": "queued", "reason": None})
             new = deepcopy(old)
             new.update({
