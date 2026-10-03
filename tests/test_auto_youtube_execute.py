@@ -300,6 +300,71 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         executor.run_job(job_id)
         self.request_sender.assert_called_once()
 
+    def test_automatic_release_keeps_legacy_uncertain_job_deferred(self):
+        job_id = self.create_bundle(execution_policy="automatic")
+        item_id = self.make_uncertain(job_id)
+        document = self.store.load()
+        record = document["uploads"][f"bearlychen:{VOD_ID}"]
+        record.update({"state": "upload_queued", "reason": None})
+        record["parts"][0].update({
+            "upload_state": "queued", "attempts": 0, "reason": None,
+            "youtube_video_id": None,
+        })
+        self.store.replace_state(document)
+
+        # Reproduce the durable pre-reconciliation legacy state: a stale
+        # release had already cleared the gate even though the JobStore still
+        # retained its uncertain upload outcome.
+        with self.manager._condition:
+            self.manager.jobs[job_id]["execution_deferred"] = False
+            self.manager._mark_dirty_locked(self.manager.jobs[job_id])
+            snapshot = self.manager._snapshot_for_persistence_locked()
+            self.manager._persist_required(snapshot)
+        restarted = self.new_manager()
+        restarted.restore_from_store()
+        self.assertFalse(restarted.get_job(job_id)["execution_deferred"])
+
+        executor = self.executor(manager=restarted)
+        executor.reconcile()
+        before = restarted.get_job(job_id)
+        self.assertEqual(before["item_states"], ["failed"])
+        self.assertEqual(before["item_failure_kinds"], ["uncertain"])
+        self.assertEqual(
+            before["item_completion_reasons"], ["upload_outcome_uncertain"]
+        )
+        self.assertEqual(
+            before["item_recovery_reasons"], ["upload_outcome_uncertain"]
+        )
+        self.assertTrue(before["execution_deferred"])
+
+        worker_starter = mock.Mock()
+        result = executor.release_automatic_jobs_for_execution(worker_starter)
+
+        self.assertEqual(result["released"], 0)
+        self.assertEqual(result["pending"], 1)
+        worker_starter.assert_not_called()
+        after = restarted.get_job(job_id)
+        self.assertTrue(after["execution_deferred"])
+        self.assertEqual(after["item_states"], ["failed"])
+        self.assertEqual(
+            executor.recovery_status_for_jobs(restarted.snapshot_jobs())[job_id]
+            ["already_uploaded_eligible_item_ids"],
+            [item_id],
+        )
+        self.assertIsNone(restarted.claim_next_item(job_id))
+        self.request_sender.assert_not_called()
+
+    def test_normal_release_rejects_inconsistent_queued_ledger_and_job_item(self):
+        job_id = self.create_bundle(execution_policy="automatic")
+        with self.manager.lock:
+            self.manager.jobs[job_id]["item_completion_reasons"][0] = "stale"
+
+        with self.assertRaisesRegex(
+            AutoYouTubeExecutionError, "release_not_allowed"
+        ):
+            self.executor().release_auto_youtube_job_for_execution(job_id)
+        self.assertTrue(self.manager.get_job(job_id)["execution_deferred"])
+
     def test_studio_confirmation_rejects_invalid_or_unowned_video_without_mutation(self):
         job_id = self.create_bundle()
         item_id = self.make_uncertain(job_id)

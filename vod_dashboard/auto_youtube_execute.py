@@ -177,11 +177,32 @@ class AutoYouTubeExecutionService:
         if len(lineage) != 1 or str(lineage[0].get("id") or "") != str(job_id):
             raise AutoYouTubeExecutionError("conflicting_ownership")
         item_ids = list(job.get("item_ids") or [])
+        item_states = list(job.get("item_states") or [])
+        failure_kinds = list(job.get("item_failure_kinds") or [])
+        completion_reasons = list(job.get("item_completion_reasons") or [])
+        recovery_reasons = list(job.get("item_recovery_reasons") or [])
+        retry_job_ids = list(job.get("item_retry_job_ids") or [])
         parts = list(record.get("parts") or [])
         if (
-            len(item_ids) != len(parts)
+            not (
+                len(parts)
+                == len(item_ids)
+                == len(item_states)
+                == len(failure_kinds)
+                == len(completion_reasons)
+                == len(recovery_reasons)
+                == len(retry_job_ids)
+            )
             or any(part.get("upload_item_id") != item_id for part, item_id in zip(parts, item_ids))
             or any(part.get("upload_state") != "queued" or part.get("youtube_video_id") is not None for part in parts)
+            # A normal automatic release is only safe for work that has never
+            # started.  Ledger queued alone is insufficient: a stale ledger
+            # must not overwrite a JobStore failure/recovery state.
+            or any(state != "queued" for state in item_states)
+            or any(failure_kinds)
+            or any(completion_reasons)
+            or any(recovery_reasons)
+            or any(retry_job_ids)
         ):
             raise AutoYouTubeExecutionError("release_not_allowed")
         try:
