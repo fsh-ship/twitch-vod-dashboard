@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import tempfile
+from threading import Event
 import unittest
+from unittest import mock
 
 from vod_dashboard import youtube_upload_state as state
 
@@ -74,7 +77,7 @@ class YouTubeUploadStateStoreTests(unittest.TestCase):
         self.assertEqual(duplicate["execution_policy"], "automatic")
         self.assertEqual(record, duplicate)
 
-    def _queued_original(self, *, playlist_id=None, cleanup_delay_hours=0):
+    def _queued_original(self, *, playlist_id=None, cleanup_delay_hours=0, start_transfer=True):
         self.create(
             playlist_id=playlist_id,
             cleanup_delay_hours=cleanup_delay_hours,
@@ -90,10 +93,129 @@ class YouTubeUploadStateStoreTests(unittest.TestCase):
             "bearlychen", "2855270041", upload_job_id="99",
             upload_item_ids=["99-item-1"],
         )
-        self.store.begin_part_transfer(
-            "bearlychen", "2855270041", upload_job_id="99",
-            upload_item_id="99-item-1", part_index=1,
+        if start_transfer:
+            self.store.begin_part_transfer(
+                "bearlychen", "2855270041", upload_job_id="99",
+                upload_item_id="99-item-1", part_index=1,
+            )
+
+    @staticmethod
+    def _create_other(store):
+        return store.create_intent_if_absent(
+            "other_streamer", "2855270042",
+            source_download_job_id="39",
+            source_download_item_id="39-item-1",
+            media_path="other_streamer/video.mp4",
+            size_bytes=24,
         )
+
+    def test_two_store_instances_serialize_read_modify_write_for_distinct_records(self):
+        other = state.YouTubeUploadStateStore(self.path.parent / "." / self.path.name)
+        first_read = Event()
+        release_first = Event()
+        second_read = Event()
+        original_first_load = self.store._load_locked
+        original_second_load = other._load_locked
+
+        def paused_first_load():
+            document = original_first_load()
+            first_read.set()
+            if not release_first.wait(5):
+                raise AssertionError("first writer was not released")
+            return document
+
+        def observed_second_load():
+            second_read.set()
+            return original_second_load()
+
+        with mock.patch.object(self.store, "_load_locked", side_effect=paused_first_load), \
+             mock.patch.object(other, "_load_locked", side_effect=observed_second_load), \
+             ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.create)
+            try:
+                self.assertTrue(first_read.wait(5))
+                second = pool.submit(self._create_other, other)
+                # An independent instance used to read the stale document here.
+                self.assertFalse(second_read.wait(0.2))
+            finally:
+                release_first.set()
+            first.result(timeout=5)
+            second.result(timeout=5)
+
+        uploads = self.store.list_records()
+        self.assertEqual(set(uploads), {
+            "bearlychen:2855270041", "other_streamer:2855270042"
+        })
+
+    def test_other_record_write_cannot_erase_transfer_started(self):
+        self._queued_original(start_transfer=False)
+        other = state.YouTubeUploadStateStore(self.path)
+        other_read = Event()
+        release_other = Event()
+        transfer_read = Event()
+        original_other_load = other._load_locked
+        original_transfer_load = self.store._load_locked
+
+        def paused_other_load():
+            document = original_other_load()
+            other_read.set()
+            if not release_other.wait(5):
+                raise AssertionError("other writer was not released")
+            return document
+
+        def observed_transfer_load():
+            transfer_read.set()
+            return original_transfer_load()
+
+        with mock.patch.object(other, "_load_locked", side_effect=paused_other_load), \
+             mock.patch.object(self.store, "_load_locked", side_effect=observed_transfer_load), \
+             ThreadPoolExecutor(max_workers=2) as pool:
+            other_write = pool.submit(self._create_other, other)
+            try:
+                self.assertTrue(other_read.wait(5))
+                transfer = pool.submit(
+                    self.store.begin_part_transfer,
+                    "bearlychen", "2855270041",
+                    upload_job_id="99", upload_item_id="99-item-1", part_index=1,
+                )
+                self.assertFalse(transfer_read.wait(0.2))
+            finally:
+                release_other.set()
+            other_write.result(timeout=5)
+            transfer.result(timeout=5)
+
+        uploads = self.store.list_records()
+        part = uploads["bearlychen:2855270041"]["parts"][0]
+        self.assertEqual(part["upload_state"], "transfer_started")
+        self.assertEqual(part["attempts"], 1)
+        self.assertIn("other_streamer:2855270042", uploads)
+
+    def test_distinct_state_files_do_not_block_each_other(self):
+        other = state.YouTubeUploadStateStore(self.root / "other-state.json")
+        first_read = Event()
+        release_first = Event()
+        original_load = self.store._load_locked
+
+        def paused_load():
+            document = original_load()
+            first_read.set()
+            if not release_first.wait(5):
+                raise AssertionError("first writer was not released")
+            return document
+
+        with mock.patch.object(self.store, "_load_locked", side_effect=paused_load), \
+             ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.create)
+            try:
+                self.assertTrue(first_read.wait(5))
+                # This must finish while the first file's write lock is held.
+                pool.submit(self._create_other, other).result(timeout=3)
+            finally:
+                release_first.set()
+            first.result(timeout=5)
+
+        self.assertIn("bearlychen:2855270041", self.store.list_records())
+        self.assertIn("other_streamer:2855270042", other.list_records())
 
     def test_cleanup_policy_is_frozen_and_not_changed_by_duplicate_admission(self):
         first, _ = self.create(cleanup_delay_hours=6)

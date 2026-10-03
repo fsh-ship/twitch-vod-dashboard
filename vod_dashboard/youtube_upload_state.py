@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 import re
 import threading
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from weakref import WeakValueDictionary
 
 from vod_dashboard.runtime_files import atomic_write_text
 from vod_dashboard.settings import canonical_streamer_login
@@ -68,6 +69,20 @@ _TRANSITIONS = {
 State = Dict[str, Any]
 UploadRecord = Dict[str, Any]
 Clock = Callable[[], datetime]
+
+_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: WeakValueDictionary[Path, Any] = WeakValueDictionary()
+
+
+def _lock_for_path(path: Path):
+    """Share one lock per state file across store instances in this process."""
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(path)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[path] = lock
+        return lock
+
 
 class YouTubeUploadStateError(RuntimeError): pass
 class YouTubeUploadStateValidationError(YouTubeUploadStateError, ValueError): pass
@@ -356,7 +371,10 @@ def _schedule_completed_cleanup(record: UploadRecord, now: str) -> UploadRecord:
     return record
 
 class YouTubeUploadStateStore:
-    def __init__(self, path: Path, *, clock: Optional[Clock] = None) -> None: self.path = Path(path); self._clock = clock or (lambda: datetime.now(timezone.utc)); self._lock = threading.RLock()
+    def __init__(self, path: Path, *, clock: Optional[Clock] = None) -> None:
+        self.path = Path(path).resolve()
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._lock = _lock_for_path(self.path)
     @classmethod
     def from_dashboard_dir(cls, dashboard_dir: Path, *, clock: Optional[Clock] = None) -> "YouTubeUploadStateStore": return cls(youtube_upload_state_path(dashboard_dir), clock=clock)
     def _load_locked(self) -> State:
