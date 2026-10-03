@@ -3068,7 +3068,7 @@ function renderQueueVodItem(item, compact=false) {
     && recoveryStatus.known_eligible_item_ids.includes(itemId);
   const canConfirmAutoYoutubeUpload = item.job?.type === 'youtube_upload'
     && item.job?.origin === 'auto_youtube'
-    && ['error', 'interrupted'].includes(item.state)
+    && (['error', 'interrupted'].includes(item.state) || item.state === 'waiting')
     && Array.isArray(recoveryStatus.already_uploaded_eligible_item_ids)
     && recoveryStatus.already_uploaded_eligible_item_ids.includes(itemId);
   const continuation = recoveryStatus.continuation || {};

@@ -201,6 +201,25 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         )
         return claim["item_id"]
 
+    def make_resolved_queued_history(self, job_id, *, item_index=0):
+        """Persist the narrow historical JobStore shape from production."""
+        with self.manager._condition:
+            job = self.manager.jobs[job_id]
+            job["execution_deferred"] = True
+            job["state"] = "queued"
+            job["item_states"][item_index] = "queued"
+            job["item_resolved"][item_index] = True
+            job["item_failure_kinds"][item_index] = ""
+            job["item_completion_reasons"][item_index] = ""
+            job["item_recovery_reasons"][item_index] = ""
+            job["item_retry_job_ids"][item_index] = ""
+            job["finished_at"] = self.manager._utc_timestamp()
+            job["item_progress"][item_index] = 99.5
+            self.manager._mark_dirty_locked(job)
+            snapshot = self.manager._snapshot_for_persistence_locked()
+            self.manager._persist_required(snapshot)
+            return job["item_ids"][item_index]
+
     def verified_video(self, video_id="AbCdEf12345", *, channel_id="my-channel"):
         service = self.service_getter.return_value
         service.channels.return_value.list.return_value.execute.return_value = {
@@ -278,6 +297,104 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
         self.assertEqual(repaired["parts"][0]["attempts"], 0)
         self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed"])
         self.request_sender.assert_not_called()
+
+    def test_resolved_queued_history_can_be_confirmed_without_local_media(self):
+        job_id = self.create_bundle()
+        item_id = self.make_resolved_queued_history(job_id)
+        restarted = self.new_manager()
+        restarted.restore_from_store()
+        source_path = self.media_root / "bearlychen" / "source.mkv"
+        source_path.unlink()
+        executor = self.executor(manager=restarted)
+
+        status = executor.recovery_status_for_jobs(restarted.snapshot_jobs())
+        self.assertEqual(
+            status[job_id]["already_uploaded_eligible_item_ids"], [item_id]
+        )
+        self.assertNotIn("eligible_item_ids", status[job_id])
+        self.verified_video()
+
+        result = executor.confirm_already_uploaded_part(
+            job_id, item_id, "https://youtu.be/AbCdEf12345"
+        )
+
+        self.assertEqual(result["youtube_video_id"], "AbCdEf12345")
+        record = self.store.get("bearlychen", VOD_ID)
+        self.assertEqual(record["parts"][0]["upload_state"], "video_confirmed")
+        self.assertEqual(record["parts"][0]["youtube_video_id"], "AbCdEf12345")
+        self.assertEqual(restarted.get_job(job_id)["item_states"], ["completed"])
+        self.request_builder.assert_not_called()
+        self.request_sender.assert_not_called()
+
+    def test_resolved_queued_history_rejects_ineligible_shapes(self):
+        fresh_job_id = self.create_bundle(streamer="freshstreamer")
+        self.assertNotIn(
+            "already_uploaded_eligible_item_ids",
+            self.executor().recovery_status_for_jobs(
+                self.manager.snapshot_jobs()
+            ).get(fresh_job_id, {}),
+        )
+
+        cases = {
+            "item_not_resolved": lambda job: job["item_resolved"].__setitem__(0, False),
+            "finished_at_missing": lambda job: job.__setitem__("finished_at", None),
+            "gate_released": lambda job: job.__setitem__("execution_deferred", False),
+            "retry_reference": lambda job: job["item_retry_job_ids"].__setitem__(0, "999"),
+        }
+        for index, (name, mutate) in enumerate(cases.items(), 1):
+            with self.subTest(name=name):
+                job_id = self.create_bundle(streamer=f"legacystreamer{index}")
+                item_id = self.make_resolved_queued_history(job_id)
+                with self.manager.lock:
+                    mutate(self.manager.jobs[job_id])
+                executor = self.executor()
+                status = executor.recovery_status_for_jobs(
+                    self.manager.snapshot_jobs()
+                )
+                self.assertNotIn(
+                    "already_uploaded_eligible_item_ids", status.get(job_id, {})
+                )
+                with self.assertRaisesRegex(
+                    AutoYouTubeExecutionError, "confirmation_not_allowed"
+                ):
+                    executor.confirm_already_uploaded_part(
+                        job_id, item_id, "AbCdEf12345"
+                    )
+
+    def test_resolved_queued_history_rejects_foreign_video_without_mutation(self):
+        job_id = self.create_bundle()
+        item_id = self.make_resolved_queued_history(job_id)
+        before_record = self.store.get("bearlychen", VOD_ID)
+        before_job = self.manager.get_job(job_id)
+        self.verified_video(channel_id="someone-else")
+
+        with self.assertRaisesRegex(AutoYouTubeExecutionError, "video_not_confirmed"):
+            self.executor().confirm_already_uploaded_part(
+                job_id, item_id, "AbCdEf12345"
+            )
+
+        self.assertEqual(self.store.get("bearlychen", VOD_ID), before_record)
+        self.assertEqual(self.manager.get_job(job_id), before_job)
+        self.request_builder.assert_not_called()
+        self.request_sender.assert_not_called()
+
+    def test_resolved_queued_history_keeps_multipart_invariants(self):
+        job_id = self.create_bundle(total=2)
+        item_id = self.make_resolved_queued_history(job_id)
+        with self.manager.lock:
+            self.manager.jobs[job_id]["item_states"][1] = "failed"
+
+        executor = self.executor()
+        self.assertNotIn(
+            "already_uploaded_eligible_item_ids",
+            executor.recovery_status_for_jobs(self.manager.snapshot_jobs()).get(
+                job_id, {}
+            ),
+        )
+        with self.assertRaisesRegex(
+            AutoYouTubeExecutionError, "ownership_mismatch"
+        ):
+            executor.confirm_already_uploaded_part(job_id, item_id, "AbCdEf12345")
 
     def test_legacy_queued_retry_still_requires_explicit_review(self):
         job_id = self.create_bundle()

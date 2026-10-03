@@ -451,6 +451,63 @@ class AutoYouTubeExecutionService:
         ]
 
     @staticmethod
+    def _possible_resolved_queued_item_ids(
+        snapshot: Mapping[str, Any]
+    ) -> list[str]:
+        """Return the narrowly-defined historical resolved/queued items."""
+        if (
+            snapshot.get("execution_deferred") is not True
+            or snapshot.get("state") != "queued"
+            or not snapshot.get("finished_at")
+        ):
+            return []
+        item_ids = list(snapshot.get("item_ids") or [])
+        states = list(snapshot.get("item_states") or [])
+        resolved = list(snapshot.get("item_resolved") or [])
+        failure_kinds = list(snapshot.get("item_failure_kinds") or [])
+        completion_reasons = list(snapshot.get("item_completion_reasons") or [])
+        recovery_reasons = list(snapshot.get("item_recovery_reasons") or [])
+        retry_ids = list(snapshot.get("item_retry_job_ids") or [])
+        if not (
+            len(item_ids)
+            == len(states)
+            == len(resolved)
+            == len(failure_kinds)
+            == len(completion_reasons)
+            == len(recovery_reasons)
+            == len(retry_ids)
+        ):
+            return []
+        return [
+            str(item_id)
+            for (
+                item_id,
+                state,
+                is_resolved,
+                failure_kind,
+                completion_reason,
+                recovery_reason,
+                retry_id,
+            ) in zip(
+                item_ids,
+                states,
+                resolved,
+                failure_kinds,
+                completion_reasons,
+                recovery_reasons,
+                retry_ids,
+            )
+            if (
+                state == "queued"
+                and is_resolved is True
+                and failure_kind == ""
+                and completion_reason == ""
+                and recovery_reason == ""
+                and retry_id == ""
+            )
+        ]
+
+    @staticmethod
     def _possible_known_pretransfer_item_ids(
         snapshot: Mapping[str, Any]
     ) -> list[str]:
@@ -530,7 +587,10 @@ class AutoYouTubeExecutionService:
                     "eligible_item_ids": eligible,
                 }
             confirmed_eligible: list[str] = []
-            for item_id in self._possible_uncertain_item_ids(snapshot):
+            for item_id in (
+                self._possible_uncertain_item_ids(snapshot)
+                + self._possible_resolved_queued_item_ids(snapshot)
+            ):
                 try:
                     self._already_uploaded_candidate(
                         job_id, item_id, records=records
@@ -693,6 +753,7 @@ class AutoYouTubeExecutionService:
             raise AutoYouTubeExecutionError("ownership_mismatch") from exc
         parts = list(record.get("parts") or [])
         states = list(job.get("item_states") or [])
+        resolved = list(job.get("item_resolved") or [])
         kinds = list(job.get("item_failure_kinds") or [])
         completion = list(job.get("item_completion_reasons") or [])
         recovery = list(job.get("item_recovery_reasons") or [])
@@ -717,15 +778,35 @@ class AutoYouTubeExecutionService:
             and part.get("attempts") == 0
             and part.get("reason") is None
         )
+        unresolved_uncertain = (
+            states[index] == "failed"
+            and kinds[index] == "uncertain"
+            and str(recovery[index] or completion[index] or "")
+            == "upload_outcome_uncertain"
+            and (normal_uncertain or legacy_queued)
+        )
+        resolved_queued_history = (
+            job.get("state") == "queued"
+            and bool(job.get("finished_at"))
+            and states[index] == "queued"
+            and index < len(resolved)
+            and resolved[index] is True
+            and kinds[index] == ""
+            and completion[index] == ""
+            and recovery[index] == ""
+            and retries[index] == ""
+            and record.get("state") == "upload_queued"
+            and record.get("reason") is None
+            and part.get("upload_state") == "queued"
+            and part.get("attempts") == 0
+            and part.get("reason") is None
+        )
         if (
             job.get("execution_deferred") is not True
-            or states[index] != "failed"
-            or kinds[index] != "uncertain"
-            or str(recovery[index] or completion[index] or "") != "upload_outcome_uncertain"
             or retries[index]
             or part.get("upload_item_id") != str(item_id)
             or part.get("youtube_video_id") is not None
-            or not (normal_uncertain or legacy_queued)
+            or not (unresolved_uncertain or resolved_queued_history)
         ):
             raise AutoYouTubeExecutionError("confirmation_not_allowed")
         for position, candidate in enumerate(parts):

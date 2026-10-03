@@ -554,6 +554,28 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertIn('data-queue-action="confirm-auto-youtube-uploaded"', cards["94"])
         self.assertIn('data-queue-action="recover-auto-youtube"', cards["94"])
 
+    def test_resolved_queued_auto_youtube_shows_already_uploaded_only_when_eligible(self):
+        eligible = _upload_job("95")
+        eligible["auto_youtube_recovery"] = {
+            "already_uploaded_eligible_item_ids": ["95-item-1"],
+        }
+        ordinary = _upload_job("96")
+
+        result = _evaluate_history_ui([eligible, ordinary])
+        cards = {item["jobId"]: item["html"] for item in result["rendered"]}
+
+        self.assertEqual(
+            next(item["state"] for item in result["rendered"] if item["jobId"] == "95"),
+            "waiting",
+        )
+        self.assertIn(
+            'data-queue-action="confirm-auto-youtube-uploaded"', cards["95"]
+        )
+        self.assertIn(">Already on YouTube<", cards["95"])
+        self.assertNotIn(
+            'data-queue-action="confirm-auto-youtube-uploaded"', cards["96"]
+        )
+
     def test_uncertain_auto_youtube_recovery_requires_explicit_confirmation(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn(
