@@ -38,6 +38,23 @@ YOUTUBE_OAUTH_MODE_NATIVE = "native"
 YOUTUBE_OAUTH_MODE_EXTERNAL = "external"
 
 
+def youtube_video_belongs_to_connected_channel(service: Any, video_id: str) -> bool:
+    """Require exact video identity and the authenticated channel as owner."""
+    channels = service.channels().list(part="id", mine=True).execute().get("items", [])
+    videos = service.videos().list(part="snippet", id=video_id).execute().get("items", [])
+    return (
+        len(videos) == 1
+        and isinstance(videos[0], dict)
+        and videos[0].get("id") == video_id
+        and any(
+            isinstance(channel, dict)
+            and bool(channel.get("id"))
+            and channel["id"] == videos[0].get("snippet", {}).get("channelId")
+            for channel in channels
+        )
+    )
+
+
 class YouTubeNotConnectedError(RuntimeError):
     """Raised when an operation requires an authenticated channel."""
 

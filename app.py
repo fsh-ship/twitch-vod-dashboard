@@ -3119,6 +3119,135 @@ def api_recover_uncertain_auto_youtube_item():
     })
 
 
+@app.post("/api/jobs/auto-youtube/confirm-uploaded")
+def api_confirm_uploaded_auto_youtube_item():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or set(data) != {"job_id", "item_id", "video"}:
+        return jsonify({"error": "An exact item and YouTube video are required.", "reason": "invalid_request"}), 400
+    raw_job_id, raw_item_id, video = data["job_id"], data["item_id"], data["video"]
+    if not all(isinstance(value, str) for value in (raw_job_id, raw_item_id, video)):
+        return jsonify({"error": "An exact item and YouTube video are required.", "reason": "invalid_request"}), 400
+    job_id, item_id = raw_job_id.strip(), raw_item_id.strip()
+    if (
+        not re.fullmatch(r"[1-9][0-9]{0,19}", job_id)
+        or not re.fullmatch(rf"{re.escape(job_id)}-item-[1-9][0-9]{{0,5}}", item_id)
+    ):
+        return jsonify({"error": "An exact item and YouTube video are required.", "reason": "invalid_request"}), 400
+    try:
+        result = _auto_youtube_execution_service(
+            _job_manager_for_compatibility()
+        ).confirm_already_uploaded_part(job_id, item_id, video)
+    except dashboard_jobs.JobPersistenceRequiredError as exc:
+        return jsonify({"error": "Job history could not be saved safely. The video will not be reuploaded.", "reason": exc.code}), 503
+    except dashboard_auto_youtube_execute.AutoYouTubeExecutionError as exc:
+        responses = {
+            "invalid_youtube_video_id": ("Enter a valid YouTube video ID or supported URL.", 400),
+            "video_not_confirmed": ("This video could not be verified as belonging to the connected YouTube channel.", 409),
+            "video_verification_unavailable": ("YouTube verification is unavailable. No state was changed.", 503),
+            "invalid_auto_youtube_job": ("The Auto YouTube job was not found.", 404),
+            "ownership_mismatch": ("This item has inconsistent ownership state.", 409),
+            "conflicting_ownership": ("This item has conflicting upload ownership.", 409),
+            "confirmation_not_allowed": ("This item is no longer eligible for confirmation.", 409),
+            "confirmation_persistence_failed": ("The video confirmation could not be saved safely.", 503),
+            "job_store_unavailable": ("Job history persistence is unavailable.", 503),
+            "ownership_store_unavailable": ("Auto YouTube upload state is unavailable.", 503),
+        }
+        message, status = responses.get(exc.code, ("The video could not be confirmed.", 409))
+        return jsonify({"error": message, "reason": exc.code}), status
+    except Exception:
+        app.logger.error("Auto YouTube reviewed video confirmation failed.")
+        return jsonify({"error": "The video could not be confirmed safely.", "reason": "confirmation_request_failed"}), 503
+    return jsonify({"ok": True, **result, "status": "video_confirmed"})
+
+
+@app.post("/api/jobs/auto-youtube/continue-remaining")
+def api_continue_remaining_auto_youtube_uploads():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or set(data) != {"job_id"}:
+        return jsonify({
+            "error": "An exact Auto YouTube job ID is required.",
+            "reason": "invalid_request",
+        }), 400
+    raw_job_id = data.get("job_id")
+    if not isinstance(raw_job_id, str):
+        return jsonify({
+            "error": "An exact Auto YouTube job ID is required.",
+            "reason": "invalid_request",
+        }), 400
+    job_id = raw_job_id.strip()
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", job_id):
+        return jsonify({
+            "error": "An exact Auto YouTube job ID is required.",
+            "reason": "invalid_request",
+        }), 400
+
+    manager = _job_manager_for_compatibility()
+    try:
+        result = _auto_youtube_execution_service(
+            manager
+        ).continue_confirmed_auto_youtube_job_for_execution(job_id)
+    except dashboard_jobs.JobPersistenceRequiredError as exc:
+        return jsonify({
+            "error": (
+                "The remaining uploads could not be released because job "
+                "history persistence is unavailable."
+            ),
+            "reason": exc.code,
+        }), 503
+    except dashboard_auto_youtube_execute.AutoYouTubeExecutionError as exc:
+        responses = {
+            "invalid_auto_youtube_job": (
+                "The Auto YouTube job was not found.", 404
+            ),
+            "continuation_not_allowed": (
+                "The remaining uploads are not in a safe continuation state.",
+                409,
+            ),
+            "ownership_mismatch": (
+                "This Auto YouTube job has inconsistent ownership state.", 409
+            ),
+            "conflicting_ownership": (
+                "This Auto YouTube job has conflicting ownership state.", 409
+            ),
+            "continuation_media_invalid": (
+                "The prepared media for the remaining uploads is no longer valid.",
+                409,
+            ),
+            "job_store_unavailable": (
+                "Job history persistence is unavailable.", 503
+            ),
+            "ownership_store_unavailable": (
+                "Auto YouTube upload state is unavailable.", 503
+            ),
+        }
+        message, status = responses.get(
+            exc.code, ("The remaining uploads could not be released.", 409)
+        )
+        return jsonify({"error": message, "reason": exc.code}), status
+    except Exception:
+        app.logger.error("Auto YouTube remaining-upload continuation failed.")
+        return jsonify({
+            "error": "The remaining uploads could not be released.",
+            "reason": "continuation_request_failed",
+        }), 503
+
+    try:
+        manager.start_worker(run_upload_job, job_id)
+    except Exception:
+        try:
+            manager.defer_auto_youtube_job(job_id)
+        except Exception:
+            app.logger.error(
+                "Auto YouTube continuation rollback failed "
+                "(continuation_worker_start_failed)."
+            )
+        return jsonify({
+            "error": "The remaining upload worker could not be started.",
+            "reason": "continuation_worker_start_failed",
+        }), 503
+    return jsonify({"ok": True, **result, "status": "continued"})
+
+
 @app.post("/api/jobs/auto-youtube/recover-known")
 def api_recover_known_auto_youtube_item():
     data = request.get_json(silent=True)

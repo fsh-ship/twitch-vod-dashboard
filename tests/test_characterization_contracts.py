@@ -285,6 +285,16 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
                 "api_recover_uncertain_auto_youtube_item",
             ),
             (
+                "/api/jobs/auto-youtube/confirm-uploaded",
+                "POST",
+                "api_confirm_uploaded_auto_youtube_item",
+            ),
+            (
+                "/api/jobs/auto-youtube/continue-remaining",
+                "POST",
+                "api_continue_remaining_auto_youtube_uploads",
+            ),
+            (
                 "/api/jobs/auto-youtube/recover-known",
                 "POST",
                 "api_recover_known_auto_youtube_item",
@@ -866,6 +876,121 @@ class RouteAndApiContractTests(IsolatedDashboardTestCase):
             )
             self.assertEqual(csrf_response.status_code, 403)
         service.recover_uncertain_part_for_execution.assert_not_called()
+
+    def test_confirm_uploaded_requires_exact_item_and_existing_security(self):
+        service = mock.Mock()
+        with mock.patch.object(dashboard, "_auto_youtube_execution_service", return_value=service):
+            for payload in (
+                {}, {"job_id": "79", "item_id": "79-item-1"},
+                {"job_id": "79", "item_id": "80-item-1", "video": "AbCdEf12345"},
+            ):
+                with self.subTest(payload=payload):
+                    response = self.client.post(
+                        "/api/jobs/auto-youtube/confirm-uploaded", json=payload,
+                        headers=self.csrf_headers,
+                    )
+                    self.assertEqual(response.status_code, 400)
+            payload = {"job_id": "79", "item_id": "79-item-1", "video": "AbCdEf12345"}
+            self.assertEqual(self.client.post(
+                "/api/jobs/auto-youtube/confirm-uploaded", json=payload,
+            ).status_code, 403)
+            self.assertEqual(self.client.post(
+                "/api/jobs/auto-youtube/confirm-uploaded", json=payload,
+                headers={**self.csrf_headers, "Origin": "https://untrusted.example"},
+            ).status_code, 403)
+        service.confirm_already_uploaded_part.assert_not_called()
+
+    def test_confirm_uploaded_never_starts_worker_and_reports_verification_failure(self):
+        manager = mock.Mock()
+        service = mock.Mock()
+        payload = {"job_id": "79", "item_id": "79-item-1", "video": "AbCdEf12345"}
+        service.confirm_already_uploaded_part.side_effect = [
+            dashboard.dashboard_auto_youtube_execute.AutoYouTubeExecutionError("video_not_confirmed"),
+            {"job_id": "79", "item_id": "79-item-1", "youtube_video_id": "AbCdEf12345"},
+        ]
+        with mock.patch.object(dashboard, "_job_manager_for_compatibility", return_value=manager), \
+             mock.patch.object(dashboard, "_auto_youtube_execution_service", return_value=service):
+            rejected = self.client.post(
+                "/api/jobs/auto-youtube/confirm-uploaded", json=payload,
+                headers=self.csrf_headers,
+            )
+            accepted = self.client.post(
+                "/api/jobs/auto-youtube/confirm-uploaded", json=payload,
+                headers=self.csrf_headers,
+            )
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual(rejected.get_json()["reason"], "video_not_confirmed")
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.get_json()["status"], "video_confirmed")
+        service.confirm_already_uploaded_part.assert_has_calls([
+            mock.call("79", "79-item-1", "AbCdEf12345"),
+            mock.call("79", "79-item-1", "AbCdEf12345"),
+        ])
+        manager.start_worker.assert_not_called()
+
+    def test_continue_remaining_requires_exact_job_and_existing_security(self):
+        service = mock.Mock()
+        with mock.patch.object(
+            dashboard, "_auto_youtube_execution_service", return_value=service
+        ):
+            for payload in (None, {}, {"job_id": "79", "item_id": "79-item-2"}):
+                with self.subTest(payload=payload):
+                    kwargs = (
+                        {"data": "not-json", "content_type": "application/json"}
+                        if payload is None else {"json": payload}
+                    )
+                    response = self.client.post(
+                        "/api/jobs/auto-youtube/continue-remaining",
+                        headers=self.csrf_headers, **kwargs,
+                    )
+                    self.assertEqual(response.status_code, 400)
+            self.assertEqual(self.client.post(
+                "/api/jobs/auto-youtube/continue-remaining",
+                json={"job_id": "79"},
+            ).status_code, 403)
+        service.continue_confirmed_auto_youtube_job_for_execution.assert_not_called()
+
+    def test_continue_remaining_starts_only_after_durable_service_release(self):
+        manager = mock.Mock()
+        service = mock.Mock()
+        service.continue_confirmed_auto_youtube_job_for_execution.return_value = {
+            "job_id": "79", "next_item_id": "79-item-2",
+            "next_part_index": 2, "remaining_part_count": 1,
+        }
+        with mock.patch.object(
+            dashboard, "_job_manager_for_compatibility", return_value=manager
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_execution_service", return_value=service
+        ):
+            response = self.client.post(
+                "/api/jobs/auto-youtube/continue-remaining",
+                json={"job_id": "79"}, headers=self.csrf_headers,
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["status"], "continued")
+        service.continue_confirmed_auto_youtube_job_for_execution.assert_called_once_with("79")
+        manager.start_worker.assert_called_once_with(dashboard.run_upload_job, "79")
+
+    def test_continue_remaining_rejection_never_starts_worker(self):
+        manager = mock.Mock()
+        service = mock.Mock()
+        service.continue_confirmed_auto_youtube_job_for_execution.side_effect = (
+            dashboard.dashboard_auto_youtube_execute.AutoYouTubeExecutionError(
+                "continuation_not_allowed"
+            )
+        )
+        with mock.patch.object(
+            dashboard, "_job_manager_for_compatibility", return_value=manager
+        ), mock.patch.object(
+            dashboard, "_auto_youtube_execution_service", return_value=service
+        ):
+            response = self.client.post(
+                "/api/jobs/auto-youtube/continue-remaining",
+                json={"job_id": "79"}, headers=self.csrf_headers,
+            )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["reason"], "continuation_not_allowed")
+        manager.start_worker.assert_not_called()
 
     def test_uncertain_auto_youtube_recovery_starts_only_after_durable_service_transition(self):
         manager = mock.Mock()

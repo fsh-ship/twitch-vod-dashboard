@@ -70,8 +70,18 @@ function confirmAction(options={}) {
   const message = document.getElementById('appConfirmDialogDescription');
   const cancelButton = document.getElementById('appConfirmDialogCancel');
   const confirmButton = document.getElementById('appConfirmDialogAccept');
+  const inputLabel = document.getElementById('appConfirmDialogInputLabel');
+  const input = document.getElementById('appConfirmDialogInput');
   if (!title || !message || !cancelButton || !confirmButton) return Promise.resolve(false);
 
+  const inputMode = Boolean(options.inputLabel);
+  if (inputMode && (!inputLabel || !input)) return Promise.resolve(false);
+  if (inputLabel && input) {
+    inputLabel.hidden = !inputMode;
+    input.hidden = !inputMode;
+    input.value = '';
+    if (inputMode) document.getElementById('appConfirmDialogInputCaption').textContent = String(options.inputLabel);
+  }
   const variant = options.variant === 'danger' ? 'danger' : 'default';
   const trigger = options.trigger || document.activeElement;
   title.textContent = String(options.title || 'Confirm action');
@@ -98,12 +108,17 @@ function confirmAction(options={}) {
         else dialog.removeAttribute('open');
       }
       restoreConfirmationFocus(trigger);
-      resolve(Boolean(result));
+      resolve(inputMode ? (result || false) : Boolean(result));
     };
     const onCancel = event => { event.preventDefault(); finish(false); };
     const onNativeClose = () => finish(false);
     const onCancelClick = () => finish(false);
-    const onConfirmClick = () => finish(true);
+    const onConfirmClick = () => {
+      if (!inputMode) { finish(true); return; }
+      const value = input.value.trim();
+      if (!value) { input.focus(); return; }
+      finish(value);
+    };
     const onBackdropClick = event => { if (event.target === dialog) finish(false); };
     const onKeydown = event => {
       if (event.key === 'Escape') {
@@ -135,7 +150,7 @@ function confirmAction(options={}) {
     if (typeof dialog.showModal === 'function') dialog.showModal();
     else dialog.setAttribute('open', '');
     // Cancellation is the safe default; especially important for destructive actions.
-    cancelButton.focus();
+    (inputMode ? input : cancelButton).focus();
   });
 }
 
@@ -3051,9 +3066,22 @@ function renderQueueVodItem(item, compact=false) {
     && item.state === 'error'
     && Array.isArray(recoveryStatus.known_eligible_item_ids)
     && recoveryStatus.known_eligible_item_ids.includes(itemId);
+  const canConfirmAutoYoutubeUpload = item.job?.type === 'youtube_upload'
+    && item.job?.origin === 'auto_youtube'
+    && ['error', 'interrupted'].includes(item.state)
+    && Array.isArray(recoveryStatus.already_uploaded_eligible_item_ids)
+    && recoveryStatus.already_uploaded_eligible_item_ids.includes(itemId);
+  const continuation = recoveryStatus.continuation || {};
+  const canContinueRemainingAutoYoutube = item.job?.type === 'youtube_upload'
+    && item.job?.origin === 'auto_youtube'
+    && item.state === 'waiting'
+    && continuation.eligible === true
+    && continuation.next_item_id === itemId;
   if (canStartAutoYoutube) actionButtons.push(`<button type="button" class="primary queue-item-action" data-queue-action="start-auto-youtube" data-job-id="${escapeHtml(item.job.id)}" data-part-count="${bundleStates.length}" aria-label="Start YouTube upload: ${escapeHtml(accessibleTitle)}">Start upload</button>`);
   if (canAddAutoYoutubePlaylist) actionButtons.push(`<button type="button" class="primary queue-item-action" data-queue-action="add-auto-youtube-playlist" data-job-id="${escapeHtml(item.job.id)}" data-part-count="${escapeHtml(playlistStatus.part_count || bundleStates.length)}" aria-label="Add ${escapeHtml(accessibleTitle)} to its YouTube playlist">Add to playlist</button>`);
   if (canRecoverUncertainAutoYoutube) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="recover-auto-youtube" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Retry YouTube upload after review: ${escapeHtml(accessibleTitle)}">Retry upload</button>`);
+  if (canConfirmAutoYoutubeUpload) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="confirm-auto-youtube-uploaded" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Confirm already on YouTube: ${escapeHtml(accessibleTitle)}">Already on YouTube</button>`);
+  if (canContinueRemainingAutoYoutube) actionButtons.push(`<button type="button" class="primary queue-item-action" data-queue-action="continue-auto-youtube-remaining" data-job-id="${escapeHtml(item.job.id)}" data-part-count="${escapeHtml(continuation.remaining_part_count || '')}" aria-label="Continue remaining YouTube uploads: ${escapeHtml(accessibleTitle)}">Continue remaining uploads</button>`);
   if (canRecoverKnownAutoYoutube) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="recover-known-auto-youtube" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Retry YouTube upload: ${escapeHtml(accessibleTitle)}">Retry upload</button>`);
   if (capabilities.can_cancel) actionButtons.push(`<button type="button" class="danger-outline queue-item-action" data-queue-action="cancel" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Cancel ${escapeHtml(accessibleTitle)}">Cancel</button>`);
   if (capabilities.can_stop_after_current) actionButtons.push(`<button type="button" class="quiet-button queue-item-action" data-queue-action="stop" data-job-id="${escapeHtml(item.job.id)}" data-item-id="${escapeHtml(itemId)}" aria-label="Stop Queue after ${escapeHtml(accessibleTitle)}">Stop after current</button>`);
@@ -3112,14 +3140,16 @@ function wireQueueItemInteractions(box) {
     'start-auto-youtube': ['/api/jobs/auto-youtube/release', 'Starting YouTube upload...'],
     'add-auto-youtube-playlist': ['/api/jobs/auto-youtube/playlist', 'Adding to YouTube playlist...'],
     'recover-auto-youtube': ['/api/jobs/auto-youtube/recover-uncertain', 'Requeuing reviewed YouTube upload...'],
+    'confirm-auto-youtube-uploaded': ['/api/jobs/auto-youtube/confirm-uploaded', 'Verifying YouTube video...'],
+    'continue-auto-youtube-remaining': ['/api/jobs/auto-youtube/continue-remaining', 'Starting remaining YouTube uploads...'],
     'recover-known-auto-youtube': ['/api/jobs/auto-youtube/recover-known', 'Requeuing YouTube upload...'],
   };
   box.querySelectorAll('.queue-item-action').forEach(button => button.addEventListener('click', async () => {
     const action = button.dataset.queueAction;
     const route = actionRoutes[action];
     if (!route) return;
-    const isAutoYoutubeRecovery = ['recover-auto-youtube', 'recover-known-auto-youtube'].includes(action);
-    const isPendingAutoYoutubeAction = ['start-auto-youtube', 'add-auto-youtube-playlist', 'recover-auto-youtube', 'recover-known-auto-youtube'].includes(action);
+    const isAutoYoutubeRecovery = ['recover-auto-youtube', 'recover-known-auto-youtube', 'confirm-auto-youtube-uploaded', 'continue-auto-youtube-remaining'].includes(action);
+    const isPendingAutoYoutubeAction = ['start-auto-youtube', 'add-auto-youtube-playlist', 'recover-auto-youtube', 'recover-known-auto-youtube', 'confirm-auto-youtube-uploaded', 'continue-auto-youtube-remaining'].includes(action);
     const pendingKey = isPendingAutoYoutubeAction
       ? [button.dataset.jobId, isAutoYoutubeRecovery ? button.dataset.itemId : ''].filter(Boolean).join(':')
       : '';
@@ -3129,7 +3159,18 @@ function wireQueueItemInteractions(box) {
         ? pendingAutoYoutubeRecoveries
         : pendingAutoYoutubeReleases;
     if (pendingKey && pendingActions.has(pendingKey)) return;
-    if (['start-auto-youtube', 'add-auto-youtube-playlist', 'recover-auto-youtube', 'recover-known-auto-youtube'].includes(action)) {
+    let videoInput = null;
+    if (action === 'confirm-auto-youtube-uploaded') {
+      videoInput = await confirmAction({
+        title:'Already on YouTube?',
+        message:'Use this only after finding this exact video in YouTube Studio. Enter its URL or video ID. The connected channel will be checked before this item is marked complete. No upload will start.',
+        inputLabel:'YouTube video URL or ID',
+        confirmLabel:'Verify and confirm',
+        trigger:button,
+      });
+      if (!videoInput) return;
+      pendingActions.add(pendingKey);
+    } else if (['start-auto-youtube', 'add-auto-youtube-playlist', 'recover-auto-youtube', 'recover-known-auto-youtube', 'continue-auto-youtube-remaining'].includes(action)) {
       const partCount = Number(button.dataset.partCount);
       const partNote = Number.isInteger(partCount) && partCount > 1
         ? `\nThis VOD contains ${partCount} parts.`
@@ -3140,6 +3181,8 @@ function wireQueueItemInteractions(box) {
           ? 'Only retry after checking YouTube Studio. If the video exists there, retrying may create a duplicate.\n\nConfirm that no valid upload remains and any incomplete entry was deleted.'
           : action === 'recover-known-auto-youtube'
             ? 'Retry this upload now? The previous failure occurred before any YouTube upload transfer began.'
+          : action === 'continue-auto-youtube-remaining'
+            ? `Continue the remaining ${partCount || 'queued'} upload part${partCount === 1 ? '' : 's'}? Confirmed parts will not be uploaded again.`
           : `Start this YouTube upload now?${partNote}`;
       const confirmed = await confirmAction({
         title:action === 'add-auto-youtube-playlist'
@@ -3148,6 +3191,8 @@ function wireQueueItemInteractions(box) {
             ? 'Retry uncertain upload?'
             : action === 'recover-known-auto-youtube'
               ? 'Retry upload?'
+              : action === 'continue-auto-youtube-remaining'
+                ? 'Continue remaining uploads?'
             : 'Start YouTube upload',
         message:question,
         confirmLabel:action === 'add-auto-youtube-playlist'
@@ -3156,6 +3201,8 @@ function wireQueueItemInteractions(box) {
             ? 'I checked — retry upload'
             : action === 'recover-known-auto-youtube'
               ? 'Retry upload'
+              : action === 'continue-auto-youtube-remaining'
+                ? 'Continue uploads'
             : 'Start upload'
       });
       if (!confirmed) return;
@@ -3168,6 +3215,10 @@ function wireQueueItemInteractions(box) {
         ? {job_id:button.dataset.jobId}
         : action === 'recover-auto-youtube'
           ? {job_id:button.dataset.jobId, item_id:button.dataset.itemId, reviewed:true}
+          : action === 'confirm-auto-youtube-uploaded'
+            ? {job_id:button.dataset.jobId, item_id:button.dataset.itemId, video:videoInput}
+          : action === 'continue-auto-youtube-remaining'
+            ? {job_id:button.dataset.jobId}
           : action === 'recover-known-auto-youtube'
             ? {job_id:button.dataset.jobId, item_id:button.dataset.itemId}
           : {job_id:button.dataset.jobId, item_id:button.dataset.itemId};
@@ -3176,6 +3227,8 @@ function wireQueueItemInteractions(box) {
       if (action === 'start-auto-youtube') showToast('YouTube upload queued.');
       if (action === 'add-auto-youtube-playlist') showToast('YouTube playlist updated.');
       if (action === 'recover-auto-youtube') showToast('Reviewed upload requeued.');
+      if (action === 'confirm-auto-youtube-uploaded') showToast('Existing YouTube video confirmed. No upload was started.');
+      if (action === 'continue-auto-youtube-remaining') showToast('Remaining YouTube uploads started.');
       if (action === 'recover-known-auto-youtube') showToast('YouTube upload requeued.');
       await pollJobs();
     } catch (error) {

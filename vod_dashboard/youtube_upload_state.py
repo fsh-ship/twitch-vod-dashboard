@@ -751,6 +751,108 @@ class YouTubeUploadStateStore:
             self._write_locked(doc)
             return deepcopy(normalized)
 
+    def confirm_reviewed_part_video(
+        self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any,
+        upload_item_id: Any, part_index: Any, youtube_video_id: Any,
+    ) -> UploadRecord:
+        """Confirm a Studio-reviewed uncertain upload, including a lost-update legacy part."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        job_id = _identifier(upload_job_id, "invalid_reviewed_confirmation")
+        item_id = _identifier(upload_item_id, "invalid_reviewed_confirmation")
+        video_id = _youtube_id(youtube_video_id, "invalid_reviewed_confirmation")
+        if video_id is None or type(part_index) is not int or part_index < 1:
+            raise YouTubeUploadStateValidationError("invalid_reviewed_confirmation")
+        with self._lock:
+            doc = self._load_locked()
+            old = doc["uploads"].get(key)
+            if old is None or old["upload_job_id"] != job_id or part_index > len(old["parts"]):
+                raise YouTubeUploadStateValidationError("invalid_reviewed_confirmation")
+            parts = deepcopy(old["parts"])
+            current = parts[part_index - 1]
+            uncertain = (
+                old["state"] == "needs_attention"
+                and old["reason"] == "upload_outcome_uncertain"
+                and current["upload_state"] == "uncertain"
+                and current["reason"] == "upload_outcome_uncertain"
+            )
+            legacy = (
+                (old["state"] == "upload_queued" or
+                 (old["state"] == "needs_attention" and old["reason"] == "upload_outcome_uncertain"))
+                and current["upload_state"] == "queued"
+                and current["attempts"] == 0
+                and current["reason"] is None
+            )
+            if (
+                current["upload_item_id"] != item_id
+                or current["youtube_video_id"] is not None
+                or not (uncertain or legacy)
+                or any(
+                    part.get("youtube_video_id") == video_id
+                    for record in doc["uploads"].values()
+                    for part in record.get("parts", [])
+                )
+                or any(part["upload_state"] not in {"video_confirmed", "completed"}
+                       or not part["youtube_video_id"] for part in parts[:part_index - 1])
+                or any(part["upload_state"] != "queued" or part["youtube_video_id"] is not None
+                       for part in parts[part_index:])
+            ):
+                raise YouTubeUploadStateValidationError("invalid_reviewed_confirmation")
+            current.update({"upload_state": "video_confirmed", "youtube_video_id": video_id, "reason": None})
+            all_confirmed = all(
+                part["upload_state"] in {"video_confirmed", "completed"}
+                and part["youtube_video_id"] is not None for part in parts
+            )
+            now = _now(self._clock)
+            new = deepcopy(old)
+            new.update({
+                "state": ("playlist_pending" if old["playlist_id"] else "completed")
+                if all_confirmed else "upload_queued",
+                "parts": parts, "reason": None, "updated_at": now,
+            })
+            new = _schedule_completed_cleanup(new, now)
+            normalized = _record_v5(new, key)
+            doc["uploads"][key] = normalized
+            self._write_locked(doc)
+            return deepcopy(normalized)
+
+    def recover_reviewed_legacy_queued_part(
+        self, streamer: Any, twitch_vod_id: Any, *, upload_job_id: Any,
+        upload_item_id: Any, part_index: Any,
+    ) -> UploadRecord:
+        """Authorize a reviewed Retry when a lost update left the ledger queued."""
+        key = canonical_upload_key(streamer, twitch_vod_id)
+        job_id = _identifier(upload_job_id, "invalid_part_recovery")
+        item_id = _identifier(upload_item_id, "invalid_part_recovery")
+        if type(part_index) is not int or part_index < 1:
+            raise YouTubeUploadStateValidationError("invalid_part_recovery")
+        with self._lock:
+            doc = self._load_locked()
+            old = doc["uploads"].get(key)
+            if old is None or old["upload_job_id"] != job_id or part_index > len(old["parts"]):
+                raise YouTubeUploadStateValidationError("invalid_part_recovery")
+            parts = old["parts"]
+            current = parts[part_index - 1]
+            if (
+                old["state"] not in {"upload_queued", "needs_attention"}
+                or old["reason"] not in {None, "upload_outcome_uncertain"}
+                or current["upload_item_id"] != item_id
+                or current["upload_state"] != "queued"
+                or current["attempts"] != 0
+                or current["youtube_video_id"] is not None
+                or current["reason"] is not None
+                or any(part["upload_state"] not in {"video_confirmed", "completed"}
+                       or not part["youtube_video_id"] for part in parts[:part_index - 1])
+                or any(part["upload_state"] != "queued" or part["youtube_video_id"] is not None
+                       for part in parts[part_index:])
+            ):
+                raise YouTubeUploadStateValidationError("invalid_part_recovery")
+            new = deepcopy(old)
+            new.update({"state": "upload_queued", "reason": None, "updated_at": _now(self._clock)})
+            normalized = _record_v5(new, key)
+            doc["uploads"][key] = normalized
+            self._write_locked(doc)
+            return deepcopy(normalized)
+
     def recover_known_pretransfer_part(
         self,
         streamer: Any,

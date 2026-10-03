@@ -757,6 +757,24 @@ class LocalYouTubeHelperTests(unittest.TestCase):
 
 
 class YouTubeConnectionHelperTests(unittest.TestCase):
+    def test_reviewed_video_must_belong_to_connected_channel(self):
+        video_id = "AbCdEf12345"
+        service = mock.Mock()
+        service.channels.return_value.list.return_value.execute.return_value = {
+            "items": [{"id": "other"}, {"id": "connected"}],
+        }
+        videos_response = service.videos.return_value.list.return_value.execute
+        videos_response.return_value = {
+            "items": [{"id": video_id, "snippet": {"channelId": "connected"}}],
+        }
+        self.assertTrue(youtube.youtube_video_belongs_to_connected_channel(service, video_id))
+        videos_response.return_value = {"items": []}
+        self.assertFalse(youtube.youtube_video_belongs_to_connected_channel(service, video_id))
+        videos_response.return_value = {
+            "items": [{"id": video_id, "snippet": {"channelId": "foreign"}}],
+        }
+        self.assertFalse(youtube.youtube_video_belongs_to_connected_channel(service, video_id))
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.base = Path(self.temp_dir.name)

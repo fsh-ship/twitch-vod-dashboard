@@ -1629,6 +1629,10 @@ class JobManager:
             if index is None:
                 return False
             self._set_item_state_locked(job, index, "completed")
+            job["item_recovery_reasons"][index] = ""
+            errors = job.get("item_errors")
+            if isinstance(errors, list) and index < len(errors):
+                errors[index] = ""
             progress = job.get("item_progress")
             if isinstance(progress, list) and index < len(progress):
                 progress[index] = 100

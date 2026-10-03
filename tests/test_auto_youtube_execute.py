@@ -11,6 +11,7 @@ from unittest import mock
 from vod_dashboard.auto_youtube_execute import (
     AutoYouTubeExecutionError,
     AutoYouTubeExecutionService,
+    youtube_video_id_from_input,
 )
 from vod_dashboard.auto_youtube_materialize import AutoYouTubeMaterializationService
 from vod_dashboard.auto_youtube_multipart import MediaProbeResult
@@ -36,6 +37,24 @@ VOD_ID = "2855270041"
 
 
 class AutoYouTubeExecutionTests(unittest.TestCase):
+    def test_reviewed_video_input_only_accepts_exact_youtube_identity(self):
+        video_id = "AbCdEf12345"
+        for value in (
+            video_id,
+            f"https://www.youtube.com/watch?v={video_id}",
+            f"https://youtu.be/{video_id}",
+            f"https://www.youtube.com/shorts/{video_id}",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(youtube_video_id_from_input(value), video_id)
+        for value in (
+            "too-short", f"https://youtube.com.evil.example/watch?v={video_id}",
+            f"https://www.youtube.com/watch?v={video_id}&v=Other000001",
+            f"http://youtu.be/{video_id}", f"https://youtu.be/{video_id}/extra",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(youtube_video_id_from_input(value))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -181,6 +200,233 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
             reason="upload_outcome_uncertain",
         )
         return claim["item_id"]
+
+    def verified_video(self, video_id="AbCdEf12345", *, channel_id="my-channel"):
+        service = self.service_getter.return_value
+        service.channels.return_value.list.return_value.execute.return_value = {
+            "items": [{"id": "my-channel"}]
+        }
+        service.videos.return_value.list.return_value.execute.return_value = {
+            "items": [{"id": video_id, "snippet": {"channelId": channel_id}}]
+        }
+        return service
+
+    def test_studio_confirmed_uncertain_part_completes_without_reupload(self):
+        job_id = self.create_bundle(playlist_id="frozen-playlist")
+        item_id = self.make_uncertain(job_id)
+        service = self.verified_video()
+
+        result = self.executor().confirm_already_uploaded_part(
+            job_id, item_id, "https://www.youtube.com/watch?v=AbCdEf12345"
+        )
+
+        record = self.store.get("bearlychen", VOD_ID)
+        job = self.manager.get_job(job_id)
+        self.assertEqual(result["youtube_video_id"], "AbCdEf12345")
+        self.assertEqual(record["state"], "playlist_pending")
+        self.assertEqual(record["parts"][0]["upload_state"], "video_confirmed")
+        self.assertEqual(record["parts"][0]["youtube_video_id"], "AbCdEf12345")
+        self.assertEqual(job["item_states"], ["completed"])
+        self.assertEqual(job["item_recovery_reasons"], [""])
+        self.assertEqual(job["item_failure_kinds"], [""])
+        self.assertFalse(job["execution_deferred"])
+        self.assertNotIn(
+            job_id,
+            self.executor().recovery_status_for_jobs(
+                self.manager.snapshot_jobs()
+            ),
+        )
+        with self.assertRaises(AutoYouTubeExecutionError):
+            self.executor().confirm_already_uploaded_part(job_id, item_id, "AbCdEf12345")
+        with self.assertRaises(AutoYouTubeExecutionError):
+            self.executor().recover_uncertain_part_for_execution(job_id, item_id)
+        self.assertIsNone(self.manager.claim_next_item(job_id))
+        service.channels.return_value.list.assert_called_once_with(part="id", mine=True)
+        service.videos.return_value.list.assert_called_once_with(part="snippet", id="AbCdEf12345")
+        self.request_builder.assert_not_called()
+        self.request_sender.assert_not_called()
+
+    def test_studio_confirmation_repairs_explicit_legacy_queued_part(self):
+        job_id = self.create_bundle()
+        item_id = self.make_uncertain(job_id)
+        document = self.store.load()
+        record = document["uploads"][f"bearlychen:{VOD_ID}"]
+        record.update({"state": "upload_queued", "reason": None})
+        record["parts"][0].update({
+            "upload_state": "queued", "attempts": 0, "reason": None,
+        })
+        self.store.replace_state(document)
+        self.verified_video()
+
+        executor = self.executor()
+        executor.reconcile()
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["failed"])
+        self.assertTrue(self.manager.get_job(job_id)["execution_deferred"])
+        status = executor.recovery_status_for_jobs(self.manager.snapshot_jobs())
+        self.assertEqual(
+            status[job_id]["already_uploaded_eligible_item_ids"], [item_id]
+        )
+        self.assertEqual(status[job_id]["eligible_item_ids"], [item_id])
+
+        executor.confirm_already_uploaded_part(
+            job_id, item_id, "https://youtu.be/AbCdEf12345"
+        )
+
+        repaired = self.store.get("bearlychen", VOD_ID)
+        self.assertEqual(repaired["state"], "completed")
+        self.assertEqual(repaired["parts"][0]["upload_state"], "video_confirmed")
+        self.assertEqual(repaired["parts"][0]["attempts"], 0)
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed"])
+        self.request_sender.assert_not_called()
+
+    def test_legacy_queued_retry_still_requires_explicit_review(self):
+        job_id = self.create_bundle()
+        item_id = self.make_uncertain(job_id)
+        document = self.store.load()
+        record = document["uploads"][f"bearlychen:{VOD_ID}"]
+        record.update({"state": "upload_queued", "reason": None})
+        record["parts"][0].update({
+            "upload_state": "queued", "attempts": 0, "reason": None,
+        })
+        self.store.replace_state(document)
+        executor = self.executor()
+        executor.reconcile()
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["failed"])
+        self.request_sender.assert_not_called()
+
+        executor.recover_uncertain_part_for_execution(job_id, item_id)
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["queued"])
+        self.assertFalse(self.manager.get_job(job_id)["execution_deferred"])
+        executor.run_job(job_id)
+        self.request_sender.assert_called_once()
+
+    def test_studio_confirmation_rejects_invalid_or_unowned_video_without_mutation(self):
+        job_id = self.create_bundle()
+        item_id = self.make_uncertain(job_id)
+        before_record = self.store.get("bearlychen", VOD_ID)
+        before_job = self.manager.get_job(job_id)
+        executor = self.executor()
+        for invalid in ("bad", "https://youtube.com.evil.example/watch?v=AbCdEf12345", "http://youtu.be/AbCdEf12345"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(AutoYouTubeExecutionError, "invalid_youtube_video_id"):
+                executor.confirm_already_uploaded_part(job_id, item_id, invalid)
+        self.service_getter.assert_not_called()
+        self.verified_video(channel_id="someone-else")
+        with self.assertRaisesRegex(AutoYouTubeExecutionError, "video_not_confirmed"):
+            executor.confirm_already_uploaded_part(job_id, item_id, "AbCdEf12345")
+        self.assertEqual(self.store.get("bearlychen", VOD_ID), before_record)
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], before_job["item_states"])
+        self.request_sender.assert_not_called()
+
+    def test_studio_confirmation_preserves_unconfirmed_multipart_parts(self):
+        job_id = self.create_bundle(total=2, playlist_id="frozen-playlist")
+        item_id = self.make_uncertain(job_id)
+        self.verified_video()
+        before = self.store.get("bearlychen", VOD_ID)["parts"][1]
+
+        self.executor().confirm_already_uploaded_part(job_id, item_id, "AbCdEf12345")
+
+        record = self.store.get("bearlychen", VOD_ID)
+        job = self.manager.get_job(job_id)
+        self.assertEqual(record["state"], "upload_queued")
+        self.assertEqual(record["parts"][1], before)
+        self.assertEqual(job["item_states"], ["completed", "queued"])
+        self.assertTrue(job["execution_deferred"])
+        self.assertIsNone(self.manager.claim_next_item(job_id))
+        self.request_sender.assert_not_called()
+
+    def test_reviewed_multipart_confirmation_requires_explicit_continuation(self):
+        job_id = self.create_bundle(total=2, execution_policy="automatic")
+        item_id = self.make_uncertain(job_id)
+        self.verified_video()
+        executor = self.executor()
+
+        executor.confirm_already_uploaded_part(job_id, item_id, "AbCdEf12345")
+
+        job = self.manager.get_job(job_id)
+        self.assertEqual(job["item_states"], ["completed", "queued"])
+        self.assertTrue(job["execution_deferred"])
+        self.assertIsNone(self.manager.claim_next_item(job_id))
+        self.assertEqual(self.request_sender.call_count, 0)
+        status = executor.recovery_status_for_jobs(self.manager.snapshot_jobs())
+        self.assertEqual(status[job_id]["continuation"], {
+            "eligible": True,
+            "next_item_id": f"{job_id}-item-2",
+            "remaining_part_count": 1,
+        })
+
+        worker_starter = mock.Mock()
+        self.assertEqual(
+            executor.release_automatic_jobs_for_execution(worker_starter)["ignored"],
+            1,
+        )
+        worker_starter.assert_not_called()
+        self.assertTrue(self.manager.get_job(job_id)["execution_deferred"])
+
+        continued = executor.continue_confirmed_auto_youtube_job_for_execution(job_id)
+        self.assertEqual(continued["next_item_id"], f"{job_id}-item-2")
+        self.assertFalse(self.manager.get_job(job_id)["execution_deferred"])
+        executor.run_job(job_id)
+
+        self.assertEqual(self.request_sender.call_count, 1)
+        self.request_builder.assert_called_once()
+        self.assertTrue(
+            str(self.request_builder.call_args.args[1]).endswith("part-002.mkv")
+        )
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["completed", "completed"])
+        self.assertEqual(
+            self.store.get("bearlychen", VOD_ID)["parts"][0]["youtube_video_id"],
+            "AbCdEf12345",
+        )
+
+    def test_continuation_rejects_inconsistent_confirmed_prefix_or_queued_suffix(self):
+        job_id = self.create_bundle(total=2)
+        item_id = self.make_uncertain(job_id)
+        self.verified_video()
+        executor = self.executor()
+        executor.confirm_already_uploaded_part(job_id, item_id, "AbCdEf12345")
+        with self.manager.lock:
+            self.manager.jobs[job_id]["item_failure_kinds"][1] = "uncertain"
+
+        with self.assertRaisesRegex(
+            AutoYouTubeExecutionError, "continuation_not_allowed"
+        ):
+            executor.continue_confirmed_auto_youtube_job_for_execution(job_id)
+        self.assertTrue(self.manager.get_job(job_id)["execution_deferred"])
+        self.assertEqual(self.request_sender.call_count, 0)
+
+    def test_studio_confirmation_fails_closed_when_ledger_save_fails(self):
+        job_id = self.create_bundle()
+        item_id = self.make_uncertain(job_id)
+        before = self.store.get("bearlychen", VOD_ID)
+        self.verified_video()
+        with mock.patch.object(
+            self.store, "_write_locked",
+            side_effect=YouTubeUploadStatePersistenceError("write failed"),
+        ), self.assertRaisesRegex(AutoYouTubeExecutionError, "confirmation_persistence_failed"):
+            self.executor().confirm_already_uploaded_part(job_id, item_id, "AbCdEf12345")
+        self.assertEqual(self.store.get("bearlychen", VOD_ID), before)
+        self.assertEqual(self.manager.get_job(job_id)["item_states"], ["failed"])
+        self.request_sender.assert_not_called()
+
+    def test_studio_confirmation_job_save_failure_recovers_from_ledger_on_restart(self):
+        job_id = self.create_bundle()
+        item_id = self.make_uncertain(job_id)
+        self.verified_video()
+        with mock.patch.object(
+            self.manager.job_store, "save",
+            side_effect=JobStorePersistenceError("write failed"),
+        ), self.assertRaises(JobPersistenceRequiredError):
+            self.executor().confirm_already_uploaded_part(job_id, item_id, "AbCdEf12345")
+        self.assertEqual(
+            self.store.get("bearlychen", VOD_ID)["parts"][0]["youtube_video_id"],
+            "AbCdEf12345",
+        )
+        restored = self.new_manager()
+        restored.restore_from_store()
+        self.executor(manager=restored).reconcile()
+        self.assertEqual(restored.get_job(job_id)["item_states"], ["completed"])
+        self.assertIsNone(restored.claim_next_item(job_id))
+        self.request_sender.assert_not_called()
 
     def make_known_pretransfer_failure(
         self, job_id, *, part_index=1, reason="youtube_not_connected"
@@ -1315,6 +1561,10 @@ class AutoYouTubeExecutionTests(unittest.TestCase):
             (
                 "auto_youtube_execute.py",
                 "recover_known_pretransfer_part_for_execution",
+            ),
+            (
+                "auto_youtube_execute.py",
+                "continue_confirmed_auto_youtube_job_for_execution",
             ),
         ])
 

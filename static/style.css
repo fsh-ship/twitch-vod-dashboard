@@ -836,6 +836,9 @@ main { width:100%; max-width:1320px; }
 .confirmation-dialog h2 { margin:0; }
 .confirmation-dialog p { line-height:1.55; }
 .app-confirm-dialog-message { margin:0; white-space:pre-line; overflow-wrap:anywhere; }
+.app-confirm-dialog-input-label { display:grid; gap:8px; }
+.app-confirm-dialog-input-label[hidden] { display:none; }
+.app-confirm-dialog-input-label input { width:100%; box-sizing:border-box; }
 .dialog-actions { justify-content:flex-end; }
 
 .settings-tabs { display:flex; gap:8px; padding:6px; border:1px solid var(--line); border-radius:16px; background:rgba(13,19,32,.9); overflow-x:auto; scrollbar-width:thin; }

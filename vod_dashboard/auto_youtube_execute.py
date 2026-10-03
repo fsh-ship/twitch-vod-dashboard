@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any, Callable, Dict, Mapping, Optional
+from urllib.parse import parse_qs, urlsplit
 
 from vod_dashboard.auto_youtube_materialize import (
     AutoYouTubeMaterializationService,
@@ -11,7 +13,10 @@ from vod_dashboard.auto_youtube_materialize import (
 )
 from vod_dashboard.auto_youtube_multipart import MediaProbeResult, derive_part_upload_plan, probe_media
 from vod_dashboard.media import MediaPathPolicy
-from vod_dashboard.youtube import YouTubeNotConnectedError
+from vod_dashboard.youtube import (
+    YouTubeNotConnectedError,
+    youtube_video_belongs_to_connected_channel,
+)
 from vod_dashboard.youtube_upload_state import (
     YouTubeUploadStatePersistenceError,
     YouTubeUploadStateStore,
@@ -27,6 +32,35 @@ class AutoYouTubeExecutionError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+def youtube_video_id_from_input(value: Any) -> Optional[str]:
+    """Accept a video ID or a supported YouTube URL, never an arbitrary host."""
+    raw = value.strip() if isinstance(value, str) else ""
+    video_id = raw
+    if raw.startswith("https://"):
+        try:
+            parsed = urlsplit(raw)
+            if parsed.username or parsed.password or parsed.port or parsed.fragment:
+                return None
+            host = (parsed.hostname or "").lower()
+            if host == "youtu.be" and parsed.path.count("/") == 1:
+                video_id = parsed.path[1:]
+            elif host in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
+                if parsed.path == "/watch":
+                    values = parse_qs(parsed.query).get("v", [])
+                    if len(values) != 1:
+                        return None
+                    video_id = values[0]
+                elif parsed.path.startswith(("/shorts/", "/live/")) and parsed.path.count("/") == 2:
+                    video_id = parsed.path.rsplit("/", 1)[1]
+                else:
+                    return None
+            else:
+                return None
+        except ValueError:
+            return None
+    return video_id if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id) else None
 
 
 class AutoYouTubeExecutionService:
@@ -155,6 +189,66 @@ class AutoYouTubeExecutionService:
         except (_MissingMaterializationMedia, _InvalidMaterializationMedia) as exc:
             raise AutoYouTubeExecutionError("release_media_invalid") from exc
         return job, record
+
+    def _continuation_candidate(
+        self,
+        job_id: str,
+        *,
+        records: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any], list[Dict[str, Any]], int]:
+        """Validate the exact confirmed-prefix/queued-suffix continuation state."""
+        job, record, descriptors = self._ownership(job_id, records=records)
+        self._validate_unique_lineage(job_id, job)
+        item_ids = list(job.get("item_ids") or [])
+        states = list(job.get("item_states") or [])
+        failure_kinds = list(job.get("item_failure_kinds") or [])
+        completion_reasons = list(job.get("item_completion_reasons") or [])
+        recovery_reasons = list(job.get("item_recovery_reasons") or [])
+        retry_ids = list(job.get("item_retry_job_ids") or [])
+        parts = list(record.get("parts") or [])
+        if (
+            job.get("execution_deferred") is not True
+            or job.get("state") != "queued"
+            or record.get("state") != "upload_queued"
+            or not (
+                len(parts) == len(item_ids) == len(states) == len(failure_kinds)
+                == len(completion_reasons) == len(recovery_reasons) == len(retry_ids)
+            )
+        ):
+            raise AutoYouTubeExecutionError("continuation_not_allowed")
+        first_queued = None
+        for index, (part, item_id) in enumerate(zip(parts, item_ids)):
+            if part.get("upload_item_id") != item_id:
+                raise AutoYouTubeExecutionError("ownership_mismatch")
+            confirmed = (
+                part.get("upload_state") in {"video_confirmed", "completed"}
+                and bool(part.get("youtube_video_id"))
+                and states[index] == "completed"
+                and failure_kinds[index] == ""
+                and recovery_reasons[index] == ""
+                and not retry_ids[index]
+            )
+            queued = (
+                part.get("upload_state") == "queued"
+                and part.get("youtube_video_id") is None
+                and part.get("reason") is None
+                and states[index] == "queued"
+                and failure_kinds[index] == ""
+                and completion_reasons[index] == ""
+                and recovery_reasons[index] == ""
+                and not retry_ids[index]
+            )
+            if first_queued is None:
+                if confirmed:
+                    continue
+                if not queued:
+                    raise AutoYouTubeExecutionError("continuation_not_allowed")
+                first_queued = index
+            elif not queued:
+                raise AutoYouTubeExecutionError("continuation_not_allowed")
+        if first_queued is None or first_queued == 0:
+            raise AutoYouTubeExecutionError("continuation_not_allowed")
+        return job, record, descriptors, first_queued
 
     def _validate_unique_lineage(
         self, job_id: str, job: Mapping[str, Any]
@@ -397,14 +491,34 @@ class AutoYouTubeExecutionService:
                     self._uncertain_recovery_candidate(
                         job_id, item_id, records=records
                     )
-                except Exception:
-                    continue
+                except AutoYouTubeExecutionError as exc:
+                    if exc.code != "recovery_not_allowed":
+                        continue
+                    try:
+                        _job, legacy_record, index = self._already_uploaded_candidate(
+                            job_id, item_id, records=records
+                        )
+                        if legacy_record["parts"][index]["upload_state"] != "queued":
+                            continue
+                    except Exception:
+                        continue
                 eligible.append(str(item_id))
             if eligible:
                 result[job_id] = {
                     "reason": "upload_outcome_uncertain",
                     "eligible_item_ids": eligible,
                 }
+            confirmed_eligible: list[str] = []
+            for item_id in self._possible_uncertain_item_ids(snapshot):
+                try:
+                    self._already_uploaded_candidate(
+                        job_id, item_id, records=records
+                    )
+                except Exception:
+                    continue
+                confirmed_eligible.append(str(item_id))
+            if confirmed_eligible:
+                result.setdefault(job_id, {})["already_uploaded_eligible_item_ids"] = confirmed_eligible
             known_eligible: list[str] = []
             for item_id in self._possible_known_pretransfer_item_ids(snapshot):
                 try:
@@ -418,6 +532,18 @@ class AutoYouTubeExecutionService:
                 result.setdefault(job_id, {})["known_eligible_item_ids"] = (
                     known_eligible
                 )
+            try:
+                _job, _record, _descriptors, next_index = (
+                    self._continuation_candidate(job_id, records=records)
+                )
+            except Exception:
+                pass
+            else:
+                result.setdefault(job_id, {})["continuation"] = {
+                    "eligible": True,
+                    "next_item_id": str(snapshot["item_ids"][next_index]),
+                    "remaining_part_count": len(snapshot["item_ids"]) - next_index,
+                }
         return result
 
     def recover_uncertain_part_for_execution(
@@ -429,9 +555,22 @@ class AutoYouTubeExecutionService:
         health = self._job_manager.persistence_status()
         if health.get("enabled") is not True or health.get("healthy") is not True:
             raise AutoYouTubeExecutionError("job_store_unavailable")
-        job, record, descriptors, index = self._uncertain_recovery_candidate(
-            str(job_id), str(item_id)
-        )
+        legacy = False
+        try:
+            job, record, descriptors, index = self._uncertain_recovery_candidate(
+                str(job_id), str(item_id)
+            )
+        except AutoYouTubeExecutionError as exc:
+            if exc.code != "recovery_not_allowed":
+                raise
+            try:
+                job, record, index = self._already_uploaded_candidate(str(job_id), str(item_id))
+            except AutoYouTubeExecutionError:
+                raise exc
+            if record["parts"][index]["upload_state"] != "queued":
+                raise exc
+            descriptors = self._materializer()._part_descriptors(record)
+            legacy = True
         try:
             self._materializer()._validate_media(record, descriptors)
         except (_MissingMaterializationMedia, _InvalidMaterializationMedia) as exc:
@@ -441,7 +580,11 @@ class AutoYouTubeExecutionService:
         ):
             raise AutoYouTubeExecutionError("recovery_not_allowed")
         try:
-            recovered = self._state_store.recover_uncertain_part(
+            recover = (
+                self._state_store.recover_reviewed_legacy_queued_part
+                if legacy else self._state_store.recover_uncertain_part
+            )
+            recovered = recover(
                 record["streamer"],
                 record["twitch_vod_id"],
                 upload_job_id=str(job_id),
@@ -514,6 +657,113 @@ class AutoYouTubeExecutionService:
             "job_id": str(job_id),
             "item_id": str(item_id),
             "part_index": index + 1,
+        }
+
+    def _already_uploaded_candidate(
+        self, job_id: str, item_id: str, *,
+        records: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any], int]:
+        job, record, _descriptors = self._ownership(str(job_id), records=records)
+        self._validate_unique_lineage(str(job_id), job)
+        item_ids = list(job.get("item_ids") or [])
+        try:
+            index = item_ids.index(str(item_id))
+        except ValueError as exc:
+            raise AutoYouTubeExecutionError("ownership_mismatch") from exc
+        parts = list(record.get("parts") or [])
+        states = list(job.get("item_states") or [])
+        kinds = list(job.get("item_failure_kinds") or [])
+        completion = list(job.get("item_completion_reasons") or [])
+        recovery = list(job.get("item_recovery_reasons") or [])
+        retries = list(job.get("item_retry_job_ids") or [])
+        if not (len(parts) == len(item_ids) == len(states) == len(kinds)
+                == len(completion) == len(recovery) == len(retries)):
+            raise AutoYouTubeExecutionError("ownership_mismatch")
+        part = parts[index]
+        normal_uncertain = (
+            record.get("state") == "needs_attention"
+            and record.get("reason") == "upload_outcome_uncertain"
+            and part.get("upload_state") == "uncertain"
+            and part.get("reason") == "upload_outcome_uncertain"
+        )
+        legacy_queued = (
+            (
+                record.get("state") == "upload_queued"
+                or (record.get("state") == "needs_attention"
+                    and record.get("reason") == "upload_outcome_uncertain")
+            )
+            and part.get("upload_state") == "queued"
+            and part.get("attempts") == 0
+            and part.get("reason") is None
+        )
+        if (
+            job.get("execution_deferred") is not True
+            or states[index] != "failed"
+            or kinds[index] != "uncertain"
+            or str(recovery[index] or completion[index] or "") != "upload_outcome_uncertain"
+            or retries[index]
+            or part.get("upload_item_id") != str(item_id)
+            or part.get("youtube_video_id") is not None
+            or not (normal_uncertain or legacy_queued)
+        ):
+            raise AutoYouTubeExecutionError("confirmation_not_allowed")
+        for position, candidate in enumerate(parts):
+            if position < index and (
+                candidate.get("upload_state") not in {"video_confirmed", "completed"}
+                or not candidate.get("youtube_video_id")
+                or states[position] != "completed"
+            ):
+                raise AutoYouTubeExecutionError("ownership_mismatch")
+            if position > index and (
+                candidate.get("upload_state") != "queued"
+                or candidate.get("youtube_video_id") is not None
+                or states[position] != "queued"
+            ):
+                raise AutoYouTubeExecutionError("ownership_mismatch")
+        return job, record, index
+
+    def confirm_already_uploaded_part(
+        self, job_id: str, item_id: str, video_input: str
+    ) -> Dict[str, Any]:
+        """Resolve one uncertain item from verified remote ownership; never release work."""
+        video_id = youtube_video_id_from_input(video_input)
+        if video_id is None:
+            raise AutoYouTubeExecutionError("invalid_youtube_video_id")
+        if self._state_store.health().get("healthy") is not True:
+            raise AutoYouTubeExecutionError("ownership_store_unavailable")
+        health = self._job_manager.persistence_status()
+        if health.get("enabled") is not True or health.get("healthy") is not True:
+            raise AutoYouTubeExecutionError("job_store_unavailable")
+        job, record, index = self._already_uploaded_candidate(str(job_id), str(item_id))
+        parts = list(record["parts"])
+        try:
+            service = self._service_getter(dict(self._settings_provider()), interactive=False)
+            verified = youtube_video_belongs_to_connected_channel(service, video_id)
+        except Exception as exc:
+            raise AutoYouTubeExecutionError("video_verification_unavailable") from exc
+        if not verified:
+            raise AutoYouTubeExecutionError("video_not_confirmed")
+        with self._job_manager.lock:
+            # The remote lookup is slow; recheck the item under the Queue lock
+            # so a concurrent Retry cannot release it between review and save.
+            self._already_uploaded_candidate(str(job_id), str(item_id))
+            try:
+                confirmed = self._state_store.confirm_reviewed_part_video(
+                    record["streamer"], record["twitch_vod_id"],
+                    upload_job_id=str(job_id), upload_item_id=str(item_id),
+                    part_index=index + 1, youtube_video_id=video_id,
+                )
+            except YouTubeUploadStateValidationError as exc:
+                raise AutoYouTubeExecutionError("confirmation_not_allowed") from exc
+            except YouTubeUploadStatePersistenceError as exc:
+                raise AutoYouTubeExecutionError("confirmation_persistence_failed") from exc
+            if not self._job_manager.complete_auto_youtube_item(str(job_id), str(item_id)):
+                raise AutoYouTubeExecutionError("ownership_mismatch")
+        self._log(str(job_id), f"Auto YouTube part {index + 1}/{len(parts)} confirmed from YouTube Studio review.")
+        return {
+            "job_id": str(job_id), "item_id": str(item_id),
+            "part_index": index + 1, "youtube_video_id": video_id,
+            "bundle_state": confirmed["state"],
         }
 
     def recover_known_pretransfer_part_for_execution(
@@ -626,6 +876,38 @@ class AutoYouTubeExecutionService:
             raise AutoYouTubeExecutionError("release_not_allowed")
         return True
 
+    def continue_confirmed_auto_youtube_job_for_execution(
+        self, job_id: str
+    ) -> Dict[str, Any]:
+        """Explicitly release only the queued suffix after reviewed confirmation."""
+        if self._state_store.health().get("healthy") is not True:
+            raise AutoYouTubeExecutionError("ownership_store_unavailable")
+        health = self._job_manager.persistence_status()
+        if health.get("enabled") is not True or health.get("healthy") is not True:
+            raise AutoYouTubeExecutionError("job_store_unavailable")
+        job, record, descriptors, next_index = self._continuation_candidate(
+            str(job_id)
+        )
+        try:
+            self._materializer()._validate_media(record, descriptors)
+        except (_MissingMaterializationMedia, _InvalidMaterializationMedia) as exc:
+            raise AutoYouTubeExecutionError("continuation_media_invalid") from exc
+        if not self._job_manager.release_auto_youtube_job_for_execution(
+            str(job_id)
+        ):
+            raise AutoYouTubeExecutionError("continuation_not_allowed")
+        self._log(
+            str(job_id),
+            f"Auto YouTube remaining upload parts continue at part "
+            f"{next_index + 1}/{len(descriptors)} after reviewed confirmation.",
+        )
+        return {
+            "job_id": str(job_id),
+            "next_item_id": str(job["item_ids"][next_index]),
+            "next_part_index": next_index + 1,
+            "remaining_part_count": len(descriptors) - next_index,
+        }
+
     def release_automatic_jobs_for_execution(
         self,
         worker_starter: Callable[[str], Any],
@@ -661,7 +943,15 @@ class AutoYouTubeExecutionService:
             try:
                 job = self._job_manager.get_job(job_id) or {}
                 if job.get("execution_deferred") is True:
-                    self.release_auto_youtube_job_for_execution(job_id)
+                    try:
+                        self._continuation_candidate(job_id, records=records)
+                    except AutoYouTubeExecutionError:
+                        self.release_auto_youtube_job_for_execution(job_id)
+                    else:
+                        # A reviewed remote confirmation intentionally requires
+                        # an administrator to approve the remaining suffix.
+                        result["ignored"] += 1
+                        continue
                     released_now = True
                 elif recover_released:
                     self._validate_release_candidate(job_id, deferred=False)
@@ -846,6 +1136,9 @@ class AutoYouTubeExecutionService:
                     result["blocked"] += 1
                 continue
             states = list(job.get("item_states") or [])
+            failure_kinds = list(job.get("item_failure_kinds") or [])
+            recovery_reasons = list(job.get("item_recovery_reasons") or [])
+            completion_reasons = list(job.get("item_completion_reasons") or [])
             blocked = record.get("state") == "needs_attention"
             for index, (part, item_id) in enumerate(zip(record.get("parts") or [], job.get("item_ids") or [])):
                 ledger_state = part.get("upload_state")
@@ -878,6 +1171,25 @@ class AutoYouTubeExecutionService:
                     continue
                 if ledger_state == "queued" and job_state == "completed":
                     self._block(job, record, item_id=item_id, index=index, reason="materialization_consistency_error", uncertain=False)
+                    blocked = True
+                    result["blocked"] += 1
+                    break
+                if (
+                    ledger_state == "queued"
+                    and job_state == "failed"
+                    and index < len(failure_kinds)
+                    and index < len(recovery_reasons)
+                    and index < len(completion_reasons)
+                    and failure_kinds[index] == "uncertain"
+                    and str(
+                        recovery_reasons[index]
+                        or completion_reasons[index]
+                        or ""
+                    ) == "upload_outcome_uncertain"
+                ):
+                    # A prior lost update can erase transfer_started from the
+                    # ledger. The durable JobStore uncertainty still forbids
+                    # automatic requeue/reupload until explicit review.
                     blocked = True
                     result["blocked"] += 1
                     break

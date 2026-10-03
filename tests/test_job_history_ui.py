@@ -502,6 +502,16 @@ class JobHistoryUiTests(unittest.TestCase):
         eligible["auto_youtube_recovery"] = {
             "reason": "upload_outcome_uncertain",
             "eligible_item_ids": ["91-item-1"],
+            "already_uploaded_eligible_item_ids": ["91-item-1"],
+        }
+        legacy = _upload_job(
+            "94", states=["failed"], failure_kinds=["uncertain"]
+        )
+        legacy["item_completion_reasons"] = ["upload_outcome_uncertain"]
+        legacy["item_recovery_reasons"] = ["upload_outcome_uncertain"]
+        legacy["auto_youtube_recovery"] = {
+            "eligible_item_ids": ["94-item-1"],
+            "already_uploaded_eligible_item_ids": ["94-item-1"],
         }
         known = _upload_job(
             "92", states=["failed"], failure_kinds=["known"]
@@ -518,15 +528,18 @@ class JobHistoryUiTests(unittest.TestCase):
         manual["auto_youtube_recovery"] = {
             "reason": "upload_outcome_uncertain",
             "eligible_item_ids": ["93-item-1"],
+            "already_uploaded_eligible_item_ids": ["93-item-1"],
         }
 
-        result = _evaluate_history_ui([eligible, known, manual])
+        result = _evaluate_history_ui([eligible, known, manual, legacy])
         cards = {item["jobId"]: item["html"] for item in result["rendered"]}
 
         self.assertIn("Upload status uncertain", cards["91"])
         self.assertIn("Check YouTube Studio", cards["91"])
         self.assertIn('data-queue-action="recover-auto-youtube"', cards["91"])
         self.assertIn(">Retry upload<", cards["91"])
+        self.assertIn('data-queue-action="confirm-auto-youtube-uploaded"', cards["91"])
+        self.assertIn(">Already on YouTube<", cards["91"])
         self.assertNotIn('data-queue-action="retry"', cards["91"])
         self.assertIn("Upload retry available", cards["92"])
         self.assertIn(
@@ -537,6 +550,9 @@ class JobHistoryUiTests(unittest.TestCase):
         self.assertNotIn(
             'data-queue-action="recover-auto-youtube"', cards["93"]
         )
+        self.assertNotIn('data-queue-action="confirm-auto-youtube-uploaded"', cards["93"])
+        self.assertIn('data-queue-action="confirm-auto-youtube-uploaded"', cards["94"])
+        self.assertIn('data-queue-action="recover-auto-youtube"', cards["94"])
 
     def test_uncertain_auto_youtube_recovery_requires_explicit_confirmation(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
@@ -554,6 +570,41 @@ class JobHistoryUiTests(unittest.TestCase):
             source,
         )
         self.assertIn("Reviewed upload requeued.", source)
+        self.assertIn("Only retry after checking YouTube Studio", source)
+        self.assertIn("The connected channel will be checked before this item is marked complete", source)
+        self.assertIn("video:videoInput", source)
+        self.assertIn("'/api/jobs/auto-youtube/confirm-uploaded'", source)
+        self.assertIn('id="appConfirmDialogInput"', TEMPLATE)
+        self.assertIn('.app-confirm-dialog-input-label[hidden] { display:none; }', STYLESHEET)
+
+    def test_confirmed_multipart_suffix_shows_only_explicit_continue_action(self):
+        bundle = _upload_job(
+            "95", states=["completed", "queued"], execution_policy="automatic"
+        )
+        bundle["item_completion_reasons"] = ["completed", ""]
+        bundle["item_recovery_reasons"] = ["", ""]
+        bundle["auto_youtube_recovery"] = {
+            "continuation": {
+                "eligible": True,
+                "next_item_id": "95-item-2",
+                "remaining_part_count": 1,
+            }
+        }
+        result = _evaluate_history_ui([bundle])
+        cards = {item["itemId"]: item["html"] for item in result["rendered"]}
+        self.assertNotIn(
+            'data-queue-action="continue-auto-youtube-remaining"',
+            cards["95-item-1"],
+        )
+        self.assertIn(
+            'data-queue-action="continue-auto-youtube-remaining"',
+            cards["95-item-2"],
+        )
+        self.assertIn("Continue remaining uploads", cards["95-item-2"])
+        self.assertNotIn('data-queue-action="start-auto-youtube"', cards["95-item-2"])
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("'/api/jobs/auto-youtube/continue-remaining'", source)
+        self.assertIn("Confirmed parts will not be uploaded again.", source)
 
     def test_automatic_policy_never_shows_manual_start_and_explains_queue_state(self):
         result = _evaluate_history_ui([
